@@ -852,3 +852,52 @@ async def test_video_to_music_path_does_not_exist(monkeypatch, output_dir):
     from sonilo_mcp.api import video_to_music
     with pytest.raises(Exception, match="does not exist"):
         await video_to_music(video_path="/tmp/__definitely_not_real_video__.mp4")
+
+
+async def test_play_audio_rejects_nonexistent(monkeypatch):
+    monkeypatch.setenv("SONILO_MCP_BASE_PATH", "/tmp")
+    from sonilo_mcp.api import play_audio
+    with pytest.raises(Exception, match="does not exist"):
+        play_audio("/tmp/__not_a_real_audio__.mp3")
+
+
+async def test_play_audio_rejects_wrong_extension(monkeypatch, tmp_path):
+    monkeypatch.setenv("SONILO_MCP_BASE_PATH", str(tmp_path))
+    text = tmp_path / "note.txt"
+    text.write_text("hi")
+    from sonilo_mcp.api import play_audio
+    with pytest.raises(Exception, match="not a recognized audio format"):
+        play_audio(str(text))
+
+
+async def test_play_audio_invokes_playback(monkeypatch, tmp_path):
+    monkeypatch.setenv("SONILO_MCP_BASE_PATH", str(tmp_path))
+    audio = tmp_path / "song.mp3"
+    audio.write_bytes(b"FAKE")
+
+    called = {}
+
+    def fake_play(data, samplerate):
+        called["data"] = data
+        called["sr"] = samplerate
+
+    def fake_wait():
+        called["waited"] = True
+
+    def fake_read(buf):
+        return ([0.0, 0.1, 0.2], 44100)
+
+    import sys
+    fake_sd = type(sys)("sounddevice")
+    fake_sd.play = fake_play
+    fake_sd.wait = fake_wait
+    fake_sf = type(sys)("soundfile")
+    fake_sf.read = fake_read
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    monkeypatch.setitem(sys.modules, "soundfile", fake_sf)
+
+    from sonilo_mcp.api import play_audio
+    out = play_audio(str(audio))
+    assert called["sr"] == 44100
+    assert called.get("waited") is True
+    assert "Successfully played audio file" in out.text

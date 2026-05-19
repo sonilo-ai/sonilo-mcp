@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import io
 import json
 import mimetypes
 import os
@@ -474,6 +475,43 @@ async def get_usage(days: int = 30) -> dict:
     if not (1 <= days <= 365):
         raise Exception(f"days must be between 1 and 365 (got {days})")
     return await _http_get_json("/v1/account/usage", params={"days": days})
+
+
+# ---------- Tools: local playback ----------
+
+@mcp.tool(
+    description=(
+        "Play a local audio file through the system's default output device. "
+        "Supports WAV, MP3, M4A, AAC, OGG, FLAC.\n\n"
+        "Args:\n"
+        "    input_file_path (str): Absolute path or relative to "
+        "SONILO_MCP_BASE_PATH.\n\n"
+        "Returns:\n"
+        "    Success message including the played path."
+    )
+)
+def play_audio(input_file_path: str) -> TextContent:
+    cfg = _get_config()
+    path = _resolve_input_file(
+        input_file_path, cfg["base_path"], _AUDIO_EXTS, "audio"
+    )
+    try:
+        import sounddevice as sd
+        import soundfile as sf
+    except ModuleNotFoundError as e:
+        raise Exception(
+            "Audio playback requires `sounddevice` and `soundfile` — "
+            "install with `pip install sounddevice soundfile`"
+        ) from e
+
+    audio_bytes = path.read_bytes()
+    data, samplerate = sf.read(io.BytesIO(audio_bytes))
+    sd.play(data, samplerate)
+    sd.wait()
+    return TextContent(
+        type="text",
+        text=f"Successfully played audio file: {path}",
+    )
 
 
 # ---------- Entry point ----------

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
 from pathlib import Path
+from typing import AsyncIterator
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -177,6 +179,69 @@ async def _http_get_json(path: str, params: dict | None = None) -> dict:
                 await asyncio.sleep(1)
                 continue
             raise Exception(f"HTTP request failed: {e}") from e
+
+
+# ---------- Streaming consumer ----------
+
+async def _consume_ndjson_lines(
+    lines: AsyncIterator[str],
+) -> tuple[dict[int, bytearray], int, str | None]:
+    """Consume an NDJSON event stream, accumulating audio bytes by stream_index.
+
+    Returns:
+        (streams_by_index, num_streams, title_or_none)
+    Raises:
+        Exception if an error event is seen, or if the stream ends without
+        a `complete` event.
+
+    Event types per backend/app/services/stream_events.py:
+        - audio_chunk: append base64-decoded bytes to streams[stream_index]
+        - title: capture optional title for filename
+        - complete: terminal success
+        - error: terminal failure → raise
+        - others (stage_start, stage_complete, trace, final_inputs): ignore
+    Malformed JSON lines are silently dropped (matches backend's fail-closed).
+    """
+    streams: dict[int, bytearray] = {}
+    num_streams = 1
+    title: str | None = None
+    completed = False
+    error_msg: str | None = None
+
+    async for line in lines:
+        if not line.strip():
+            continue
+        try:
+            evt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(evt, dict):
+            continue
+        t = evt.get("type")
+        if t == "audio_chunk":
+            idx = int(evt.get("stream_index", 0))
+            num_streams = int(evt.get("num_streams", 1))
+            data = evt.get("data")
+            if isinstance(data, str):
+                streams.setdefault(idx, bytearray()).extend(
+                    base64.b64decode(data)
+                )
+        elif t == "title":
+            t_val = evt.get("title")
+            if isinstance(t_val, str) and t_val.strip():
+                title = t_val
+        elif t == "complete":
+            completed = True
+        elif t == "error":
+            error_msg = (
+                evt.get("message") or evt.get("code") or "stream error"
+            )
+            break
+        # All other event types are silently ignored.
+
+    if not completed:
+        raise Exception(error_msg or "Stream ended without `complete` event")
+    return streams, num_streams, title
 
 
 # ---------- Tools: account ----------

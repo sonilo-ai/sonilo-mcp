@@ -9,6 +9,9 @@ import json
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import AsyncIterator
@@ -91,14 +94,15 @@ def _resolve_input_file(
 
     `kind` is used in error messages (e.g. "audio", "video").
     """
-    if not os.path.isabs(file_path):
+    expanded = os.path.expanduser(file_path)
+    if not os.path.isabs(expanded):
         if not base_path:
             raise Exception(
                 "File path must be absolute when SONILO_MCP_BASE_PATH is not set"
             )
-        path = Path(os.path.expanduser(base_path)) / file_path
+        path = Path(os.path.expanduser(base_path)) / expanded
     else:
-        path = Path(os.path.expanduser(file_path))
+        path = Path(expanded)
 
     if not path.exists():
         raise Exception(f"File ({path}) does not exist")
@@ -305,7 +309,7 @@ async def _post_streaming_generation(
     saved: list[TextContent] = []
     for idx, buf in sorted(streams.items()):
         suffix = f"-{idx}" if num_streams > 1 else ""
-        out_file = output_path / f"{safe_title}{suffix}.mp3"
+        out_file = output_path / f"{safe_title}{suffix}.m4a"
         out_file.write_bytes(bytes(buf))
         saved.append(TextContent(
             type="text",
@@ -333,7 +337,7 @@ async def _post_streaming_generation(
         "(~/Desktop unless overridden).\n\n"
         "Returns:\n"
         "    One TextContent per generated audio stream, each containing "
-        "the absolute path of the saved .mp3 file."
+        "the absolute path of the saved .m4a file (AAC in MP4 container)."
     )
 )
 async def text_to_music(
@@ -495,13 +499,42 @@ def play_audio(input_file_path: str) -> TextContent:
     path = _resolve_input_file(
         input_file_path, cfg["base_path"], _AUDIO_EXTS, "audio"
     )
+
+    # Prefer a system audio player — handles mp3/aac/m4a natively via OS
+    # codecs. `soundfile`'s bundled libsndfile has weak/no mp3 support
+    # depending on platform, so falling through to it for mp3 fails with
+    # "Format not recognised".
+    player_cmd: list[str] | None = None
+    if sys.platform == "darwin" and shutil.which("afplay"):
+        player_cmd = ["afplay", str(path)]
+    elif sys.platform.startswith("linux"):
+        if path.suffix.lower() == ".mp3" and shutil.which("mpg123"):
+            player_cmd = ["mpg123", "-q", str(path)]
+        elif shutil.which("aplay"):
+            player_cmd = ["aplay", "-q", str(path)]
+
+    if player_cmd is not None:
+        try:
+            subprocess.run(player_cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+            raise Exception(f"{player_cmd[0]} failed: {stderr.strip() or e}") from e
+        return TextContent(
+            type="text",
+            text=f"Successfully played audio file: {path}",
+        )
+
+    # Fallback for platforms without a known system player: try
+    # sounddevice + soundfile (works reliably for WAV/FLAC/OGG; mp3
+    # support depends on the bundled libsndfile build).
     try:
         import sounddevice as sd
         import soundfile as sf
     except ModuleNotFoundError as e:
         raise Exception(
-            "Audio playback requires `sounddevice` and `soundfile` — "
-            "install with `pip install sounddevice soundfile`"
+            "Audio playback requires a system player (afplay on macOS, "
+            "mpg123/aplay on Linux) or the `sounddevice` and `soundfile` "
+            "Python packages."
         ) from e
 
     audio_bytes = path.read_bytes()
@@ -518,7 +551,6 @@ def play_audio(input_file_path: str) -> TextContent:
 
 def main() -> None:
     """Run the MCP server over stdio transport."""
-    import sys
     print("Starting Sonilo MCP server", flush=True, file=sys.stderr)
     mcp.run()
 

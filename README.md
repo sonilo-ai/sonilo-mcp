@@ -68,7 +68,7 @@ Tools marked ✅ make API calls that incur charges on your Sonilo account.
 
 ## Output Format
 
-Generated audio is currently saved as `.mp3`. File names use the title returned by the backend (slugified) or a `sonilo-<timestamp>.mp3` fallback. When multiple parallel streams are returned, a `-<index>` suffix is appended.
+Generated audio is saved as `.m4a` (AAC in MP4 container — this is what the backend currently emits). File names use the title returned by the backend (slugified) or a `sonilo-<timestamp>.m4a` fallback. When multiple parallel streams are returned, a `-<index>` suffix is appended.
 
 ## Common Errors
 

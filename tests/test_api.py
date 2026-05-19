@@ -130,6 +130,16 @@ def test_resolve_input_file_wrong_extension(tmp_path):
         _resolve_input_file(str(f), None, {".mp3"}, "audio")
 
 
+def test_resolve_input_file_tilde_expansion(monkeypatch, tmp_path):
+    """~/foo.mp3 should be expanded to $HOME/foo.mp3 before isabs check."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    f = tmp_path / "song.mp3"
+    f.write_bytes(b"x")
+    from sonilo_mcp.api import _resolve_input_file
+    out = _resolve_input_file("~/song.mp3", None, {".mp3"}, "audio")
+    assert out == f
+
+
 def test_make_output_path_tilde_expansion(monkeypatch, tmp_path):
     # Simulate ~ expanding to tmp_path by patching HOME
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -614,10 +624,10 @@ async def test_text_to_music_writes_file(monkeypatch, output_dir):
     result = await text_to_music(prompt="happy", duration=10)
 
     assert len(result) == 1
-    expected = output_dir / "happy-tune.mp3"
+    expected = output_dir / "happy-tune.m4a"
     assert expected.exists()
     assert expected.read_bytes() == audio
-    assert "happy-tune.mp3" in result[0].text
+    assert "happy-tune.m4a" in result[0].text
 
 
 @respx.mock
@@ -640,8 +650,8 @@ async def test_text_to_music_multi_stream(monkeypatch, output_dir):
     from sonilo_mcp.api import text_to_music
     result = await text_to_music(prompt="happy", duration=10)
     assert len(result) == 2
-    assert (output_dir / "twin-0.mp3").read_bytes() == a
-    assert (output_dir / "twin-1.mp3").read_bytes() == b_bytes
+    assert (output_dir / "twin-0.m4a").read_bytes() == a
+    assert (output_dir / "twin-1.m4a").read_bytes() == b_bytes
 
 
 @respx.mock
@@ -660,10 +670,10 @@ async def test_text_to_music_no_title_fallback(monkeypatch, output_dir):
     from sonilo_mcp.api import text_to_music
     result = await text_to_music(prompt="x", duration=5)
     assert len(result) == 1
-    # Fallback name pattern: sonilo-<unix-timestamp>.mp3
+    # Fallback name pattern: sonilo-<unix-timestamp>.m4a
     name = Path(result[0].text.split("File saved as: ")[1]).name
     assert name.startswith("sonilo-")
-    assert name.endswith(".mp3")
+    assert name.endswith(".m4a")
 
 
 @respx.mock
@@ -870,15 +880,47 @@ async def test_play_audio_rejects_wrong_extension(monkeypatch, tmp_path):
         play_audio(str(text))
 
 
-async def test_play_audio_invokes_playback(monkeypatch, tmp_path):
+async def test_play_audio_uses_afplay_on_macos(monkeypatch, tmp_path):
     monkeypatch.setenv("SONILO_MCP_BASE_PATH", str(tmp_path))
     audio = tmp_path / "song.mp3"
     audio.write_bytes(b"FAKE")
 
+    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/usr/bin/{name}" if name == "afplay" else None,
+    )
+
+    called = {}
+    import subprocess as _sp
+
+    def fake_run(cmd, **kwargs):
+        called["cmd"] = cmd
+        called["check"] = kwargs.get("check")
+        return _sp.CompletedProcess(cmd, 0, b"", b"")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    from sonilo_mcp.api import play_audio
+    out = play_audio(str(audio))
+    assert called["cmd"][0] == "afplay"
+    assert called["cmd"][1] == str(audio)
+    assert called["check"] is True
+    assert "Successfully played audio file" in out.text
+
+
+async def test_play_audio_falls_back_to_sounddevice(monkeypatch, tmp_path):
+    monkeypatch.setenv("SONILO_MCP_BASE_PATH", str(tmp_path))
+    audio = tmp_path / "song.wav"
+    audio.write_bytes(b"FAKE")
+
+    # Pretend we're on an OS with no recognised system player.
+    monkeypatch.setattr("sys.platform", "freebsd")
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
     called = {}
 
     def fake_play(data, samplerate):
-        called["data"] = data
         called["sr"] = samplerate
 
     def fake_wait():
@@ -901,6 +943,29 @@ async def test_play_audio_invokes_playback(monkeypatch, tmp_path):
     assert called["sr"] == 44100
     assert called.get("waited") is True
     assert "Successfully played audio file" in out.text
+
+
+async def test_play_audio_propagates_afplay_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("SONILO_MCP_BASE_PATH", str(tmp_path))
+    audio = tmp_path / "song.mp3"
+    audio.write_bytes(b"FAKE")
+
+    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: f"/usr/bin/{name}" if name == "afplay" else None,
+    )
+
+    import subprocess as _sp
+
+    def fake_run(cmd, **kwargs):
+        raise _sp.CalledProcessError(1, cmd, output=b"", stderr=b"bad file")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    from sonilo_mcp.api import play_audio
+    with pytest.raises(Exception, match="afplay failed.*bad file"):
+        play_audio(str(audio))
 
 
 @respx.mock

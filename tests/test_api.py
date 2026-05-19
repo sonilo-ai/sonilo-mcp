@@ -587,3 +587,147 @@ async def test_consume_ndjson_skips_negative_stream_index():
     streams, _, _ = await _consume_ndjson_lines(_async_iter(lines))
     assert -1 not in streams
     assert bytes(streams[0]) == b"y"
+
+
+import time as _time
+
+
+def _ndjson_bytes(events: list[dict]) -> bytes:
+    return b"".join(json.dumps(e).encode() + b"\n" for e in events)
+
+
+@respx.mock
+async def test_text_to_music_writes_file(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    audio = b"\x00\x01\x02fake-mp3-bytes"
+    ndjson = _ndjson_bytes([
+        {"type": "title", "title": "Happy Tune"},
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(audio).decode()},
+        {"type": "complete"},
+    ])
+    respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import text_to_music
+    result = await text_to_music(prompt="happy", duration=10)
+
+    assert len(result) == 1
+    expected = output_dir / "happy-tune.mp3"
+    assert expected.exists()
+    assert expected.read_bytes() == audio
+    assert "happy-tune.mp3" in result[0].text
+
+
+@respx.mock
+async def test_text_to_music_multi_stream(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    a = b"track-a"
+    b_bytes = b"track-b"
+    ndjson = _ndjson_bytes([
+        {"type": "title", "title": "Twin"},
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 2,
+         "data": base64.b64encode(a).decode()},
+        {"type": "audio_chunk", "stream_index": 1, "num_streams": 2,
+         "data": base64.b64encode(b_bytes).decode()},
+        {"type": "complete"},
+    ])
+    respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import text_to_music
+    result = await text_to_music(prompt="happy", duration=10)
+    assert len(result) == 2
+    assert (output_dir / "twin-0.mp3").read_bytes() == a
+    assert (output_dir / "twin-1.mp3").read_bytes() == b_bytes
+
+
+@respx.mock
+async def test_text_to_music_no_title_fallback(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    audio = b"x"
+    ndjson = _ndjson_bytes([
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(audio).decode()},
+        {"type": "complete"},
+    ])
+    respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import text_to_music
+    result = await text_to_music(prompt="x", duration=5)
+    assert len(result) == 1
+    # Fallback name pattern: sonilo-<unix-timestamp>.mp3
+    name = Path(result[0].text.split("File saved as: ")[1]).name
+    assert name.startswith("sonilo-")
+    assert name.endswith(".mp3")
+
+
+@respx.mock
+async def test_text_to_music_error_event_no_file(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    ndjson = _ndjson_bytes([
+        {"type": "error", "code": "MODAL_DEAD", "message": "upstream failure"},
+    ])
+    respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import text_to_music
+    with pytest.raises(Exception, match="upstream failure"):
+        await text_to_music(prompt="x", duration=5)
+    assert list(output_dir.iterdir()) == []
+
+
+@respx.mock
+async def test_text_to_music_401_error(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "bad")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(401, json={"detail": "Invalid API key"})
+    )
+    from sonilo_mcp.api import text_to_music
+    with pytest.raises(Exception, match="Invalid SONILO_API_KEY"):
+        await text_to_music(prompt="x", duration=5)
+
+
+@respx.mock
+async def test_text_to_music_429_error(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(429, json={"detail": "Rate limit exceeded"})
+    )
+    from sonilo_mcp.api import text_to_music
+    with pytest.raises(Exception, match="Rate limit exceeded"):
+        await text_to_music(prompt="x", duration=5)
+
+
+async def test_text_to_music_missing_api_key(output_dir):
+    from sonilo_mcp.api import text_to_music
+    with pytest.raises(Exception, match="SONILO_API_KEY"):
+        await text_to_music(prompt="x", duration=5)
+
+
+@respx.mock
+async def test_text_to_music_sends_correct_body(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    audio = b"x"
+    ndjson = _ndjson_bytes([
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(audio).decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import text_to_music
+    await text_to_music(prompt="energetic rock", duration=42)
+    body = json.loads(route.calls.last.request.content)
+    assert body == {"prompt": "energetic rock", "duration": 42}
+    auth = route.calls.last.request.headers["authorization"]
+    assert auth == "Bearer k"

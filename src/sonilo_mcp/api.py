@@ -7,11 +7,13 @@ import binascii
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.types import TextContent
 
 mcp = FastMCP("Sonilo")
 
@@ -251,6 +253,98 @@ async def _consume_ndjson_lines(
     if not completed:
         raise Exception(error_msg or "Stream ended without `complete` event")
     return streams, num_streams, title
+
+
+# ---------- Generation streaming ----------
+
+async def _post_streaming_generation(
+    path: str,
+    output_path: Path,
+    json_body: dict | None = None,
+    data: dict | None = None,
+    files: dict | None = None,
+) -> list[TextContent]:
+    """Open a streaming POST, consume the NDJSON stream, write each audio
+    stream to disk under output_path.
+
+    No retry — generation endpoints are non-idempotent and could double-charge.
+    """
+    cfg = _get_config()
+    if not cfg["api_key"]:
+        raise Exception(f"SONILO_API_KEY not set — see {_API_KEYS_URL}")
+    url = cfg["api_url"].rstrip("/") + path
+    headers = {"Authorization": f"Bearer {cfg['api_key']}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:
+            async with client.stream(
+                "POST", url, headers=headers,
+                json=json_body, data=data, files=files,
+            ) as r:
+                if r.status_code >= 400:
+                    body = (await r.aread()).decode("utf-8", errors="replace")
+                    _raise_http_error(r.status_code, body)
+                streams, num_streams, title = await _consume_ndjson_lines(
+                    r.aiter_lines()
+                )
+    except httpx.TimeoutException as e:
+        raise Exception(
+            f"Generation timed out after {cfg['timeout']}s. The backend may "
+            "have completed and charged your account — check `get_usage` to "
+            "reconcile."
+        ) from e
+    except httpx.RequestError as e:
+        raise Exception(
+            f"HTTP request failed: {e}. Verify SONILO_API_URL "
+            f"({cfg['api_url']}) is reachable."
+        ) from e
+
+    safe_title = _slugify(title) if title else f"sonilo-{int(time.time())}"
+    saved: list[TextContent] = []
+    for idx, buf in sorted(streams.items()):
+        suffix = f"-{idx}" if num_streams > 1 else ""
+        out_file = output_path / f"{safe_title}{suffix}.mp3"
+        out_file.write_bytes(bytes(buf))
+        saved.append(TextContent(
+            type="text",
+            text=f"Success. File saved as: {out_file}",
+        ))
+    if not saved:
+        raise Exception("Stream completed but no audio chunks were received")
+    return saved
+
+
+# ---------- Tools: generation ----------
+
+@mcp.tool(
+    description=(
+        "Generate music from a text prompt and save the resulting audio "
+        "file(s) to a local directory.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges. Only use when explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    prompt (str): Description of the music to generate "
+        "(1–1000 chars).\n"
+        "    duration (int): Length in seconds (1–300).\n"
+        "    output_directory (str, optional): Absolute path, or relative "
+        "to SONILO_MCP_BASE_PATH. Defaults to SONILO_MCP_BASE_PATH "
+        "(~/Desktop unless overridden).\n\n"
+        "Returns:\n"
+        "    One TextContent per generated audio stream, each containing "
+        "the absolute path of the saved .mp3 file."
+    )
+)
+async def text_to_music(
+    prompt: str,
+    duration: int,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    out_path = _make_output_path(output_directory)
+    return await _post_streaming_generation(
+        "/v1/text-to-music",
+        out_path,
+        json_body={"prompt": prompt, "duration": duration},
+    )
 
 
 # ---------- Tools: account ----------

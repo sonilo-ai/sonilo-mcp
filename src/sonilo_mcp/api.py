@@ -347,6 +347,97 @@ async def text_to_music(
     )
 
 
+_services_cache: dict | None = None
+_services_cache_expiry: float = 0.0
+_SERVICES_CACHE_TTL = 300  # seconds
+
+
+async def _get_max_upload_size_mb() -> int:
+    """Cached lookup of /v1/account/services.max_upload_size_mb.
+
+    Returns 300 if the call fails (matches the backend default in
+    backend/app/routers/v1/video_to_music.py).
+    """
+    global _services_cache, _services_cache_expiry
+    now = time.time()
+    if _services_cache is None or now > _services_cache_expiry:
+        try:
+            _services_cache = await _http_get_json("/v1/account/services")
+            _services_cache_expiry = now + _SERVICES_CACHE_TTL
+        except Exception:
+            return 300
+    try:
+        return int(_services_cache.get("max_upload_size_mb") or 300)
+    except (TypeError, ValueError):
+        return 300
+
+
+@mcp.tool(
+    description=(
+        "Generate music that matches the soundtrack of a video. Provide "
+        "either a local video file path or a publicly accessible video URL.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges. Only use when explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    video_path (str, optional): Absolute local path, or relative "
+        "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.avi/.wmv/.webm/.mkv.\n"
+        "    video_url (str, optional): HTTPS URL to a video file.\n"
+        "    prompt (str, optional): Style hint for the generated music.\n"
+        "    output_directory (str, optional): Where to save the resulting "
+        "audio file(s). Defaults to SONILO_MCP_BASE_PATH.\n\n"
+        "Exactly one of video_path and video_url must be provided.\n\n"
+        "Returns:\n"
+        "    One TextContent per generated audio stream."
+    )
+)
+async def video_to_music(
+    video_path: str | None = None,
+    video_url: str | None = None,
+    prompt: str | None = None,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    if (video_path and video_url) or (not video_path and not video_url):
+        raise Exception(
+            "Provide either video_path or video_url (exactly one, not both)"
+        )
+
+    out_path = _make_output_path(output_directory)
+    cfg = _get_config()
+
+    if video_path:
+        resolved = _resolve_input_file(
+            video_path, cfg["base_path"], _VIDEO_EXTS, "video"
+        )
+        max_mb = await _get_max_upload_size_mb()
+        size_mb = resolved.stat().st_size / (1024 * 1024)
+        if size_mb > max_mb:
+            raise Exception(
+                f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
+            )
+        data = {"prompt": prompt} if prompt else None
+        with open(resolved, "rb") as fh:
+            files = {"video": (resolved.name, fh.read(), "video/mp4")}
+        return await _post_streaming_generation(
+            "/v1/video-to-music",
+            out_path,
+            data=data,
+            files=files,
+        )
+
+    # video_url path — backend expects multipart form, not JSON
+    form: dict = {"video_url": video_url}
+    if prompt:
+        form["prompt"] = prompt
+    # Use `data` for form fields without files; httpx will use
+    # application/x-www-form-urlencoded. The backend `video_to_music`
+    # endpoint accepts both multipart and urlencoded for the URL mode.
+    return await _post_streaming_generation(
+        "/v1/video-to-music",
+        out_path,
+        data=form,
+    )
+
+
 # ---------- Tools: account ----------
 
 @mcp.tool(

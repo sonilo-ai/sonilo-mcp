@@ -731,3 +731,126 @@ async def test_text_to_music_sends_correct_body(monkeypatch, output_dir):
     assert body == {"prompt": "energetic rock", "duration": 42}
     auth = route.calls.last.request.headers["authorization"]
     assert auth == "Bearer k"
+
+
+@respx.mock
+async def test_video_to_music_url_mode(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    audio = b"mp3"
+    ndjson = _ndjson_bytes([
+        {"type": "title", "title": "From URL"},
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(audio).decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import video_to_music
+    from urllib.parse import parse_qs
+    result = await video_to_music(video_url="https://cdn.example.com/v.mp4")
+    assert len(result) == 1
+    body = route.calls.last.request.content.decode()
+    parsed = parse_qs(body)
+    assert parsed["video_url"] == ["https://cdn.example.com/v.mp4"]
+
+
+@respx.mock
+async def test_video_to_music_url_with_prompt(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    ndjson = _ndjson_bytes([
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(b"x").decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import video_to_music
+    await video_to_music(video_url="https://x.com/v.mp4", prompt="upbeat")
+    body = route.calls.last.request.content.decode()
+    assert "upbeat" in body
+
+
+async def test_video_to_music_both_inputs_rejected(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp.api import video_to_music
+    with pytest.raises(Exception, match="Provide either"):
+        await video_to_music(video_url="https://x", video_path="/tmp/x.mp4")
+
+
+async def test_video_to_music_no_input_rejected(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp.api import video_to_music
+    with pytest.raises(Exception, match="Provide either"):
+        await video_to_music()
+
+
+@respx.mock
+async def test_video_to_music_path_mode(monkeypatch, output_dir, tmp_path):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"FAKE-MP4-BYTES")
+
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={
+            "available_services": [], "rpm_limit": 60,
+            "concurrency_limit": 1, "discount_factor": 1.0,
+            "max_upload_size_mb": 300,
+        })
+    )
+    ndjson = _ndjson_bytes([
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(b"x").decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    # Reset the services cache so this test gets a fresh lookup
+    import sonilo_mcp.api as api_mod
+    api_mod._services_cache = None
+    api_mod._services_cache_expiry = 0.0
+    from sonilo_mcp.api import video_to_music
+    await video_to_music(video_path=str(video))
+    # multipart upload should include the file content
+    assert b"FAKE-MP4-BYTES" in route.calls.last.request.content
+
+
+@respx.mock
+async def test_video_to_music_path_too_large(monkeypatch, output_dir, tmp_path):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    video = tmp_path / "big.mp4"
+    # 2 MB file
+    video.write_bytes(b"\x00" * (2 * 1024 * 1024))
+
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={
+            "available_services": [], "rpm_limit": 60,
+            "concurrency_limit": 1, "discount_factor": 1.0,
+            "max_upload_size_mb": 1,  # cap = 1 MB
+        })
+    )
+    upload_route = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(200, content=b"")
+    )
+    import sonilo_mcp.api as api_mod
+    api_mod._services_cache = None
+    api_mod._services_cache_expiry = 0.0
+    from sonilo_mcp.api import video_to_music
+    with pytest.raises(Exception, match="too large"):
+        await video_to_music(video_path=str(video))
+    # Must NOT upload
+    assert upload_route.call_count == 0
+
+
+async def test_video_to_music_path_does_not_exist(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp.api import video_to_music
+    with pytest.raises(Exception, match="does not exist"):
+        await video_to_music(video_path="/tmp/__definitely_not_real_video__.mp4")

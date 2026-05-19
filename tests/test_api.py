@@ -126,3 +126,13 @@ def test_resolve_input_file_wrong_extension(tmp_path):
     f.write_text("not audio")
     with pytest.raises(Exception, match="not a recognized audio format"):
         _resolve_input_file(str(f), None, {".mp3"}, "audio")
+
+
+def test_make_output_path_tilde_expansion(monkeypatch, tmp_path):
+    # Simulate ~ expanding to tmp_path by patching HOME
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SONILO_MCP_BASE_PATH", str(tmp_path))
+    from sonilo_mcp.api import _make_output_path
+    out = _make_output_path("~/music")
+    assert out == tmp_path / "music"
+    assert out.exists()

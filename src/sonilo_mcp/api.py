@@ -41,15 +41,18 @@ def _make_output_path(output_directory: str | None) -> Path:
     1. absolute path → use as-is
     2. relative path + SONILO_MCP_BASE_PATH set → join
     3. None → SONILO_MCP_BASE_PATH (defaults to ~/Desktop)
+    Tilde (~) in either base_path or output_directory is expanded.
     Raises if the resulting directory is not writeable.
     """
     base_path = _get_config()["base_path"]
     if output_directory is None:
         output_path = Path(os.path.expanduser(base_path))
-    elif not os.path.isabs(output_directory):
-        output_path = Path(os.path.expanduser(base_path)) / output_directory
     else:
-        output_path = Path(os.path.expanduser(output_directory))
+        expanded = os.path.expanduser(output_directory)
+        if os.path.isabs(expanded):
+            output_path = Path(expanded)
+        else:
+            output_path = Path(os.path.expanduser(base_path)) / expanded
 
     if not _is_file_writeable(output_path):
         raise Exception(f"Directory ({output_path}) is not writeable")

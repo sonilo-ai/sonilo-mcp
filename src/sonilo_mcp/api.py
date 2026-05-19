@@ -203,7 +203,7 @@ async def get_account_services() -> dict:
 )
 async def get_usage(days: int = 30) -> dict:
     if not (1 <= days <= 365):
-        raise Exception("days must be between 1 and 365")
+        raise Exception(f"days must be between 1 and 365 (got {days})")
     return await _http_get_json("/v1/account/usage", params={"days": days})
 
 

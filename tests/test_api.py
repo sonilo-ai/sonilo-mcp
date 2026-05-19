@@ -342,7 +342,21 @@ async def test_get_usage_custom_days(monkeypatch):
 
 async def test_get_usage_rejects_out_of_range():
     from sonilo_mcp.api import get_usage
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="between 1 and 365"):
         await get_usage(days=0)
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="between 1 and 365"):
         await get_usage(days=400)
+    with pytest.raises(Exception, match="between 1 and 365"):
+        await get_usage(days=-5)
+
+
+@respx.mock
+async def test_get_usage_boundary_values_accepted(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/account/usage").mock(
+        return_value=httpx.Response(200, json={"summary": {}, "daily": []})
+    )
+    from sonilo_mcp.api import get_usage
+    await get_usage(days=1)
+    await get_usage(days=365)

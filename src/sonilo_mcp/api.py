@@ -179,6 +179,34 @@ async def _http_get_json(path: str, params: dict | None = None) -> dict:
             raise Exception(f"HTTP request failed: {e}") from e
 
 
+# ---------- Tools: account ----------
+
+@mcp.tool(
+    description=(
+        "Get the authenticated account's available Sonilo services, rate limits, "
+        "concurrency limit, discount factor, and max video upload size. "
+        "Use this to discover what generation endpoints are available before "
+        "calling them."
+    )
+)
+async def get_account_services() -> dict:
+    return await _http_get_json("/v1/account/services")
+
+
+@mcp.tool(
+    description=(
+        "Get the authenticated account's usage summary and per-day breakdown. "
+        "Useful for cost reconciliation and tracking generation history.\n\n"
+        "Args:\n"
+        "    days (int, optional): Lookback window in days, 1–365. Defaults to 30."
+    )
+)
+async def get_usage(days: int = 30) -> dict:
+    if not (1 <= days <= 365):
+        raise Exception("days must be between 1 and 365")
+    return await _http_get_json("/v1/account/usage", params={"days": days})
+
+
 # ---------- Entry point ----------
 
 def main() -> None:

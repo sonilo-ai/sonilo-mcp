@@ -289,3 +289,60 @@ async def test_http_get_json_forwards_params(monkeypatch):
     sent = route.calls.last.request.url.params
     assert sent["days"] == "7"
     assert sent["filter"] == "x"
+
+
+@respx.mock
+async def test_get_account_services(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={
+            "available_services": ["text-to-music", "video-to-music"],
+            "rpm_limit": 60,
+            "concurrency_limit": 4,
+            "discount_factor": 1.0,
+            "max_upload_size_mb": 300,
+        })
+    )
+    from sonilo_mcp.api import get_account_services
+    out = await get_account_services()
+    assert out["available_services"] == ["text-to-music", "video-to-music"]
+    assert out["max_upload_size_mb"] == 300
+
+
+@respx.mock
+async def test_get_usage_default_days(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    route = respx.get("https://api.test.local/v1/account/usage").mock(
+        return_value=httpx.Response(200, json={
+            "summary": {"total_requests": 0, "total_duration_seconds": 0.0,
+                        "total_cost": "0", "period_start": "2026-05-01T00:00:00Z",
+                        "period_end": "2026-05-18T00:00:00Z"},
+            "daily": [],
+        })
+    )
+    from sonilo_mcp.api import get_usage
+    out = await get_usage()
+    assert out["summary"]["total_requests"] == 0
+    assert route.calls.last.request.url.params["days"] == "30"
+
+
+@respx.mock
+async def test_get_usage_custom_days(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    route = respx.get("https://api.test.local/v1/account/usage").mock(
+        return_value=httpx.Response(200, json={"summary": {}, "daily": []})
+    )
+    from sonilo_mcp.api import get_usage
+    await get_usage(days=7)
+    assert route.calls.last.request.url.params["days"] == "7"
+
+
+async def test_get_usage_rejects_out_of_range():
+    from sonilo_mcp.api import get_usage
+    with pytest.raises(Exception):
+        await get_usage(days=0)
+    with pytest.raises(Exception):
+        await get_usage(days=400)

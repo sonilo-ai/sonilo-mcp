@@ -492,3 +492,98 @@ async def test_consume_ndjson_empty_title_keeps_none():
     from sonilo_mcp.api import _consume_ndjson_lines
     _, _, title = await _consume_ndjson_lines(_async_iter(lines))
     assert title is None
+
+
+async def test_consume_ndjson_error_event_no_message_or_code():
+    lines = [
+        json.dumps({"type": "error"}),
+    ]
+    from sonilo_mcp.api import _consume_ndjson_lines
+    with pytest.raises(Exception, match="stream error"):
+        await _consume_ndjson_lines(_async_iter(lines))
+
+
+async def test_consume_ndjson_skips_bad_stream_index():
+    lines = [
+        json.dumps({
+            "type": "audio_chunk", "stream_index": "abc", "num_streams": 1,
+            "data": base64.b64encode(b"x").decode(),
+        }),
+        json.dumps({
+            "type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+            "data": base64.b64encode(b"y").decode(),
+        }),
+        json.dumps({"type": "complete"}),
+    ]
+    from sonilo_mcp.api import _consume_ndjson_lines
+    streams, _, _ = await _consume_ndjson_lines(_async_iter(lines))
+    assert bytes(streams[0]) == b"y"
+
+
+async def test_consume_ndjson_skips_null_num_streams():
+    lines = [
+        json.dumps({
+            "type": "audio_chunk", "stream_index": 0, "num_streams": None,
+            "data": base64.b64encode(b"x").decode(),
+        }),
+        json.dumps({
+            "type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+            "data": base64.b64encode(b"y").decode(),
+        }),
+        json.dumps({"type": "complete"}),
+    ]
+    from sonilo_mcp.api import _consume_ndjson_lines
+    streams, _, _ = await _consume_ndjson_lines(_async_iter(lines))
+    assert bytes(streams[0]) == b"y"
+
+
+async def test_consume_ndjson_skips_non_string_data():
+    lines = [
+        json.dumps({
+            "type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+            "data": None,
+        }),
+        json.dumps({
+            "type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+            "data": base64.b64encode(b"x").decode(),
+        }),
+        json.dumps({"type": "complete"}),
+    ]
+    from sonilo_mcp.api import _consume_ndjson_lines
+    streams, _, _ = await _consume_ndjson_lines(_async_iter(lines))
+    assert bytes(streams[0]) == b"x"
+
+
+async def test_consume_ndjson_skips_malformed_base64():
+    lines = [
+        json.dumps({
+            "type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+            "data": "!!! not valid base64 !!!",
+        }),
+        json.dumps({
+            "type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+            "data": base64.b64encode(b"x").decode(),
+        }),
+        json.dumps({"type": "complete"}),
+    ]
+    from sonilo_mcp.api import _consume_ndjson_lines
+    streams, _, _ = await _consume_ndjson_lines(_async_iter(lines))
+    assert bytes(streams[0]) == b"x"
+
+
+async def test_consume_ndjson_skips_negative_stream_index():
+    lines = [
+        json.dumps({
+            "type": "audio_chunk", "stream_index": -1, "num_streams": 1,
+            "data": base64.b64encode(b"x").decode(),
+        }),
+        json.dumps({
+            "type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+            "data": base64.b64encode(b"y").decode(),
+        }),
+        json.dumps({"type": "complete"}),
+    ]
+    from sonilo_mcp.api import _consume_ndjson_lines
+    streams, _, _ = await _consume_ndjson_lines(_async_iter(lines))
+    assert -1 not in streams
+    assert bytes(streams[0]) == b"y"

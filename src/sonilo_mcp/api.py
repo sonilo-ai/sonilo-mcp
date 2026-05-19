@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import os
 import re
@@ -219,13 +220,21 @@ async def _consume_ndjson_lines(
             continue
         t = evt.get("type")
         if t == "audio_chunk":
-            idx = int(evt.get("stream_index", 0))
-            num_streams = int(evt.get("num_streams", 1))
+            try:
+                idx = int(evt.get("stream_index", 0))
+                num_streams = int(evt.get("num_streams", 1))
+            except (TypeError, ValueError):
+                continue
+            if idx < 0:
+                continue
             data = evt.get("data")
-            if isinstance(data, str):
-                streams.setdefault(idx, bytearray()).extend(
-                    base64.b64decode(data)
-                )
+            if not isinstance(data, str):
+                continue
+            try:
+                decoded = base64.b64decode(data, validate=True)
+            except (binascii.Error, ValueError):
+                continue
+            streams.setdefault(idx, bytearray()).extend(decoded)
         elif t == "title":
             t_val = evt.get("title")
             if isinstance(t_val, str) and t_val.strip():

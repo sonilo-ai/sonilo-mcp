@@ -259,3 +259,33 @@ async def test_http_get_json_401_no_retry(monkeypatch):
     with pytest.raises(Exception, match="Invalid SONILO_API_KEY"):
         await _http_get_json("/v1/foo")
     assert route.call_count == 1  # no retry on 4xx
+
+
+@respx.mock
+async def test_http_get_json_network_error_retries_once(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    route = respx.get("https://api.test.local/v1/foo").mock(
+        side_effect=[
+            httpx.ConnectError("boom"),
+            httpx.Response(200, json={"ok": True}),
+        ]
+    )
+    from sonilo_mcp.api import _http_get_json
+    out = await _http_get_json("/v1/foo")
+    assert out == {"ok": True}
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_http_get_json_forwards_params(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    route = respx.get("https://api.test.local/v1/foo").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    from sonilo_mcp.api import _http_get_json
+    await _http_get_json("/v1/foo", params={"days": 7, "filter": "x"})
+    sent = route.calls.last.request.url.params
+    assert sent["days"] == "7"
+    assert sent["filter"] == "x"

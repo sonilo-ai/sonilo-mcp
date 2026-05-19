@@ -1,10 +1,13 @@
 """Sonilo MCP server — exposes Sonilo's /v1/* API as MCP tools over stdio."""
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
 from pathlib import Path
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("Sonilo")
@@ -101,20 +104,14 @@ def _resolve_input_file(
 
 # ---------- HTTP plumbing ----------
 
-import asyncio
-import json as _json
-
-import httpx
-
-
 def _extract_detail(body: str) -> str:
     """Pull the `detail` field out of a FastAPI error body, falling back to the raw body."""
     try:
-        parsed = _json.loads(body)
+        parsed = json.loads(body)
         if isinstance(parsed, dict) and "detail" in parsed:
             return str(parsed["detail"])
         return body
-    except (_json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError):
         return body
 
 
@@ -148,6 +145,11 @@ def _raise_http_error(status_code: int, body: str) -> None:
     raise Exception(f"Unexpected status {status_code}: {detail}")
 
 
+# Short timeout for lightweight GETs (services, usage). Streaming
+# generation calls use cfg["timeout"] (default 300s) instead.
+_GET_TIMEOUT_SECONDS = 30
+
+
 async def _http_get_json(path: str, params: dict | None = None) -> dict:
     """GET helper with one-shot retry on 5xx / network errors.
 
@@ -160,10 +162,9 @@ async def _http_get_json(path: str, params: dict | None = None) -> dict:
     url = cfg["api_url"].rstrip("/") + path
     headers = {"Authorization": f"Bearer {cfg['api_key']}"}
 
-    last_exc: Exception | None = None
     for attempt in (1, 2):
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=_GET_TIMEOUT_SECONDS) as client:
                 r = await client.get(url, headers=headers, params=params)
             if r.status_code >= 500 and attempt == 1:
                 await asyncio.sleep(1)
@@ -172,14 +173,10 @@ async def _http_get_json(path: str, params: dict | None = None) -> dict:
                 _raise_http_error(r.status_code, r.text)
             return r.json()
         except httpx.RequestError as e:
-            last_exc = e
             if attempt == 1:
                 await asyncio.sleep(1)
                 continue
             raise Exception(f"HTTP request failed: {e}") from e
-    if last_exc is not None:
-        raise Exception(f"HTTP request failed: {last_exc}") from last_exc
-    raise Exception("HTTP request failed: unreachable")
 
 
 # ---------- Entry point ----------

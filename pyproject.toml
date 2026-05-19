@@ -34,7 +34,7 @@ sonilo-mcp = "sonilo_mcp.api:main"
 
 [project.urls]
 Homepage = "https://platform.sonilo.com"
-Repository = "https://github.com/sonilo-ai/sonilo-api-dashboard"
+Repository = "https://github.com/sonilo-ai/sonilo-mcp"
 
 [build-system]
 requires = ["setuptools>=61", "wheel"]

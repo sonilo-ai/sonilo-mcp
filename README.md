@@ -82,7 +82,6 @@ Generated audio is saved as `.m4a` (AAC in MP4 container — this is what the ba
 ## Development
 
 ```bash
-cd mcp
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"

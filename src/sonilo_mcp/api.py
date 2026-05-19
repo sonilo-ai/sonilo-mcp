@@ -5,6 +5,7 @@ import asyncio
 import base64
 import binascii
 import json
+import mimetypes
 import os
 import re
 import time
@@ -352,6 +353,13 @@ _services_cache_expiry: float = 0.0
 _SERVICES_CACHE_TTL = 300  # seconds
 
 
+def _reset_services_cache() -> None:
+    """Test helper: force the next _get_max_upload_size_mb() call to refetch."""
+    global _services_cache, _services_cache_expiry
+    _services_cache = None
+    _services_cache_expiry = 0.0
+
+
 async def _get_max_upload_size_mb() -> int:
     """Cached lookup of /v1/account/services.max_upload_size_mb.
 
@@ -380,7 +388,8 @@ async def _get_max_upload_size_mb() -> int:
         "incur charges. Only use when explicitly requested by the user.\n\n"
         "Args:\n"
         "    video_path (str, optional): Absolute local path, or relative "
-        "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.avi/.wmv/.webm/.mkv.\n"
+        "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.avi/.wmv/.webm/.mkv. "
+        "Subject to the account's max upload size (typically 300 MB).\n"
         "    video_url (str, optional): HTTPS URL to a video file.\n"
         "    prompt (str, optional): Style hint for the generated music.\n"
         "    output_directory (str, optional): Where to save the resulting "
@@ -415,8 +424,9 @@ async def video_to_music(
                 f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
             )
         data = {"prompt": prompt} if prompt else None
+        mime, _ = mimetypes.guess_type(resolved.name)
         with open(resolved, "rb") as fh:
-            files = {"video": (resolved.name, fh.read(), "video/mp4")}
+            files = {"video": (resolved.name, fh.read(), mime or "application/octet-stream")}
         return await _post_streaming_generation(
             "/v1/video-to-music",
             out_path,

@@ -811,9 +811,8 @@ async def test_video_to_music_path_mode(monkeypatch, output_dir, tmp_path):
         return_value=httpx.Response(200, content=ndjson)
     )
     # Reset the services cache so this test gets a fresh lookup
-    import sonilo_mcp.api as api_mod
-    api_mod._services_cache = None
-    api_mod._services_cache_expiry = 0.0
+    from sonilo_mcp.api import _reset_services_cache
+    _reset_services_cache()
     from sonilo_mcp.api import video_to_music
     await video_to_music(video_path=str(video))
     # multipart upload should include the file content
@@ -838,9 +837,8 @@ async def test_video_to_music_path_too_large(monkeypatch, output_dir, tmp_path):
     upload_route = respx.post("https://api.test.local/v1/video-to-music").mock(
         return_value=httpx.Response(200, content=b"")
     )
-    import sonilo_mcp.api as api_mod
-    api_mod._services_cache = None
-    api_mod._services_cache_expiry = 0.0
+    from sonilo_mcp.api import _reset_services_cache
+    _reset_services_cache()
     from sonilo_mcp.api import video_to_music
     with pytest.raises(Exception, match="too large"):
         await video_to_music(video_path=str(video))

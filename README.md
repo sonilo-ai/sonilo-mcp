@@ -14,6 +14,15 @@ Or install with pip:
 pip install sonilo-mcp
 ```
 
+### Audio Playback Dependencies
+
+The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macOS/Linux, install via:
+
+- **macOS**: `brew install portaudio`
+- **Debian/Ubuntu**: `sudo apt-get install libportaudio2`
+
+`uvx sonilo-mcp` and `pip install` will pull the Python bindings, but the system PortAudio library must be installed separately. The other tools (`text_to_music`, `video_to_music`, `get_account_services`, `get_usage`) work without PortAudio.
+
 ## Configuration
 
 ### Claude Desktop

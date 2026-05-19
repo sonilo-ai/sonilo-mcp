@@ -377,7 +377,7 @@ async def _get_max_upload_size_mb() -> int:
             return 300
     try:
         return int(_services_cache.get("max_upload_size_mb") or 300)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AttributeError):
         return 300
 
 
@@ -518,7 +518,8 @@ def play_audio(input_file_path: str) -> TextContent:
 
 def main() -> None:
     """Run the MCP server over stdio transport."""
-    print("Starting Sonilo MCP server", flush=True)
+    import sys
+    print("Starting Sonilo MCP server", flush=True, file=sys.stderr)
     mcp.run()
 
 

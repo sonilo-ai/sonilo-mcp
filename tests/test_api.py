@@ -901,3 +901,16 @@ async def test_play_audio_invokes_playback(monkeypatch, tmp_path):
     assert called["sr"] == 44100
     assert called.get("waited") is True
     assert "Successfully played audio file" in out.text
+
+
+@respx.mock
+async def test_get_max_upload_size_mb_falls_back_on_failure(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(500, text="boom")
+    )
+    from sonilo_mcp.api import _get_max_upload_size_mb, _reset_services_cache
+    _reset_services_cache()
+    out = await _get_max_upload_size_mb()
+    assert out == 300

@@ -66,10 +66,34 @@ def test_make_output_path_default(monkeypatch, tmp_path):
     assert out.exists()
 
 
-def test_make_output_path_absolute(tmp_path):
+def test_make_output_path_absolute(tmp_path, monkeypatch):
+    # Absolute paths under the base directory are allowed.
+    monkeypatch.setenv("SONILO_MCP_BASE_PATH", str(tmp_path))
     from sonilo_mcp.api import _make_output_path
     out = _make_output_path(str(tmp_path / "abs"))
     assert out == tmp_path / "abs"
+    assert out.exists()
+
+
+def test_make_output_path_outside_base_rejected(tmp_path, monkeypatch):
+    # By default, writing outside SONILO_MCP_BASE_PATH is blocked.
+    base = tmp_path / "base"
+    base.mkdir()
+    monkeypatch.setenv("SONILO_MCP_BASE_PATH", str(base))
+    from sonilo_mcp.api import _make_output_path
+    with pytest.raises(Exception, match="outside the allowed base"):
+        _make_output_path(str(tmp_path / "elsewhere"))
+
+
+def test_make_output_path_outside_base_allowed_with_optout(tmp_path, monkeypatch):
+    # SONILO_MCP_ALLOW_ANY_PATH restores writing anywhere.
+    base = tmp_path / "base"
+    base.mkdir()
+    monkeypatch.setenv("SONILO_MCP_BASE_PATH", str(base))
+    monkeypatch.setenv("SONILO_MCP_ALLOW_ANY_PATH", "true")
+    from sonilo_mcp.api import _make_output_path
+    out = _make_output_path(str(tmp_path / "elsewhere"))
+    assert out == tmp_path / "elsewhere"
     assert out.exists()
 
 
@@ -113,6 +137,29 @@ def test_resolve_input_file_relative_with_base(monkeypatch, tmp_path):
     f = tmp_path / "song.mp3"
     f.write_bytes(b"x")
     out = _resolve_input_file("song.mp3", str(tmp_path), {".mp3"}, "audio")
+    assert out == f
+
+
+def test_resolve_input_file_outside_base_rejected(tmp_path):
+    # An existing file outside the base directory is blocked by default,
+    # preventing exfiltration of arbitrary on-disk files.
+    base = tmp_path / "base"
+    base.mkdir()
+    f = tmp_path / "secret.mp3"
+    f.write_bytes(b"x")
+    from sonilo_mcp.api import _resolve_input_file
+    with pytest.raises(Exception, match="outside the allowed base"):
+        _resolve_input_file(str(f), str(base), {".mp3"}, "audio")
+
+
+def test_resolve_input_file_outside_base_allowed_with_optout(tmp_path, monkeypatch):
+    base = tmp_path / "base"
+    base.mkdir()
+    f = tmp_path / "secret.mp3"
+    f.write_bytes(b"x")
+    monkeypatch.setenv("SONILO_MCP_ALLOW_ANY_PATH", "1")
+    from sonilo_mcp.api import _resolve_input_file
+    out = _resolve_input_file(str(f), str(base), {".mp3"}, "audio")
     assert out == f
 
 

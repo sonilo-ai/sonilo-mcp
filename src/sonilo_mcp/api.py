@@ -37,6 +37,9 @@ def _get_config() -> dict:
         "api_url": os.getenv("SONILO_API_URL", "https://api.sonilo.com"),
         "base_path": os.getenv("SONILO_MCP_BASE_PATH", base_default),
         "timeout": float(os.getenv("TIME_OUT_SECONDS", "300")),
+        "allow_any_path": os.getenv(
+            "SONILO_MCP_ALLOW_ANY_PATH", ""
+        ).strip().lower() in ("1", "true", "yes", "on"),
     }
 
 
@@ -46,6 +49,25 @@ def _is_file_writeable(path: Path) -> bool:
     if path.exists():
         return os.access(path, os.W_OK)
     return os.access(path.parent if path.parent.exists() else path.parent.parent, os.W_OK)
+
+
+def _is_within_base(path: Path, base_path: str | None) -> bool:
+    """Whether `path` resolves to a location inside `base_path`.
+
+    Confinement is the default: tools may only read/write under
+    SONILO_MCP_BASE_PATH, so a confused/compromised client can't read or
+    exfiltrate arbitrary files on disk. Returns True (no confinement) when
+    SONILO_MCP_ALLOW_ANY_PATH is set, or when no base_path is available.
+    Both paths are resolved first so symlinks can't escape the base.
+    """
+    if _get_config()["allow_any_path"] or not base_path:
+        return True
+    base = Path(os.path.expanduser(base_path)).resolve()
+    try:
+        path.resolve().relative_to(base)
+        return True
+    except ValueError:
+        return False
 
 
 def _make_output_path(output_directory: str | None) -> Path:
@@ -67,6 +89,12 @@ def _make_output_path(output_directory: str | None) -> Path:
         else:
             output_path = Path(os.path.expanduser(base_path)) / expanded
 
+    if not _is_within_base(output_path, base_path):
+        raise Exception(
+            f"Output directory ({output_path}) is outside the allowed base "
+            "directory (SONILO_MCP_BASE_PATH). Use a path under it, or set "
+            "SONILO_MCP_ALLOW_ANY_PATH=true to allow writing elsewhere."
+        )
     if not _is_file_writeable(output_path):
         raise Exception(f"Directory ({output_path}) is not writeable")
     output_path.mkdir(parents=True, exist_ok=True)
@@ -110,6 +138,12 @@ def _resolve_input_file(
         raise Exception(f"File ({path}) is not a file")
     if path.suffix.lower() not in allowed_exts:
         raise Exception(f"File ({path}) is not a recognized {kind} format")
+    if not _is_within_base(path, base_path):
+        raise Exception(
+            f"File ({path}) is outside the allowed base directory "
+            "(SONILO_MCP_BASE_PATH). Move it under that directory, or set "
+            "SONILO_MCP_ALLOW_ANY_PATH=true to allow reading it."
+        )
     return path
 
 

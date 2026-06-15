@@ -51,8 +51,18 @@ Get your API key at <https://platform.sonilo.com/dashboard/api-keys>.
 |---|---|---|
 | `SONILO_API_KEY` | _(required)_ | Bearer token. |
 | `SONILO_API_URL` | `https://api.sonilo.com` | Public API base URL. |
-| `SONILO_MCP_BASE_PATH` | `~/Desktop` | Default output directory and base for relative input paths. |
+| `SONILO_MCP_BASE_PATH` | `~/Desktop` | Default output directory and base for relative input paths. Also the confinement boundary (see below). |
+| `SONILO_MCP_ALLOW_ANY_PATH` | `false` | Set to `true` to let tools read/write files outside `SONILO_MCP_BASE_PATH`. |
 | `TIME_OUT_SECONDS` | `300` | Generation timeout. |
+
+### File access & confinement
+
+By default, the file tools (`video_to_music` input, `play_audio`, and any
+`output_directory`) are **confined to `SONILO_MCP_BASE_PATH`**. Paths that
+resolve outside it (after symlink resolution) are rejected. This limits the
+blast radius if a client is tricked into reading or exfiltrating arbitrary
+files. To opt out — e.g. to read a video from elsewhere on disk — set
+`SONILO_MCP_ALLOW_ANY_PATH=true`.
 
 ## Tools
 

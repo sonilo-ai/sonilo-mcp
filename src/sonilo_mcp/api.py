@@ -346,10 +346,13 @@ async def text_to_music(
     output_directory: str | None = None,
 ) -> list[TextContent]:
     out_path = _make_output_path(output_directory)
+    # The backend's text-to-music endpoint expects form fields, not a JSON
+    # body (same as video-to-music). Sending JSON yields a 422
+    # "Field required" for prompt/duration.
     return await _post_streaming_generation(
         "/v1/text-to-music",
         out_path,
-        json_body={"prompt": prompt, "duration": duration},
+        data={"prompt": prompt, "duration": duration},
     )
 
 

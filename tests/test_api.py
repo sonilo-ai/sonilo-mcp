@@ -617,11 +617,19 @@ async def test_text_to_music_writes_file(monkeypatch, output_dir):
          "data": base64.b64encode(audio).decode()},
         {"type": "complete"},
     ])
-    respx.post("https://api.test.local/v1/text-to-music").mock(
+    route = respx.post("https://api.test.local/v1/text-to-music").mock(
         return_value=httpx.Response(200, content=ndjson)
     )
     from sonilo_mcp.api import text_to_music
     result = await text_to_music(prompt="happy", duration=10)
+
+    # The backend expects form fields, not JSON — guard against regressing.
+    sent = route.calls.last.request
+    assert sent.headers["content-type"].startswith(
+        "application/x-www-form-urlencoded"
+    )
+    assert b"prompt=happy" in sent.content
+    assert b"duration=10" in sent.content
 
     assert len(result) == 1
     expected = output_dir / "happy-tune.m4a"
@@ -736,10 +744,16 @@ async def test_text_to_music_sends_correct_body(monkeypatch, output_dir):
         return_value=httpx.Response(200, content=ndjson)
     )
     from sonilo_mcp.api import text_to_music
+    from urllib.parse import parse_qs
     await text_to_music(prompt="energetic rock", duration=42)
-    body = json.loads(route.calls.last.request.content)
-    assert body == {"prompt": "energetic rock", "duration": 42}
-    auth = route.calls.last.request.headers["authorization"]
+    req = route.calls.last.request
+    # Backend expects form fields, not JSON.
+    assert req.headers["content-type"].startswith(
+        "application/x-www-form-urlencoded"
+    )
+    body = parse_qs(req.content.decode())
+    assert body == {"prompt": ["energetic rock"], "duration": ["42"]}
+    auth = req.headers["authorization"]
     assert auth == "Bearer k"
 
 

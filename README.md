@@ -1,18 +1,6 @@
 # Sonilo MCP Server
 
-An MCP (Model Context Protocol) server that exposes [Sonilo](https://platform.sonilo.com)'s AI music generation API to MCP-compatible clients (Claude Desktop, Cursor, etc.).
-
-## Install
-
-```bash
-uvx sonilo-mcp
-```
-
-Or install with pip:
-
-```bash
-pip install sonilo-mcp
-```
+An MCP (Model Context Protocol) server that exposes [Sonilo](https://platform.sonilo.com)'s AI music generation API to MCP-compatible clients (Claude Desktop, Codex).
 
 ### Audio Playback Dependencies
 
@@ -23,43 +11,83 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
 
 `uvx sonilo-mcp` and `pip install` will pull the Python bindings, but the system PortAudio library must be installed separately. The other tools (`text_to_music`, `video_to_music`, `get_account_services`, `get_usage`) work without PortAudio.
 
+## Quickstart with Claude Desktop
+
+1. **Get your API key** from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys).
+
+2. **Install the `uv` package manager** (provides `uvx`):
+
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+
+   See the [uv repo](https://github.com/astral-sh/uv) for other install methods.
+
+3. **Go to Claude > Settings > Developer > Edit Config > claude_desktop_config.json to include the following:**
+
+   ```json
+   {
+     "mcpServers": {
+       "sonilo": {
+         "command": "uvx",
+         "args": ["sonilo-mcp"],
+         "env": {
+           "SONILO_API_KEY": "sks_...",
+           "SONILO_API_URL": "https://api.sonilo.com",
+           "TIME_OUT_SECONDS": "300"
+         }
+       }
+     }
+   }
+   ```
+
+4. **Restart Claude Desktop.** You should see the Sonilo tools available in the tool menu.
+
+## Quickstart with Codex
+
+1. **Get your API key** from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys).
+
+2. **Install the `uv` package manager** (provides `uvx`):
+
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+
+3. **Go to Codex > Settings > MCP servers to fill out the following:
+
+![alt text](assets/CodexInstruction.png)
+
+
+  Or you can add the server** to `~/.codex/config.toml`:
+
+   ```toml
+   [mcp_servers.sonilo]
+   command = "uvx"
+   args = ["sonilo-mcp"]
+
+   [mcp_servers.sonilo.env]
+   SONILO_API_KEY = "sk_..."
+   SONILO_API_URL = "https://api.sonilo.com"
+   TIME_OUT_SECONDS = "300"
+   ```
+
+4. **Restart Codex** (or start a new session), then run `/mcp` to confirm `sonilo` is connected and its tools are listed.
+
+## Example usage
+
+Once the server is connected, just ask your assistant in natural language. For example:
+
+- *"Generate 30 seconds of upbeat lo-fi hip-hop for a study playlist and save it to my Desktop."*
+- *"Write an epic orchestral cinematic track, about 60 seconds long."*
+- *"Make background music that matches this video: `~/Desktop/promo.mp4`."*
+- *"Compose music for `https://example.com/clip.mp4` with a calm, ambient style."*
+- *"What Sonilo services and limits does my account have?"*
+- *"Show my Sonilo usage for the last 7 days."*
+- *"Play the track you just generated."*
+
+The assistant will call the matching tool (`text_to_music`, `video_to_music`, `get_account_services`, `get_usage`, or `play_audio`) and save generated audio to your configured output directory.
+
 ## Configuration
-
-### Claude Desktop
-
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
-
-```json
-{
-  "mcpServers": {
-    "sonilo": {
-      "command": "uvx",
-      "args": ["sonilo-mcp"],
-      "env": {
-        "SONILO_API_KEY": "sk_live_..."
-      }
-    }
-  }
-}
-```
-
-Get your API key at <https://platform.sonilo.com/dashboard/api-keys>.
-
-### Codex
-
-Add the server to `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.sonilo]
-command = "uvx"
-args = ["sonilo-mcp"]
-
-[mcp_servers.sonilo.env]
-SONILO_API_KEY = "sk_live_..."
-```
-
-Restart Codex (or start a new session) to load it, then run `/mcp` to confirm
-`sonilo` is connected and its tools are listed.
 
 ### Environment Variables
 
@@ -104,16 +132,3 @@ Generated audio is saved as `.m4a` (AAC in MP4 container — this is what the ba
 | `Insufficient minutes` / `Credit limit exceeded` | Top up at <https://platform.sonilo.com/dashboard/billing>. |
 | `Rate limit exceeded` | Check `get_account_services` for your rpm/concurrency limits. |
 | `Generation timed out` | Raise `TIME_OUT_SECONDS`. Check `get_usage` to confirm whether the backend completed and charged. |
-
-## Development
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-pytest
-```
-
-## License
-
-MIT

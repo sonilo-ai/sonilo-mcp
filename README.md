@@ -45,6 +45,22 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
 
 Get your API key at <https://platform.sonilo.com/dashboard/api-keys>.
 
+### Codex
+
+Add the server to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.sonilo]
+command = "uvx"
+args = ["sonilo-mcp"]
+
+[mcp_servers.sonilo.env]
+SONILO_API_KEY = "sk_live_..."
+```
+
+Restart Codex (or start a new session) to load it, then run `/mcp` to confirm
+`sonilo` is connected and its tools are listed.
+
 ### Environment Variables
 
 | Variable | Default | Description |

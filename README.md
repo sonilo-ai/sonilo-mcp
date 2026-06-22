@@ -34,7 +34,7 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
          "env": {
            "SONILO_API_KEY": "sks_...",
            "SONILO_API_URL": "https://api.sonilo.com",
-           "TIME_OUT_SECONDS": "300"
+           "TIME_OUT_SECONDS": "600"
          }
        }
      }
@@ -68,7 +68,7 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
    [mcp_servers.sonilo.env]
    SONILO_API_KEY = "sk_..."
    SONILO_API_URL = "https://api.sonilo.com"
-   TIME_OUT_SECONDS = "300"
+   TIME_OUT_SECONDS = "600"
    ```
 
 4. **Restart Codex** (or start a new session), then run `/mcp` to confirm `sonilo` is connected and its tools are listed.
@@ -97,7 +97,7 @@ The assistant will call the matching tool (`text_to_music`, `video_to_music`, `g
 | `SONILO_API_URL` | `https://api.sonilo.com` | Public API base URL. |
 | `SONILO_MCP_BASE_PATH` | `~/Desktop` | Default output directory and base for relative input paths. Also the confinement boundary (see below). |
 | `SONILO_MCP_ALLOW_ANY_PATH` | `false` | Set to `true` to let tools read/write files outside `SONILO_MCP_BASE_PATH`. |
-| `TIME_OUT_SECONDS` | `300` | Generation timeout. |
+| `TIME_OUT_SECONDS` | `600` | Generation timeout, in seconds. Aligned with the backend's read timeout. |
 
 ### File access & confinement
 
@@ -113,12 +113,14 @@ files. To opt out — e.g. to read a video from elsewhere on disk — set
 | Tool | Description | Cost |
 |---|---|---|
 | `text_to_music(prompt, duration, output_directory?)` | Generate music from a text prompt. | ✅ |
-| `video_to_music(video_path? \| video_url?, prompt?, output_directory?)` | Generate music matched to a video. | ✅ |
+| `video_to_music(video_path? \| video_url?, prompt?, output_directory?)` | Generate music matched to a video. Max duration **360s (6 min)**; subject to the account's upload-size cap (typically 300 MB). | ✅ |
 | `get_account_services()` | List available services and limits. | ❌ |
 | `get_usage(days=30)` | Show usage summary + per-day breakdown. | ❌ |
 | `play_audio(input_file_path)` | Play a local audio file. | ❌ |
 
 Tools marked ✅ make API calls that incur charges on your Sonilo account.
+
+> **Optional:** if [`ffprobe`](https://ffmpeg.org/) (part of FFmpeg) is installed, `video_to_music` checks a video's duration locally and rejects anything over 360s before uploading. Without it, the same limit is still enforced by the backend.
 
 ## Output Format
 

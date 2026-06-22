@@ -36,7 +36,11 @@ def _get_config() -> dict:
         "api_key": os.getenv("SONILO_API_KEY"),
         "api_url": os.getenv("SONILO_API_URL", "https://api.sonilo.com"),
         "base_path": os.getenv("SONILO_MCP_BASE_PATH", base_default),
-        "timeout": float(os.getenv("TIME_OUT_SECONDS", "300")),
+        # Default aligns with the backend's fal read timeout (600s, see
+        # backend/app/services/fal_service.py): a long generation can keep
+        # running—and charging—on the backend up to 600s, so timing out the
+        # client sooner would orphan a paid request.
+        "timeout": float(os.getenv("TIME_OUT_SECONDS", "600")),
         "allow_any_path": os.getenv(
             "SONILO_MCP_ALLOW_ANY_PATH", ""
         ).strip().lower() in ("1", "true", "yes", "on"),
@@ -145,6 +149,51 @@ def _resolve_input_file(
             "SONILO_MCP_ALLOW_ANY_PATH=true to allow reading it."
         )
     return path
+
+
+# Mirrors backend/app/services/video_service.py: the backend rejects videos
+# longer than this, so we pre-check locally to fail fast and skip a wasted
+# upload. Keep in sync with MAX_DURATION_SECONDS there.
+_MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes
+
+
+async def _check_video_duration(source: str) -> None:
+    """Best-effort local ffprobe pre-check of a video's duration.
+
+    Raises if the duration is known to exceed the backend's 360s cap, so the
+    caller fails fast instead of uploading a video the backend will reject.
+    `source` may be a local path or a URL (ffprobe handles both).
+
+    The check is best-effort: if ffprobe is not installed, times out, or
+    cannot parse the source, we stay silent and let the backend make the
+    final call rather than block a legitimate request.
+    """
+    if shutil.which("ffprobe") is None:
+        return
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            source,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except (asyncio.TimeoutError, OSError):
+        return  # fail open — let the backend decide
+    if proc.returncode != 0:
+        return
+    try:
+        duration = float(json.loads(stdout)["format"]["duration"])
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+        return
+    if duration > _MAX_VIDEO_DURATION_SECONDS:
+        raise Exception(
+            f"Video duration {duration:.1f}s exceeds the maximum of "
+            f"{_MAX_VIDEO_DURATION_SECONDS}s (6 minutes)"
+        )
 
 
 # ---------- HTTP plumbing ----------
@@ -365,7 +414,7 @@ async def _post_streaming_generation(
         "Args:\n"
         "    prompt (str): Description of the music to generate "
         "(1–1000 chars).\n"
-        "    duration (int): Length in seconds (1–300).\n"
+        "    duration (int): Length in seconds (1–360).\n"
         "    output_directory (str, optional): Absolute path, or relative "
         "to SONILO_MCP_BASE_PATH. Defaults to SONILO_MCP_BASE_PATH "
         "(~/Desktop unless overridden).\n\n"
@@ -431,7 +480,8 @@ async def _get_max_upload_size_mb() -> int:
         "Args:\n"
         "    video_path (str, optional): Absolute local path, or relative "
         "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.avi/.wmv/.webm/.mkv. "
-        "Subject to the account's max upload size (typically 300 MB).\n"
+        "Subject to the account's max upload size (typically 300 MB). "
+        "Maximum video duration is 360 seconds (6 minutes).\n"
         "    video_url (str, optional): HTTPS URL to a video file.\n"
         "    prompt (str, optional): Style hint for the generated music.\n"
         "    output_directory (str, optional): Where to save the resulting "
@@ -465,6 +515,7 @@ async def video_to_music(
             raise Exception(
                 f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
             )
+        await _check_video_duration(str(resolved))
         data = {"prompt": prompt} if prompt else None
         mime, _ = mimetypes.guess_type(resolved.name)
         with open(resolved, "rb") as fh:
@@ -477,6 +528,7 @@ async def video_to_music(
         )
 
     # video_url path — backend expects multipart form, not JSON
+    await _check_video_duration(video_url)
     form: dict = {"video_url": video_url}
     if prompt:
         form["prompt"] = prompt

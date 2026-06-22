@@ -23,7 +23,8 @@ def test_get_config_defaults(monkeypatch):
     assert cfg["api_key"] == "k1"
     assert cfg["api_url"] == "https://api.sonilo.com"
     assert cfg["base_path"] == str(Path.home() / "Desktop")
-    assert cfg["timeout"] == 300.0
+    # Aligned with the backend fal read timeout (600s).
+    assert cfg["timeout"] == 600.0
 
 
 def test_get_config_overrides(monkeypatch, tmp_path):
@@ -923,6 +924,88 @@ async def test_video_to_music_path_does_not_exist(monkeypatch, output_dir):
     from sonilo_mcp.api import video_to_music
     with pytest.raises(Exception, match="does not exist"):
         await video_to_music(video_path="/tmp/__definitely_not_real_video__.mp4")
+
+
+class _FakeProc:
+    """Stand-in for an asyncio subprocess returned by create_subprocess_exec."""
+
+    def __init__(self, stdout: bytes, returncode: int = 0):
+        self._stdout = stdout
+        self.returncode = returncode
+
+    async def communicate(self):
+        return self._stdout, b""
+
+
+def _patch_ffprobe(monkeypatch, *, duration=None, returncode=0, installed=True):
+    """Wire up a fake ffprobe that reports `duration` seconds."""
+    from sonilo_mcp import api
+
+    monkeypatch.setattr(
+        api.shutil, "which",
+        lambda name: "/usr/bin/ffprobe" if installed else None,
+    )
+    payload = (
+        json.dumps({"format": {"duration": str(duration)}}).encode()
+        if duration is not None else b""
+    )
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc(payload, returncode=returncode)
+
+    monkeypatch.setattr(api.asyncio, "create_subprocess_exec", fake_exec)
+
+
+async def test_check_video_duration_rejects_too_long(monkeypatch):
+    from sonilo_mcp.api import _check_video_duration
+    _patch_ffprobe(monkeypatch, duration=400.0)
+    with pytest.raises(Exception, match="exceeds the maximum"):
+        await _check_video_duration("/tmp/clip.mp4")
+
+
+async def test_check_video_duration_allows_within_limit(monkeypatch):
+    from sonilo_mcp.api import _check_video_duration
+    _patch_ffprobe(monkeypatch, duration=120.0)
+    await _check_video_duration("/tmp/clip.mp4")  # must not raise
+
+
+async def test_check_video_duration_skips_without_ffprobe(monkeypatch):
+    from sonilo_mcp.api import _check_video_duration
+    _patch_ffprobe(monkeypatch, duration=400.0, installed=False)
+    # ffprobe missing -> fail open, no raise even though it would be too long.
+    await _check_video_duration("/tmp/clip.mp4")
+
+
+async def test_check_video_duration_fails_open_on_probe_error(monkeypatch):
+    from sonilo_mcp.api import _check_video_duration
+    _patch_ffprobe(monkeypatch, returncode=1)  # ffprobe couldn't read it
+    await _check_video_duration("/tmp/clip.mp4")  # must not raise
+
+
+@respx.mock
+async def test_video_to_music_path_too_long(monkeypatch, output_dir, tmp_path):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    video = tmp_path / "long.mp4"
+    video.write_bytes(b"FAKE-MP4-BYTES")
+
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={
+            "available_services": [], "rpm_limit": 60,
+            "concurrency_limit": 1, "discount_factor": 1.0,
+            "max_upload_size_mb": 300,
+        })
+    )
+    upload_route = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(200, content=b"")
+    )
+    _patch_ffprobe(monkeypatch, duration=400.0)
+    from sonilo_mcp.api import _reset_services_cache, video_to_music
+    _reset_services_cache()
+    with pytest.raises(Exception, match="exceeds the maximum"):
+        await video_to_music(video_path=str(video))
+    # Must NOT upload an over-length video.
+    assert upload_route.call_count == 0
 
 
 async def test_play_audio_rejects_nonexistent(monkeypatch):

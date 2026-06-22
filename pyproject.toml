@@ -1,6 +1,6 @@
 [project]
 name = "sonilo-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server for Sonilo AI music generation API"
 authors = [{ name = "Sonilo", email = "support@sonilo.com" }]
 readme = "README.md"

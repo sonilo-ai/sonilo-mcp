@@ -15,6 +15,7 @@ import sys
 import time
 from pathlib import Path
 from typing import AsyncIterator
+from urllib.parse import urlparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -36,10 +37,9 @@ def _get_config() -> dict:
         "api_key": os.getenv("SONILO_API_KEY"),
         "api_url": os.getenv("SONILO_API_URL", "https://api.sonilo.com"),
         "base_path": os.getenv("SONILO_MCP_BASE_PATH", base_default),
-        # Default aligns with the backend's fal read timeout (600s, see
-        # backend/app/services/fal_service.py): a long generation can keep
-        # running—and charging—on the backend up to 600s, so timing out the
-        # client sooner would orphan a paid request.
+        # Default aligns with the backend's generation read timeout (600s): a
+        # long generation can keep running—and charging—on the backend up to
+        # 600s, so timing out the client sooner would orphan a paid request.
         "timeout": float(os.getenv("TIME_OUT_SECONDS", "600")),
         "allow_any_path": os.getenv(
             "SONILO_MCP_ALLOW_ANY_PATH", ""
@@ -151,9 +151,8 @@ def _resolve_input_file(
     return path
 
 
-# Mirrors backend/app/services/video_service.py: the backend rejects videos
-# longer than this, so we pre-check locally to fail fast and skip a wasted
-# upload. Keep in sync with MAX_DURATION_SECONDS there.
+# The backend rejects videos longer than this, so we pre-check locally to fail
+# fast and skip a wasted upload. Keep in sync with the backend's limit.
 _MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes
 
 
@@ -286,7 +285,7 @@ async def _consume_ndjson_lines(
         Exception if an error event is seen, or if the stream ends without
         a `complete` event.
 
-    Event types per backend/app/services/stream_events.py:
+    Event types in the backend's NDJSON stream:
         - audio_chunk: append base64-decoded bytes to streams[stream_index]
         - title: capture optional title for filename
         - complete: terminal success
@@ -454,8 +453,7 @@ def _reset_services_cache() -> None:
 async def _get_max_upload_size_mb() -> int:
     """Cached lookup of /v1/account/services.max_upload_size_mb.
 
-    Returns 300 if the call fails (matches the backend default in
-    backend/app/routers/v1/video_to_music.py).
+    Returns 300 if the call fails (matches the backend's default cap).
     """
     global _services_cache, _services_cache_expiry
     now = time.time()
@@ -501,6 +499,16 @@ async def video_to_music(
         raise Exception(
             "Provide either video_path or video_url (exactly one, not both)"
         )
+
+    if video_url:
+        # Restrict to http(s) before the URL ever reaches the local ffprobe
+        # pre-check or the backend. Without this, a caller (e.g. via prompt
+        # injection) could pass file:// to probe local files, an internal
+        # address to trigger SSRF from this machine, or a "-"-prefixed value
+        # to inject ffprobe flags.
+        scheme = urlparse(video_url).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise Exception("video_url must be an http:// or https:// URL")
 
     out_path = _make_output_path(output_directory)
     cfg = _get_config()

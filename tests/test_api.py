@@ -853,6 +853,25 @@ async def test_video_to_music_both_inputs_rejected(monkeypatch, output_dir):
         await video_to_music(video_url="https://x", video_path="/tmp/x.mp4")
 
 
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "file:///etc/passwd",
+        "ftp://example.com/v.mp4",
+        "-i",  # would inject an ffprobe flag; urlparse yields empty scheme
+        "/etc/passwd",
+        "169.254.169.254/latest/meta-data/",
+    ],
+)
+async def test_video_to_music_rejects_non_http_url(monkeypatch, output_dir, bad_url):
+    """video_url must be http(s) — guards against local file probing, SSRF,
+    and ffprobe argument injection before the value reaches ffprobe/backend."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp.api import video_to_music
+    with pytest.raises(Exception, match="http"):
+        await video_to_music(video_url=bad_url)
+
+
 async def test_video_to_music_no_input_rejected(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     from sonilo_mcp.api import video_to_music

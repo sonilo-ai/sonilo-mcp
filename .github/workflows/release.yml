@@ -25,6 +25,9 @@ jobs:
   build-and-publish:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      # Required for PyPI Trusted Publishing (OIDC). No PYPI_TOKEN secret needed.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -43,7 +46,9 @@ jobs:
             exit 1
           fi
       - name: Publish to PyPI
+        # Authenticates via OIDC Trusted Publishing — configure this repo as a
+        # trusted publisher at https://pypi.org/manage/project/sonilo-mcp/settings/publishing/
+        # (workflow: release.yml). No password/token required.
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          password: ${{ secrets.PYPI_TOKEN }}
           skip-existing: true

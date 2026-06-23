@@ -77,8 +77,8 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
 
 Once the server is connected, just ask your assistant in natural language. For example:
 
-- *"Generate 30 seconds of upbeat lo-fi hip-hop for a study playlist and save it to my Desktop."*
-- *"Write an epic orchestral cinematic track, about 60 seconds long."*
+- *"Use Sonilo mcp to generate 30 seconds of upbeat lo-fi hip-hop for a study playlist and save it to my Desktop."*
+- *"Use Sonilo to write an epic orchestral cinematic track, about 60 seconds long."*
 - *"Make background music that matches this video: `~/Desktop/promo.mp4`."*
 - *"Compose music for `https://example.com/clip.mp4` with a calm, ambient style."*
 - *"What Sonilo services and limits does my account have?"*

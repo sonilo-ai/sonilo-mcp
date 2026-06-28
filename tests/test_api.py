@@ -1183,3 +1183,52 @@ async def test_post_streaming_sends_client_headers(monkeypatch, output_dir):
     assert req.headers["X-Sonilo-Client"] == "mcp"
     assert req.headers["X-Sonilo-Client-Version"]
     assert req.headers["User-Agent"].startswith("sonilo-mcp/")
+
+
+@respx.mock
+async def test_http_get_json_sends_host_headers_from_clientinfo(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k1")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    import sonilo_mcp.api as api
+
+    class _Info:
+        name = "claude-ai"
+        version = "1.2.3"
+
+    class _Params:
+        clientInfo = _Info()
+
+    class _Session:
+        client_params = _Params()
+
+    class _Ctx:
+        session = _Session()
+
+    monkeypatch.setattr(api.mcp, "get_context", lambda: _Ctx())
+    route = respx.get("https://api.test.local/v1/foo").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    await api._http_get_json("/v1/foo")
+    req = route.calls[0].request
+    assert req.headers["X-Sonilo-Client-Host"] == "claude-ai"
+    assert req.headers["X-Sonilo-Client-Host-Version"] == "1.2.3"
+
+
+@respx.mock
+async def test_http_get_json_omits_host_headers_when_no_context(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k1")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    import sonilo_mcp.api as api
+
+    def _boom():
+        raise RuntimeError("no active request context")
+
+    monkeypatch.setattr(api.mcp, "get_context", _boom)
+    route = respx.get("https://api.test.local/v1/foo").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    await api._http_get_json("/v1/foo")
+    req = route.calls[0].request
+    assert "X-Sonilo-Client-Host" not in req.headers
+    # The base client marker is still present — only host attribution is absent.
+    assert req.headers["X-Sonilo-Client"] == "mcp"

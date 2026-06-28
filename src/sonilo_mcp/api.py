@@ -39,6 +39,30 @@ _CLIENT_HEADERS = {
 }
 
 
+def _host_headers() -> dict[str, str]:
+    """Best-effort headers identifying the MCP *host* app (Claude, Cursor,
+    Codex, …).
+
+    The host self-reports a ``clientInfo {name, version}`` during the MCP
+    ``initialize`` handshake; we read it from the live session and forward it
+    so the backend can attribute traffic to the host. Returns ``{}`` if the
+    context/session/clientInfo is unavailable for any reason — host
+    attribution must never break a request. Values are length-capped.
+    """
+    try:
+        info = mcp.get_context().session.client_params.clientInfo
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    name = getattr(info, "name", None)
+    version = getattr(info, "version", None)
+    if name:
+        out["X-Sonilo-Client-Host"] = str(name)[:64]
+    if version:
+        out["X-Sonilo-Client-Host-Version"] = str(version)[:64]
+    return out
+
+
 # ---------- Configuration ----------
 
 def _get_config() -> dict:
@@ -268,7 +292,7 @@ async def _http_get_json(path: str, params: dict | None = None) -> dict:
     if not cfg["api_key"]:
         raise Exception(f"SONILO_API_KEY not set — see {_API_KEYS_URL}")
     url = cfg["api_url"].rstrip("/") + path
-    headers = {"Authorization": f"Bearer {cfg['api_key']}", **_CLIENT_HEADERS}
+    headers = {"Authorization": f"Bearer {cfg['api_key']}", **_CLIENT_HEADERS, **_host_headers()}
 
     for attempt in (1, 2):
         try:
@@ -376,7 +400,7 @@ async def _post_streaming_generation(
     if not cfg["api_key"]:
         raise Exception(f"SONILO_API_KEY not set — see {_API_KEYS_URL}")
     url = cfg["api_url"].rstrip("/") + path
-    headers = {"Authorization": f"Bearer {cfg['api_key']}", **_CLIENT_HEADERS}
+    headers = {"Authorization": f"Bearer {cfg['api_key']}", **_CLIENT_HEADERS, **_host_headers()}
 
     try:
         async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:

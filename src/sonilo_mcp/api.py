@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import AsyncIterator
 from urllib.parse import urlparse
@@ -22,6 +23,20 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 
 mcp = FastMCP("Sonilo")
+
+try:
+    _CLIENT_VERSION = _pkg_version("sonilo-mcp")
+except PackageNotFoundError:  # running from source without an installed dist
+    _CLIENT_VERSION = "unknown"
+
+# Sent on every request so the backend can attribute traffic to the MCP.
+# Only X-Sonilo-Client is trusted by the backend for statistics; User-Agent
+# is a convenience so the marker also shows up in access logs.
+_CLIENT_HEADERS = {
+    "X-Sonilo-Client": "mcp",
+    "X-Sonilo-Client-Version": _CLIENT_VERSION,
+    "User-Agent": f"sonilo-mcp/{_CLIENT_VERSION}",
+}
 
 
 # ---------- Configuration ----------
@@ -253,7 +268,7 @@ async def _http_get_json(path: str, params: dict | None = None) -> dict:
     if not cfg["api_key"]:
         raise Exception(f"SONILO_API_KEY not set — see {_API_KEYS_URL}")
     url = cfg["api_url"].rstrip("/") + path
-    headers = {"Authorization": f"Bearer {cfg['api_key']}"}
+    headers = {"Authorization": f"Bearer {cfg['api_key']}", **_CLIENT_HEADERS}
 
     for attempt in (1, 2):
         try:
@@ -361,7 +376,7 @@ async def _post_streaming_generation(
     if not cfg["api_key"]:
         raise Exception(f"SONILO_API_KEY not set — see {_API_KEYS_URL}")
     url = cfg["api_url"].rstrip("/") + path
-    headers = {"Authorization": f"Bearer {cfg['api_key']}"}
+    headers = {"Authorization": f"Bearer {cfg['api_key']}", **_CLIENT_HEADERS}
 
     try:
         async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:

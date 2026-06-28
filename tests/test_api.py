@@ -1142,3 +1142,93 @@ async def test_get_max_upload_size_mb_falls_back_on_failure(monkeypatch):
     _reset_services_cache()
     out = await _get_max_upload_size_mb()
     assert out == 300
+
+
+@respx.mock
+async def test_http_get_json_sends_client_headers(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k1")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    route = respx.get("https://api.test.local/v1/foo").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    from sonilo_mcp.api import _http_get_json
+    await _http_get_json("/v1/foo")
+    req = route.calls[0].request
+    assert req.headers["X-Sonilo-Client"] == "mcp"
+    assert req.headers["X-Sonilo-Client-Version"]  # non-empty
+    assert req.headers["User-Agent"].startswith("sonilo-mcp/")
+
+
+@respx.mock
+async def test_post_streaming_sends_client_headers(monkeypatch, output_dir):
+    import base64
+    import json as _json
+    monkeypatch.setenv("SONILO_API_KEY", "k1")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    ndjson = (
+        _json.dumps({
+            "type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+            "data": base64.b64encode(b"x").decode(),
+        }) + "\n"
+        + _json.dumps({"type": "complete"}) + "\n"
+    ).encode()
+    route = respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import _post_streaming_generation
+    await _post_streaming_generation(
+        "/v1/text-to-music", output_dir, data={"prompt": "p", "duration": 5}
+    )
+    req = route.calls[0].request
+    assert req.headers["X-Sonilo-Client"] == "mcp"
+    assert req.headers["X-Sonilo-Client-Version"]
+    assert req.headers["User-Agent"].startswith("sonilo-mcp/")
+
+
+@respx.mock
+async def test_http_get_json_sends_host_headers_from_clientinfo(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k1")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    import sonilo_mcp.api as api
+
+    class _Info:
+        name = "claude-ai"
+        version = "1.2.3"
+
+    class _Params:
+        clientInfo = _Info()
+
+    class _Session:
+        client_params = _Params()
+
+    class _Ctx:
+        session = _Session()
+
+    monkeypatch.setattr(api.mcp, "get_context", lambda: _Ctx())
+    route = respx.get("https://api.test.local/v1/foo").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    await api._http_get_json("/v1/foo")
+    req = route.calls[0].request
+    assert req.headers["X-Sonilo-Client-Host"] == "claude-ai"
+    assert req.headers["X-Sonilo-Client-Host-Version"] == "1.2.3"
+
+
+@respx.mock
+async def test_http_get_json_omits_host_headers_when_no_context(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k1")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    import sonilo_mcp.api as api
+
+    def _boom():
+        raise RuntimeError("no active request context")
+
+    monkeypatch.setattr(api.mcp, "get_context", _boom)
+    route = respx.get("https://api.test.local/v1/foo").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    await api._http_get_json("/v1/foo")
+    req = route.calls[0].request
+    assert "X-Sonilo-Client-Host" not in req.headers
+    # The base client marker is still present — only host attribution is absent.
+    assert req.headers["X-Sonilo-Client"] == "mcp"

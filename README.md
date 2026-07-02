@@ -2,6 +2,13 @@
 
 An MCP (Model Context Protocol) server that exposes [Sonilo](https://platform.sonilo.com)'s AI music generation API to MCP-compatible clients (Claude Desktop, Codex).
 
+## Why Sonilo
+
+- **Video-to-music** — give it a video and Sonilo composes a full-length score matched to its pacing, motion, and emotion. Transitions and beat drops align to your cut points, and the track matches the video's duration exactly — no prompts or manual syncing required.
+- **Text-to-music** — generate tracks from a text description (genre, mood, tempo, instrumentation) at an exact duration (1–360s).
+- **Fully licensed, commercial-safe** — music licensed via Shutterstock; every generated track is cleared for commercial use on social, brand content, and advertising, with no Content ID worries.
+- **Pay as you go** — billed only for the seconds of music you generate; new accounts get free credits on signup.
+
 ### Audio Playback Dependencies
 
 The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macOS/Linux, install via:

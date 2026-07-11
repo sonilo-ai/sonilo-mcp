@@ -446,7 +446,9 @@ async def _post_streaming_generation(
 @mcp.tool(
     description=(
         "Generate music from a text prompt and save the resulting audio "
-        "file(s) to a local directory.\n\n"
+        "file(s) to a local directory. Generated tracks are fully licensed "
+        "(music licensed via Shutterstock) and cleared for commercial use "
+        "on social, brand content, and advertising.\n\n"
         "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
         "incur charges. Only use when explicitly requested by the user.\n\n"
         "Args:\n"
@@ -510,8 +512,13 @@ async def _get_max_upload_size_mb() -> int:
 
 @mcp.tool(
     description=(
-        "Generate music that matches the soundtrack of a video. Provide "
-        "either a local video file path or a publicly accessible video URL.\n\n"
+        "Generate an original score for a video: Sonilo analyzes the video's "
+        "pacing, motion, and emotion, aligns transitions and beat drops to "
+        "its cut points, and matches the video's duration exactly. Provide "
+        "either a local video file path or a publicly accessible video URL. "
+        "Generated tracks are fully licensed (music licensed via "
+        "Shutterstock) and cleared for commercial use on social, brand "
+        "content, and advertising.\n\n"
         "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
         "incur charges. Only use when explicitly requested by the user.\n\n"
         "Args:\n"

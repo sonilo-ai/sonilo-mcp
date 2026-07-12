@@ -140,6 +140,10 @@ def _make_output_path(output_directory: str | None) -> Path:
         )
     if not _is_file_writeable(output_path):
         raise Exception(f"Directory ({output_path}) is not writeable")
+    if output_path.exists() and not output_path.is_dir():
+        raise Exception(
+            f"Output directory ({output_path}) exists but is not a directory"
+        )
     output_path.mkdir(parents=True, exist_ok=True)
     return output_path
 
@@ -494,7 +498,19 @@ async def _post_task_submit(
             f"Backend accepted the request (status {r.status_code}) but "
             "returned no task_id"
         )
-    return str(task_id)
+    task_id = str(task_id)
+    # The user is charged as of this point. If the tool call is cancelled
+    # before anything else records the id (e.g. asyncio.CancelledError
+    # during polling/download, which propagates as a BaseException and
+    # bypasses the recovery-wrapping Exception handlers), this stderr line
+    # is the only surviving record — without it a cancelled call makes a
+    # paid task genuinely unrecoverable (no list-tasks endpoint exists).
+    print(
+        f"[sonilo-mcp] task submitted: {task_id} (recover with get_sfx_task)",
+        file=sys.stderr,
+        flush=True,
+    )
+    return task_id
 
 
 _POLL_INTERVAL_SECONDS = 5.0
@@ -511,7 +527,7 @@ def _end_sentence(value: object) -> str:
     would otherwise read as "No space left on device Task id: ..." with no
     separator.
     """
-    text = str(value)
+    text = str(value).rstrip()
     if text and text[-1] not in ".!?":
         return text + "."
     return text
@@ -562,14 +578,39 @@ def _ext_from_content_type(content_type: str | None) -> str:
     return _AUDIO_CONTENT_TYPE_EXTS.get((content_type or "").lower(), ".m4a")
 
 
+_ARTIFACT_DEST_MAX_ATTEMPTS = 10_000
+
+
 def _artifact_dest(output_path: Path, base_name: str, ext: str) -> Path:
-    """First non-existing path for base_name+ext, appending -1, -2, …"""
-    dest = output_path / f"{base_name}{ext}"
-    n = 1
-    while dest.exists():
-        dest = output_path / f"{base_name}-{n}{ext}"
-        n += 1
-    return dest
+    """Reserve and return the first available path for base_name+ext,
+    appending -1, -2, … on collision.
+
+    Reservation is ATOMIC: each candidate is claimed with
+    os.O_CREAT | os.O_EXCL, which fails if the file already exists, instead
+    of a plain exists() probe. This closes a TOCTOU race: the caller's
+    actual write happens later, after an `await` on the network GET — with
+    a mere existence check, two concurrent callers (e.g. an MCP host
+    retrying a slow call while the first is still in flight) can both pick
+    the same free name and one clobbers the other's paid result. Reserving
+    the name up front (via the exclusive create) means the second caller's
+    O_EXCL fails and it moves on to the next suffix.
+
+    The returned path exists (empty) by the time this returns; the caller
+    is responsible for removing it on any failure to actually populate it
+    (see _download_artifact).
+    """
+    for n in range(_ARTIFACT_DEST_MAX_ATTEMPTS):
+        dest = output_path / (f"{base_name}{ext}" if n == 0 else f"{base_name}-{n}{ext}")
+        try:
+            fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return dest
+    raise Exception(
+        f"Could not reserve a free filename for {base_name}{ext} in "
+        f"{output_path} after {_ARTIFACT_DEST_MAX_ATTEMPTS} attempts"
+    )
 
 
 async def _download_artifact(url: str, dest: Path) -> None:
@@ -585,6 +626,14 @@ async def _download_artifact(url: str, dest: Path) -> None:
     has the task_id) wraps these failures with the single, complete recovery
     instruction. Duplicating that instruction here would just make the
     caller's wrapped message repeat itself.
+
+    `dest` is expected to already exist (empty) — _artifact_dest reserves it
+    atomically before this is called, to close a TOCTOU race where two
+    concurrent callers could otherwise pick the same free path. On ANY
+    failure here (bad status, a network error, or the write loop dying
+    mid-stream), the reserved file is removed: leaving it behind would both
+    hand the user a corrupt/empty artifact and make a retry pick a new
+    suffixed path from _artifact_dest, permanently orphaning the file.
     """
     cfg = _get_config()
     try:
@@ -594,19 +643,15 @@ async def _download_artifact(url: str, dest: Path) -> None:
                     raise Exception(
                         f"Artifact download failed (status {r.status_code})."
                     )
-                # If the write loop dies mid-stream (for ANY reason), remove
-                # the truncated file: leaving it would both hand the user a
-                # corrupt artifact and make a retry pick a new suffixed path
-                # from _artifact_dest, permanently orphaning the partial file.
-                try:
-                    with open(dest, "wb") as fh:
-                        async for chunk in r.aiter_bytes():
-                            fh.write(chunk)
-                except BaseException:
-                    dest.unlink(missing_ok=True)
-                    raise
+                with open(dest, "wb") as fh:
+                    async for chunk in r.aiter_bytes():
+                        fh.write(chunk)
     except httpx.RequestError as e:
+        dest.unlink(missing_ok=True)
         raise Exception(f"Artifact download failed: {e}") from e
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
 
 
 async def _save_task_artifacts(

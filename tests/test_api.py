@@ -8,6 +8,7 @@ def test_package_imports():
     assert mcp.name == "Sonilo"
 
 
+import asyncio
 import base64
 import json
 import os
@@ -128,6 +129,19 @@ def test_make_output_path_unwriteable(tmp_path, monkeypatch):
     with pytest.raises(Exception, match="not writeable"):
         _make_output_path(str(locked / "child"))
     locked.chmod(0o700)
+
+
+def test_make_output_path_rejects_existing_file(tmp_path, monkeypatch):
+    # If SONILO_MCP_BASE_PATH resolves to an existing writable FILE (not a
+    # directory), _make_output_path must raise a clear error instead of
+    # letting Path.mkdir() blow up with a raw FileExistsError.
+    f = tmp_path / "base_is_a_file"
+    f.write_text("i'm a file, not a directory")
+    monkeypatch.setenv("SONILO_MCP_BASE_PATH", str(f))
+    from sonilo_mcp.api import _make_output_path
+    with pytest.raises(Exception, match="not a directory") as exc:
+        _make_output_path(None)
+    assert not isinstance(exc.value, FileExistsError)
 
 
 def test_resolve_input_file_absolute(tmp_path):
@@ -1264,6 +1278,19 @@ async def test_http_get_json_omits_host_headers_when_no_context(monkeypatch):
 # ---------- SFX task pipeline ----------
 
 
+def test_end_sentence_trailing_whitespace():
+    from sonilo_mcp.api import _end_sentence
+    # Trailing whitespace must be stripped before inspecting the last char,
+    # otherwise appended prose produces a dangling space or a doubled period.
+    assert _end_sentence("Failed with trailing space ") == "Failed with trailing space."
+    assert _end_sentence("Failed. ") == "Failed."
+    # Existing behavior for non-whitespace-trailing input stays unaffected.
+    assert _end_sentence("Failed") == "Failed."
+    assert _end_sentence("Failed.") == "Failed."
+    assert _end_sentence("Failed!") == "Failed!"
+    assert _end_sentence("Failed?") == "Failed?"
+
+
 @respx.mock
 async def test_post_task_submit_returns_task_id(monkeypatch):
     monkeypatch.setenv("SONILO_API_KEY", "k")
@@ -1281,6 +1308,28 @@ async def test_post_task_submit_returns_task_id(monkeypatch):
     sent = route.calls.last.request
     assert sent.headers["authorization"] == "Bearer k"
     assert b"prompt=boom" in sent.content
+
+
+@respx.mock
+async def test_post_task_submit_logs_task_id(monkeypatch, capsys):
+    # After a submit succeeds, the user is charged and the task_id is the
+    # only way to recover the result. If the tool call is cancelled before
+    # anything else records it (see cancellation-during-poll concern), a
+    # stderr line is the last line of defense — so it must be emitted right
+    # after the task_id is known, unconditionally.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-log-1", "status": "processing"}
+        )
+    )
+    from sonilo_mcp.api import _post_task_submit
+    task_id = await _post_task_submit("/v1/text-to-sfx", data={"prompt": "x"})
+    assert task_id == "t-log-1"
+    captured = capsys.readouterr()
+    assert "t-log-1" in captured.err
+    assert "get_sfx_task" in captured.err
 
 
 @respx.mock
@@ -1480,6 +1529,82 @@ def test_artifact_dest_avoids_collisions(tmp_path):
     assert second == tmp_path / "boom-1.m4a"
     second.write_bytes(b"y")
     assert _artifact_dest(tmp_path, "boom", ".m4a") == tmp_path / "boom-2.m4a"
+
+
+def test_artifact_dest_reserves_path_atomically(tmp_path):
+    # _artifact_dest must RESERVE the path it picks (by creating the file)
+    # rather than merely checking exists() — otherwise two concurrent
+    # callers racing between "pick a path" and "actually write the file"
+    # (an await boundary sits in between in _download_artifact) both pick
+    # the same free name and one silently clobbers the other's paid result.
+    #
+    # With no file written in between, two sequential calls must still
+    # return DIFFERENT paths — proving the first call already claimed
+    # "boom.m4a" for itself.
+    from sonilo_mcp.api import _artifact_dest
+    first = _artifact_dest(tmp_path, "boom", ".m4a")
+    second = _artifact_dest(tmp_path, "boom", ".m4a")
+    assert first == tmp_path / "boom.m4a"
+    assert second == tmp_path / "boom-1.m4a"
+    assert first != second
+    # The reserved paths must exist on disk (empty) immediately, since the
+    # reservation itself is what prevents the race.
+    assert first.exists()
+    assert second.exists()
+
+
+@respx.mock
+async def test_save_task_artifacts_concurrent_calls_get_distinct_files(
+    monkeypatch, tmp_path
+):
+    # Regression test for the TOCTOU race: two concurrent _save_task_artifacts
+    # calls with the SAME base_name (e.g. an MCP host retrying a slow
+    # text_to_sfx call while the first is still in flight, or simply two
+    # calls sharing a prompt) must not clobber each other. The first
+    # download is held open past the point where the second call resolves
+    # its destination path, mimicking the await boundary between path
+    # selection and file write.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp.api import _save_task_artifacts
+
+    start_event = asyncio.Event()
+    release_event = asyncio.Event()
+    call_count = 0
+
+    async def slow_side_effect(request):
+        nonlocal call_count
+        call_count += 1
+        n = call_count
+        if n == 1:
+            start_event.set()
+            await release_event.wait()
+        return httpx.Response(200, content=f"AUDIO-DATA-{n}".encode())
+
+    respx.get("https://r2.test/race.wav").mock(side_effect=slow_side_effect)
+
+    body = {
+        "status": "succeeded",
+        "audio": {"url": "https://r2.test/race.wav", "content_type": "audio/wav"},
+    }
+
+    async def call1():
+        return await _save_task_artifacts(body, tmp_path, "thunder", "task-1")
+
+    async def call2():
+        await start_event.wait()
+        result = await _save_task_artifacts(body, tmp_path, "thunder", "task-2")
+        release_event.set()
+        return result
+
+    r1, r2 = await asyncio.gather(call1(), call2())
+    assert len(r1) == 1 and len(r2) == 1
+
+    files = sorted(tmp_path.iterdir())
+    assert [p.name for p in files] == ["thunder-1.wav", "thunder.wav"]
+    payloads = {p.read_bytes() for p in files}
+    # Both payloads must survive intact — neither call's paid result was
+    # silently destroyed by the other.
+    assert payloads == {b"AUDIO-DATA-1", b"AUDIO-DATA-2"}
 
 
 @respx.mock

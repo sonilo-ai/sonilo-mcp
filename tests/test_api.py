@@ -1489,7 +1489,7 @@ async def test_save_task_artifacts_audio_only(monkeypatch, tmp_path):
         "task_id": "t-1", "status": "succeeded",
         "audio": {"url": "https://r2.test/a.m4a", "content_type": "audio/mp4"},
     }
-    result = await _save_task_artifacts(body, tmp_path, "boom")
+    result = await _save_task_artifacts(body, tmp_path, "boom", "t-1")
     assert len(result) == 1
     expected = tmp_path / "boom.m4a"
     assert expected.read_bytes() == b"audio-bytes"
@@ -1511,7 +1511,7 @@ async def test_save_task_artifacts_audio_and_video(monkeypatch, tmp_path):
         "audio": {"url": "https://r2.test/a.wav", "content_type": "audio/wav"},
         "video": {"url": "https://r2.test/v.mp4", "content_type": "video/mp4"},
     }
-    result = await _save_task_artifacts(body, tmp_path, "scene")
+    result = await _save_task_artifacts(body, tmp_path, "scene", "t-2")
     assert len(result) == 2
     assert (tmp_path / "scene.wav").read_bytes() == b"wav-bytes"
     assert (tmp_path / "scene.mp4").read_bytes() == b"mp4-bytes"
@@ -1536,7 +1536,7 @@ async def test_save_task_artifacts_video_failure_reports_saved_audio(
     }
     audio_dest = tmp_path / "scene2.wav"
     with pytest.raises(Exception) as exc:
-        await _save_task_artifacts(body, tmp_path, "scene2")
+        await _save_task_artifacts(body, tmp_path, "scene2", "t-77")
     msg = str(exc.value)
     assert "t-77" in msg
     assert str(audio_dest) in msg
@@ -1559,10 +1559,34 @@ async def test_save_task_artifacts_dest_error_mentions_task_id(monkeypatch, tmp_
         "audio": {"url": "https://r2.test/a.m4a", "content_type": "audio/mp4"},
     }
     with pytest.raises(Exception) as exc:
-        await api._save_task_artifacts(body, tmp_path, "x")
+        await api._save_task_artifacts(body, tmp_path, "x", "t-dest-err")
     msg = str(exc.value)
     assert "t-dest-err" in msg
     assert "get_sfx_task" in msg
+
+
+@respx.mock
+async def test_save_task_artifacts_uses_caller_task_id_when_body_omits_it(
+    monkeypatch, tmp_path
+):
+    # If the backend's terminal body ever omits task_id, the caller-supplied
+    # task_id (already known-good from submission/the tool arg) must still
+    # be used for the recovery hint — never body.get("task_id") -> None.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/a3.m4a").mock(
+        return_value=httpx.Response(403, text="expired")
+    )
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "status": "succeeded",
+        "audio": {"url": "https://r2.test/a3.m4a", "content_type": "audio/mp4"},
+    }
+    with pytest.raises(Exception) as exc:
+        await _save_task_artifacts(body, tmp_path, "x", "t-caller")
+    msg = str(exc.value)
+    assert "t-caller" in msg
+    assert "get_sfx_task" in msg
+    assert "None" not in msg
 
 
 async def test_save_task_artifacts_failed_refunded(tmp_path):
@@ -1573,11 +1597,12 @@ async def test_save_task_artifacts_failed_refunded(tmp_path):
         "refunded": True,
     }
     with pytest.raises(Exception) as exc:
-        await _save_task_artifacts(body, tmp_path, "x")
+        await _save_task_artifacts(body, tmp_path, "x", "t-3")
     msg = str(exc.value)
     assert "UPSTREAM_MALFORMED" in msg
     assert "bad output" in msg
     assert "reversed" in msg  # refunded -> "charge was reversed"
+    assert "t-3" in msg
 
 
 async def test_save_task_artifacts_failed_not_refunded(tmp_path):
@@ -1587,15 +1612,29 @@ async def test_save_task_artifacts_failed_not_refunded(tmp_path):
         "error": {"code": "GENERATION_FAILED", "message": "boom"},
         "refunded": False,
     }
-    with pytest.raises(Exception, match="not .*reversed|has not"):
-        await _save_task_artifacts(body, tmp_path, "x")
+    with pytest.raises(Exception, match="not .*reversed|has not") as exc:
+        await _save_task_artifacts(body, tmp_path, "x", "t-4")
+    assert "t-4" in str(exc.value)
+
+
+async def test_save_task_artifacts_failed_includes_task_id(tmp_path):
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "status": "failed",
+        "error": {"code": "GENERATION_FAILED", "message": "boom"},
+        "refunded": False,
+    }
+    with pytest.raises(Exception) as exc:
+        await _save_task_artifacts(body, tmp_path, "x", "t-caller-2")
+    msg = str(exc.value)
+    assert "t-caller-2" in msg
 
 
 async def test_save_task_artifacts_succeeded_without_audio(tmp_path):
     from sonilo_mcp.api import _save_task_artifacts
     body = {"task_id": "t-5", "status": "succeeded"}
     with pytest.raises(Exception, match="no audio"):
-        await _save_task_artifacts(body, tmp_path, "x")
+        await _save_task_artifacts(body, tmp_path, "x", "t-5")
 
 
 def _sfx_submit_then_poll(task_id: str, envelope: dict):

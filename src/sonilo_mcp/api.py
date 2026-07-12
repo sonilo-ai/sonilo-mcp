@@ -593,16 +593,21 @@ async def _download_artifact(url: str, dest: Path) -> None:
 
 
 async def _save_task_artifacts(
-    body: dict, output_path: Path, base_name: str
+    body: dict, output_path: Path, base_name: str, task_id: str
 ) -> list[TextContent]:
     """Turn a terminal /v1/tasks/{id} body into saved local files.
 
     failed -> raise with the backend's error code/message and whether the
     charge was refunded. succeeded -> download audio (always present) and
     video (video-to-sfx only), one TextContent per saved file.
+
+    task_id must be the caller's own known-good id (from _post_task_submit
+    or the tool's own task_id argument), NOT derived from body — the
+    backend's terminal body is not a trustworthy source for the recovery
+    id, and a missing/incorrect id here would make a paid result
+    unrecoverable.
     """
     task_status = body.get("status")
-    task_id = body.get("task_id")
     if task_status == "failed":
         err = body.get("error") or {}
         code = err.get("code") or "GENERATION_FAILED"
@@ -614,7 +619,10 @@ async def _save_task_artifacts(
                 "The charge has not been reversed — check get_usage to "
                 "reconcile."
             )
-        raise Exception(f"Generation failed ({code}): {message}. {refund_line}")
+        raise Exception(
+            f"Generation failed ({code}): {message}. {refund_line} "
+            f"Task id: {task_id}."
+        )
     if task_status != "succeeded":
         raise Exception(f"Unexpected task status: {task_status}")
 
@@ -850,7 +858,7 @@ async def text_to_sfx(
         data["audio_format"] = audio_format
     task_id = await _post_task_submit("/v1/text-to-sfx", data=data)
     body = await _poll_task(task_id, _get_config()["timeout"])
-    return await _save_task_artifacts(body, out_path, _slugify(prompt))
+    return await _save_task_artifacts(body, out_path, _slugify(prompt), task_id)
 
 
 @mcp.tool(
@@ -953,7 +961,7 @@ async def video_to_sfx(
 
     body = await _poll_task(task_id, cfg["timeout"])
     base = _slugify(prompt) if prompt and prompt.strip() else f"sfx-{task_id[:8]}"
-    return await _save_task_artifacts(body, out_path, base)
+    return await _save_task_artifacts(body, out_path, base, task_id)
 
 
 @mcp.tool(
@@ -990,7 +998,7 @@ async def get_sfx_task(
     out_path = _make_output_path(output_directory)
     # No prompt available on recovery — name by task id; extension comes
     # from the envelope's content_type.
-    return await _save_task_artifacts(body, out_path, f"sfx-{task_id[:8]}")
+    return await _save_task_artifacts(body, out_path, f"sfx-{task_id[:8]}", task_id)
 
 
 # ---------- Tools: account ----------

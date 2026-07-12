@@ -513,6 +513,58 @@ async def _poll_task(task_id: str, timeout_seconds: float) -> dict:
         await _poll_sleep(_POLL_INTERVAL_SECONDS)
 
 
+# content_type -> extension for SFX audio artifacts. The backend sets
+# content_type from the requested audio_format, so deriving the extension
+# here matches the caller's requested format. Video artifacts are always mp4.
+_AUDIO_CONTENT_TYPE_EXTS = {
+    "audio/wav": ".wav",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/flac": ".flac",
+}
+
+
+def _ext_from_content_type(content_type: str | None) -> str:
+    return _AUDIO_CONTENT_TYPE_EXTS.get((content_type or "").lower(), ".m4a")
+
+
+def _artifact_dest(output_path: Path, base_name: str, ext: str) -> Path:
+    """First non-existing path for base_name+ext, appending -1, -2, …"""
+    dest = output_path / f"{base_name}{ext}"
+    n = 1
+    while dest.exists():
+        dest = output_path / f"{base_name}-{n}{ext}"
+        n += 1
+    return dest
+
+
+async def _download_artifact(url: str, dest: Path) -> None:
+    """Stream-download a presigned result URL to dest.
+
+    Sends NO Authorization / X-Sonilo-Client / custom User-Agent headers:
+    presigned URLs carry their own auth, and the API key must never be sent
+    to the storage domain.
+    """
+    cfg = _get_config()
+    try:
+        async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:
+            async with client.stream("GET", url) as r:
+                if r.status_code >= 400:
+                    raise Exception(
+                        f"Artifact download failed (status {r.status_code}). "
+                        "The result is still stored on the backend — retry "
+                        "with get_sfx_task."
+                    )
+                with open(dest, "wb") as fh:
+                    async for chunk in r.aiter_bytes():
+                        fh.write(chunk)
+    except httpx.RequestError as e:
+        raise Exception(
+            f"Artifact download failed: {e}. The result is still stored on "
+            "the backend — retry with get_sfx_task."
+        ) from e
+
+
 # ---------- Tools: generation ----------
 
 @mcp.tool(

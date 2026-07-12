@@ -1373,3 +1373,52 @@ async def test_poll_task_timeout_mentions_recovery(monkeypatch):
         await _poll_task("t-3", timeout_seconds=0)
     assert "t-3" in str(exc.value)
     assert "get_sfx_task" in str(exc.value)
+
+
+@respx.mock
+async def test_download_artifact_writes_file_without_auth(monkeypatch, tmp_path):
+    monkeypatch.setenv("SONILO_API_KEY", "secret-key")
+    route = respx.get("https://r2.test/sfx-results/t-1/audio.m4a").mock(
+        return_value=httpx.Response(200, content=b"fake-audio-bytes")
+    )
+    from sonilo_mcp.api import _download_artifact
+    dest = tmp_path / "boom.m4a"
+    await _download_artifact("https://r2.test/sfx-results/t-1/audio.m4a", dest)
+    assert dest.read_bytes() == b"fake-audio-bytes"
+    # Presigned URLs carry their own auth; the API key and client markers
+    # must never be sent to the storage domain.
+    sent = route.calls.last.request
+    assert "authorization" not in sent.headers
+    assert "x-sonilo-client" not in sent.headers
+
+
+@respx.mock
+async def test_download_artifact_error_mentions_recovery(monkeypatch, tmp_path):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/gone").mock(
+        return_value=httpx.Response(403, text="expired")
+    )
+    from sonilo_mcp.api import _download_artifact
+    with pytest.raises(Exception, match="get_sfx_task"):
+        await _download_artifact("https://r2.test/gone", tmp_path / "x.m4a")
+
+
+def test_ext_from_content_type():
+    from sonilo_mcp.api import _ext_from_content_type
+    assert _ext_from_content_type("audio/wav") == ".wav"
+    assert _ext_from_content_type("audio/mpeg") == ".mp3"
+    assert _ext_from_content_type("audio/mp4") == ".m4a"
+    assert _ext_from_content_type("audio/flac") == ".flac"
+    assert _ext_from_content_type(None) == ".m4a"
+    assert _ext_from_content_type("application/octet-stream") == ".m4a"
+
+
+def test_artifact_dest_avoids_collisions(tmp_path):
+    from sonilo_mcp.api import _artifact_dest
+    first = _artifact_dest(tmp_path, "boom", ".m4a")
+    assert first == tmp_path / "boom.m4a"
+    first.write_bytes(b"x")
+    second = _artifact_dest(tmp_path, "boom", ".m4a")
+    assert second == tmp_path / "boom-1.m4a"
+    second.write_bytes(b"y")
+    assert _artifact_dest(tmp_path, "boom", ".m4a") == tmp_path / "boom-2.m4a"

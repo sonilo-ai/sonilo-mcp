@@ -283,6 +283,17 @@ def _extract_detail(body: str) -> str:
     return body
 
 
+def _describe_exc(e: BaseException) -> str:
+    """Render an exception for a user-facing message.
+
+    Several httpx transport errors (notably ReadError) stringify to '',
+    which would leave a hole in the message (e.g. "failed: . Verify ...");
+    fall back to the exception's class name in that case.
+    """
+    text = str(e).strip()
+    return text or type(e).__name__
+
+
 _BILLING_URL = "https://platform.sonilo.com/dashboard/billing"
 _API_KEYS_URL = "https://platform.sonilo.com/dashboard/api-keys"
 
@@ -393,7 +404,7 @@ async def _http_get_json(path: str, params: dict | None = None) -> dict:
             if attempt == 1:
                 await asyncio.sleep(1)
                 continue
-            raise Exception(f"HTTP request failed: {e}") from e
+            raise Exception(f"HTTP request failed: {_describe_exc(e)}") from e
 
 
 # ---------- Streaming consumer ----------
@@ -507,7 +518,7 @@ async def _post_streaming_generation(
         ) from e
     except httpx.RequestError as e:
         raise Exception(
-            f"HTTP request failed: {e}. Verify SONILO_API_URL "
+            f"HTTP request failed: {_describe_exc(e)}. Verify SONILO_API_URL "
             f"({cfg['api_url']}) is reachable."
         ) from e
 
@@ -548,9 +559,16 @@ async def _post_task_submit(
         async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:
             r = await client.post(url, headers=headers, data=data, files=files)
     except httpx.RequestError as e:
+        # A connection reset/timeout here means the request never fully
+        # reached the backend — the backend only creates and charges a task
+        # once it has fully received and accepted the request, so this is
+        # safe to retry (unlike a failure *after* a 202 response, which would
+        # mean the task was already created).
         raise Exception(
-            f"HTTP request failed: {e}. Verify SONILO_API_URL "
-            f"({cfg['api_url']}) is reachable."
+            f"Upload failed before the request completed "
+            f"({_describe_exc(e)}). No task was created and nothing was "
+            "charged — retry. If this keeps happening with large videos, "
+            "the connection is being reset during upload."
         ) from e
     if r.status_code >= 400:
         _raise_http_error(r.status_code, r.text)
@@ -781,7 +799,7 @@ async def _download_artifact(url: str, dest: Path) -> None:
                         fh.write(chunk)
     except httpx.RequestError as e:
         dest.unlink(missing_ok=True)
-        raise Exception(f"Artifact download failed: {e}") from e
+        raise Exception(f"Artifact download failed: {_describe_exc(e)}") from e
     except BaseException:
         dest.unlink(missing_ok=True)
         raise

@@ -1420,6 +1420,15 @@ def test_end_sentence_trailing_whitespace():
     assert _end_sentence("Failed?") == "Failed?"
 
 
+def test_describe_exc_empty_message():
+    from sonilo_mcp.api import _describe_exc
+    # httpx.ReadError (and several other transport errors) stringify to ''
+    # — falling back to the class name avoids a hole in user-facing messages.
+    assert _describe_exc(httpx.ReadError("")) == "ReadError"
+    # A normal exception with a real message is passed through unchanged.
+    assert _describe_exc(ValueError("bad input")) == "bad input"
+
+
 @respx.mock
 async def test_post_task_submit_returns_task_id(monkeypatch):
     monkeypatch.setenv("SONILO_API_KEY", "k")
@@ -1485,6 +1494,28 @@ async def test_post_task_submit_maps_errors(monkeypatch):
     from sonilo_mcp.api import _post_task_submit
     with pytest.raises(Exception, match="duration too long"):
         await _post_task_submit("/v1/text-to-sfx", data={"prompt": "x"})
+
+
+@respx.mock
+async def test_post_task_submit_read_error_message(monkeypatch):
+    # Regression: httpx.ReadError (and other transport errors) can stringify
+    # to '', which used to leave a hole in the message ("failed: . Verify
+    # ..."). It's also a common, retryable failure mid-upload — the message
+    # must say nothing was charged and that the caller should retry.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        side_effect=httpx.ReadError("")
+    )
+    from sonilo_mcp.api import _post_task_submit
+    with pytest.raises(Exception) as exc:
+        await _post_task_submit("/v1/text-to-sfx", data={"prompt": "x"})
+    message = str(exc.value)
+    assert "ReadError" in message
+    assert "nothing was charged" in message.lower() or "not charged" in message.lower() or "not been charged" in message.lower()
+    assert "retry" in message.lower()
+    assert ": ." not in message
+    assert "failed: ." not in message
 
 
 @respx.mock

@@ -1001,6 +1001,22 @@ async def test_check_video_duration_fails_open_on_probe_error(monkeypatch):
     await _check_video_duration("/tmp/clip.mp4")  # must not raise
 
 
+async def test_check_video_duration_sfx_cap_rejects_200s(monkeypatch):
+    from sonilo_mcp.api import _check_video_duration, _SFX_MAX_VIDEO_DURATION_SECONDS
+    _patch_ffprobe(monkeypatch, duration=200.0)
+    with pytest.raises(Exception, match="exceeds the maximum"):
+        await _check_video_duration(
+            "/tmp/clip.mp4", max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
+        )
+
+
+async def test_check_video_duration_music_cap_allows_200s(monkeypatch):
+    from sonilo_mcp.api import _check_video_duration
+    _patch_ffprobe(monkeypatch, duration=200.0)
+    # Default cap stays 360s — 200s must not raise.
+    await _check_video_duration("/tmp/clip.mp4")
+
+
 @respx.mock
 async def test_video_to_music_path_too_long(monkeypatch, output_dir, tmp_path):
     monkeypatch.setenv("SONILO_API_KEY", "k")

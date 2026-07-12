@@ -192,10 +192,13 @@ def _resolve_input_file(
 
 # The backend rejects videos longer than this, so we pre-check locally to fail
 # fast and skip a wasted upload. Keep in sync with the backend's limit.
-_MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes
+_MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — music endpoints
+_SFX_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sfx
 
 
-async def _check_video_duration(source: str) -> None:
+async def _check_video_duration(
+    source: str, max_seconds: int = _MAX_VIDEO_DURATION_SECONDS
+) -> None:
     """Best-effort local ffprobe pre-check of a video's duration.
 
     Raises if the duration is known to exceed the backend's 360s cap, so the
@@ -227,10 +230,10 @@ async def _check_video_duration(source: str) -> None:
         duration = float(json.loads(stdout)["format"]["duration"])
     except (json.JSONDecodeError, KeyError, ValueError, TypeError):
         return
-    if duration > _MAX_VIDEO_DURATION_SECONDS:
+    if duration > max_seconds:
         raise Exception(
             f"Video duration {duration:.1f}s exceeds the maximum of "
-            f"{_MAX_VIDEO_DURATION_SECONDS}s (6 minutes)"
+            f"{max_seconds}s"
         )
 
 

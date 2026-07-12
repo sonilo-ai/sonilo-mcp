@@ -917,6 +917,43 @@ async def video_to_sfx(
     return await _save_task_artifacts(body, out_path, base)
 
 
+@mcp.tool(
+    description=(
+        "Check a sound-effects generation task and, if finished, download "
+        "its result file(s). Use this to recover a result when text_to_sfx "
+        "or video_to_sfx timed out — their error message contains the "
+        "task_id. Does not poll: a single status check per call. This tool "
+        "itself never charges.\n\n"
+        "Args:\n"
+        "    task_id (str): The task id returned in the timeout message.\n"
+        "    output_directory (str, optional): Where to save result files. "
+        "Defaults to SONILO_MCP_BASE_PATH.\n\n"
+        "Returns:\n"
+        "    Still processing -> a status message; try again later. "
+        "Succeeded -> the saved file path(s) (audio, plus video for "
+        "video_to_sfx tasks). Failed -> an error including whether the "
+        "charge was refunded."
+    )
+)
+async def get_sfx_task(
+    task_id: str,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    body = await _http_get_json(f"/v1/tasks/{task_id}")
+    if body.get("status") == "processing":
+        return [TextContent(
+            type="text",
+            text=(
+                f"Task {task_id} is still processing. Try again in a "
+                "little while."
+            ),
+        )]
+    out_path = _make_output_path(output_directory)
+    # No prompt available on recovery — name by task id; extension comes
+    # from the envelope's content_type.
+    return await _save_task_artifacts(body, out_path, f"sfx-{task_id[:8]}")
+
+
 # ---------- Tools: account ----------
 
 @mcp.tool(

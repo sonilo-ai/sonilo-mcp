@@ -1762,3 +1762,67 @@ async def test_video_to_sfx_rejects_video_over_180s(monkeypatch, output_dir):
     _patch_ffprobe(monkeypatch, duration=200.0)
     with pytest.raises(Exception, match="exceeds the maximum"):
         await video_to_sfx(video_url="https://example.com/long.mp4")
+
+
+@respx.mock
+async def test_get_sfx_task_processing(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-30").mock(
+        return_value=httpx.Response(
+            200, json={"task_id": "t-30", "status": "processing"}
+        )
+    )
+    from sonilo_mcp.api import get_sfx_task
+    result = await get_sfx_task("t-30")
+    assert len(result) == 1
+    assert "still processing" in result[0].text
+
+
+@respx.mock
+async def test_get_sfx_task_succeeded_downloads(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-31-abcdef99").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-31-abcdef99", "status": "succeeded",
+            "audio": {"url": "https://r2.test/a.mp3", "content_type": "audio/mpeg"},
+        })
+    )
+    respx.get("https://r2.test/a.mp3").mock(
+        return_value=httpx.Response(200, content=b"mp3-bytes")
+    )
+    from sonilo_mcp.api import get_sfx_task
+    result = await get_sfx_task("t-31-abcdef99")
+    assert len(result) == 1
+    # No prompt available here -> sfx-{task_id[:8]}; ext from content_type.
+    expected = output_dir / "sfx-t-31-abc.mp3"
+    assert expected.read_bytes() == b"mp3-bytes"
+
+
+@respx.mock
+async def test_get_sfx_task_failed_raises_with_refund(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-32").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-32", "status": "failed",
+            "error": {"code": "TIMEOUT", "message": "upstream timeout"},
+            "refunded": True,
+        })
+    )
+    from sonilo_mcp.api import get_sfx_task
+    with pytest.raises(Exception, match="TIMEOUT.*reversed"):
+        await get_sfx_task("t-32")
+
+
+@respx.mock
+async def test_get_sfx_task_unknown_task_404(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/nope").mock(
+        return_value=httpx.Response(404, json={"detail": "Task not found"})
+    )
+    from sonilo_mcp.api import get_sfx_task
+    with pytest.raises(Exception, match="Task not found"):
+        await get_sfx_task("nope")

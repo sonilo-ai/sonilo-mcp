@@ -962,6 +962,47 @@ async def test_video_to_music_path_too_large(monkeypatch, output_dir, tmp_path):
     assert upload_route.call_count == 0
 
 
+@respx.mock
+async def test_video_to_music_size_cap_enforced_on_actual_bytes(
+    monkeypatch, output_dir, tmp_path
+):
+    # TOCTOU: the stat()-based size check runs before the ffprobe await (up
+    # to 30s). If the file on disk is replaced with a larger one during
+    # that window, the stale check must not let the oversized bytes bypass
+    # the cap — the cap must be enforced on what's actually read.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    video = tmp_path / "clip.mp4"
+    small = b"\x00" * 1024
+    large = b"\x01" * (5 * 1024 * 1024)
+    video.write_bytes(small)
+
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={"max_upload_size_mb": 2})
+    )
+    api._reset_services_cache()
+
+    monkeypatch.setattr(api.shutil, "which", lambda name: "/usr/bin/ffprobe")
+
+    async def fake_exec(*args, **kwargs):
+        video.write_bytes(large)  # swap happens during the caller's await
+        payload = json.dumps({"format": {"duration": "10.0"}}).encode()
+        return _FakeProc(payload, returncode=0)
+
+    monkeypatch.setattr(api.asyncio, "create_subprocess_exec", fake_exec)
+
+    upload_route = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(200, content=b"")
+    )
+
+    with pytest.raises(Exception, match="too large"):
+        await api.video_to_music(video_path=str(video))
+    # Must NOT charge — the oversized (swapped) bytes must never be uploaded.
+    assert upload_route.call_count == 0
+
+
 async def test_video_to_music_path_does_not_exist(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
@@ -1503,6 +1544,25 @@ async def test_poll_task_401_keeps_task_id(monkeypatch):
 
 
 @respx.mock
+async def test_poll_task_non_dict_body_mentions_task_id(monkeypatch):
+    # A 200 response whose JSON body isn't a dict (e.g. a bare list) must
+    # not crash with a bare AttributeError from body.get(...) — the task
+    # was already charged, so the raised message must carry the task_id
+    # and the get_sfx_task recovery call.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-nondict").mock(
+        return_value=httpx.Response(200, json=[1, 2, 3])
+    )
+    from sonilo_mcp.api import _poll_task
+    with pytest.raises(Exception) as exc:
+        await _poll_task("t-nondict", timeout_seconds=600)
+    msg = str(exc.value)
+    assert "t-nondict" in msg
+    assert "get_sfx_task" in msg
+
+
+@respx.mock
 async def test_download_artifact_writes_file_without_auth(monkeypatch, tmp_path):
     monkeypatch.setenv("SONILO_API_KEY", "secret-key")
     route = respx.get("https://r2.test/sfx-results/t-1/audio.m4a").mock(
@@ -1570,6 +1630,14 @@ def test_ext_from_content_type():
     assert _ext_from_content_type("audio/flac") == ".flac"
     assert _ext_from_content_type(None) == ".m4a"
     assert _ext_from_content_type("application/octet-stream") == ".m4a"
+
+
+def test_ext_from_content_type_non_string():
+    # A truthy non-string content_type (a backend bug) must not crash with
+    # an AttributeError from `.lower()` — fall back to the unknown default.
+    from sonilo_mcp.api import _ext_from_content_type
+    assert _ext_from_content_type(123) == ".m4a"
+    assert _ext_from_content_type(["x"]) == ".m4a"
 
 
 def test_artifact_dest_avoids_collisions(tmp_path):
@@ -1816,6 +1884,19 @@ async def test_save_task_artifacts_succeeded_without_audio(tmp_path):
     body = {"task_id": "t-5", "status": "succeeded"}
     with pytest.raises(Exception, match="no audio"):
         await _save_task_artifacts(body, tmp_path, "x", "t-5")
+
+
+async def test_save_task_artifacts_no_audio_mentions_task_id(tmp_path):
+    # The task was already charged and succeeded by the time we get here —
+    # a missing/malformed audio envelope must still carry the task_id and
+    # the get_sfx_task recovery call, not just the bare fact of the defect.
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {"task_id": "t-no-audio", "status": "succeeded"}
+    with pytest.raises(Exception, match="no audio") as exc:
+        await _save_task_artifacts(body, tmp_path, "x", "t-no-audio")
+    msg = str(exc.value)
+    assert "t-no-audio" in msg
+    assert "get_sfx_task" in msg
 
 
 async def test_save_task_artifacts_unexpected_status(tmp_path):
@@ -2159,6 +2240,48 @@ async def test_video_to_sfx_rejects_video_over_180s(monkeypatch, output_dir):
 
 
 @respx.mock
+async def test_video_to_sfx_size_cap_enforced_on_actual_bytes(
+    monkeypatch, output_dir, tmp_path
+):
+    # Same TOCTOU race as video_to_music: the stat()-based size check runs
+    # before the ffprobe await, and a file swapped for a larger one during
+    # that window must not bypass the cap. The authoritative check must be
+    # on the bytes actually read for upload, and no charge (submit POST)
+    # may happen when it fails.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    video = tmp_path / "clip.mp4"
+    small = b"\x00" * 1024
+    large = b"\x01" * (5 * 1024 * 1024)
+    video.write_bytes(small)
+
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={"max_upload_size_mb": 2})
+    )
+    api._reset_services_cache()
+
+    monkeypatch.setattr(api.shutil, "which", lambda name: "/usr/bin/ffprobe")
+
+    async def fake_exec(*args, **kwargs):
+        video.write_bytes(large)  # swap happens during the caller's await
+        payload = json.dumps({"format": {"duration": "10.0"}}).encode()
+        return _FakeProc(payload, returncode=0)
+
+    monkeypatch.setattr(api.asyncio, "create_subprocess_exec", fake_exec)
+
+    submit_route = respx.post("https://api.test.local/v1/video-to-sfx").mock(
+        return_value=httpx.Response(202, json={"task_id": "t-toctou"})
+    )
+
+    with pytest.raises(Exception, match="too large"):
+        await api.video_to_sfx(video_path=str(video))
+    # Must NOT charge — the oversized (swapped) bytes must never be uploaded.
+    assert submit_route.call_count == 0
+
+
+@respx.mock
 async def test_get_sfx_task_processing(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
@@ -2366,6 +2489,24 @@ async def test_get_sfx_task_402_keeps_task_id(monkeypatch, output_dir):
         await get_sfx_task("t-402b")
     msg = str(exc.value)
     assert "t-402b" in msg
+    assert "get_sfx_task" in msg
+
+
+@respx.mock
+async def test_get_sfx_task_non_dict_body_mentions_task_id(monkeypatch, output_dir):
+    # Same non-dict-body hazard as _poll_task, but on get_sfx_task's own
+    # status GET — must not crash with a bare AttributeError, and must
+    # keep the task_id + recovery call in the raised message.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-nondict2").mock(
+        return_value=httpx.Response(200, json=[1, 2, 3])
+    )
+    from sonilo_mcp.api import get_sfx_task
+    with pytest.raises(Exception) as exc:
+        await get_sfx_task("t-nondict2")
+    msg = str(exc.value)
+    assert "t-nondict2" in msg
     assert "get_sfx_task" in msg
 
 

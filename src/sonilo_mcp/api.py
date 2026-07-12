@@ -582,6 +582,28 @@ def _end_sentence(value: object) -> str:
     return text
 
 
+def _require_task_body(body: object, task_id: str) -> dict:
+    """Validate that a /v1/tasks/{task_id} 200 response body is a JSON
+    object, as both _poll_task and get_sfx_task assume when they call
+    body.get(...) right after fetching it.
+
+    A 200 with a body that isn't a dict (e.g. a bare list) is a backend
+    contract violation, not a 4xx/5xx — _http_get_json returns it unchanged
+    with no exception to catch. Without this check, the very next
+    `body.get("status")` raises a bare AttributeError that carries neither
+    the task_id nor a recovery hint, even though the task was already
+    submitted and charged.
+    """
+    if not isinstance(body, dict):
+        raise Exception(
+            f"Unexpected response from the backend for task {task_id} "
+            "(expected a JSON object). The task was already submitted and "
+            f'charged — call get_sfx_task("{task_id}") to check for the '
+            "result."
+        )
+    return body
+
+
 async def _poll_task(task_id: str, timeout_seconds: float) -> dict:
     """Poll GET /v1/tasks/{task_id} every _POLL_INTERVAL_SECONDS until the
     task is terminal (succeeded/failed) or timeout_seconds elapses.
@@ -614,6 +636,7 @@ async def _poll_task(task_id: str, timeout_seconds: float) -> dict:
                 "and charged — resolve the issue above, then call "
                 f'get_sfx_task("{task_id}") to retrieve the result.'
             ) from e
+        body = _require_task_body(body, task_id)
         if body.get("status") in ("succeeded", "failed"):
             return body
         if time.monotonic() >= deadline:
@@ -638,7 +661,13 @@ _AUDIO_CONTENT_TYPE_EXTS = {
 
 
 def _ext_from_content_type(content_type: str | None) -> str:
-    return _AUDIO_CONTENT_TYPE_EXTS.get((content_type or "").lower(), ".m4a")
+    # The backend is expected to send a string, but a truthy non-string
+    # value (a backend bug) must not crash this with an AttributeError from
+    # `.lower()` — treat it as unknown and fall back to the default, same
+    # as a missing/empty content_type.
+    if not isinstance(content_type, str):
+        return ".m4a"
+    return _AUDIO_CONTENT_TYPE_EXTS.get(content_type.lower(), ".m4a")
 
 
 _ARTIFACT_DEST_MAX_ATTEMPTS = 10_000
@@ -814,68 +843,81 @@ async def _save_task_artifacts(
 
     audio = body.get("audio")
     if not isinstance(audio, dict) or not audio.get("url"):
-        raise Exception("Task succeeded but no audio artifact was returned")
+        # The backend already succeeded and charged for this task — a
+        # missing/malformed audio envelope must still carry the task_id and
+        # the get_sfx_task recovery call, or a paid result becomes
+        # unrecoverable from the error message alone.
+        raise Exception(
+            "Task succeeded but no audio artifact was returned. Task id: "
+            f'{task_id} — call get_sfx_task("{task_id}") to check for the '
+            "result."
+        )
 
     saved: list[TextContent] = []
-    audio_ext = _ext_from_content_type(audio.get("content_type"))
-    existing = (
-        _existing_canonical_dest(
-            output_path, base_name, audio_ext, audio.get("file_size")
+    try:
+        # Everything below — deriving the extension, checking for a
+        # reusable existing file, computing the destination path, and the
+        # actual download — must stay inside this wrap. The backend already
+        # succeeded and charged for this task by the time we get here, so
+        # ANY failure here must still carry the task_id and recovery hint.
+        # _download_artifact (and any other failure here, e.g. an OSError
+        # from _artifact_dest) states only the bare fact of the failure —
+        # this is the one layer that owns the single, complete recovery
+        # instruction, so it isn't repeated.
+        audio_ext = _ext_from_content_type(audio.get("content_type"))
+        existing = (
+            _existing_canonical_dest(
+                output_path, base_name, audio_ext, audio.get("file_size")
+            )
+            if reuse_existing
+            else None
         )
-        if reuse_existing
-        else None
-    )
+        if existing is None:
+            dest = _artifact_dest(output_path, base_name, audio_ext)
+            await _download_artifact(audio["url"], dest)
+        else:
+            dest = existing
+    except Exception as e:
+        raise Exception(
+            f"{_end_sentence(e)} The result is still stored on the backend "
+            f'— call get_sfx_task("{task_id}") to retry.'
+        ) from e
     if existing is not None:
-        dest = existing
         saved.append(
             TextContent(type="text", text=f"Already downloaded. File saved as: {dest}")
         )
     else:
-        try:
-            dest = _artifact_dest(output_path, base_name, audio_ext)
-            await _download_artifact(audio["url"], dest)
-        except Exception as e:
-            # The backend already succeeded and charged for this task by the
-            # time we get here, so ANY failure in this block — computing the
-            # destination path or downloading — must still carry the task_id
-            # and recovery hint. Otherwise a paid result becomes unrecoverable
-            # from the error message alone. _download_artifact (and any other
-            # failure here, e.g. an OSError from _artifact_dest) states only the
-            # bare fact of the failure — this is the one layer that owns the
-            # single, complete recovery instruction, so it isn't repeated.
-            raise Exception(
-                f"{_end_sentence(e)} The result is still stored on the backend "
-                f'— call get_sfx_task("{task_id}") to retry.'
-            ) from e
         saved.append(TextContent(type="text", text=f"Success. File saved as: {dest}"))
     audio_dest = dest
 
     video = body.get("video")
     if isinstance(video, dict) and video.get("url"):
-        existing_video = (
-            _existing_canonical_dest(
-                output_path, base_name, ".mp4", video.get("file_size")
-            )
-            if reuse_existing
-            else None
-        )
-        if existing_video is not None:
-            dest = existing_video
-            saved.append(
-                TextContent(
-                    type="text", text=f"Already downloaded. File saved as: {dest}"
-                )
-            )
-            return saved
         try:
-            dest = _artifact_dest(output_path, base_name, ".mp4")
-            await _download_artifact(video["url"], dest)
+            existing_video = (
+                _existing_canonical_dest(
+                    output_path, base_name, ".mp4", video.get("file_size")
+                )
+                if reuse_existing
+                else None
+            )
+            if existing_video is None:
+                dest = _artifact_dest(output_path, base_name, ".mp4")
+                await _download_artifact(video["url"], dest)
+            else:
+                dest = existing_video
         except Exception as e:
             raise Exception(
                 f"{_end_sentence(e)} The audio file was already saved as: "
                 f"{audio_dest}. The video is still stored on the backend — "
                 f'call get_sfx_task("{task_id}") to retry the download.'
             ) from e
+        if existing_video is not None:
+            saved.append(
+                TextContent(
+                    type="text", text=f"Already downloaded. File saved as: {dest}"
+                )
+            )
+            return saved
         saved.append(
             TextContent(type="text", text=f"Success. File saved as: {dest}")
         )
@@ -1007,14 +1049,27 @@ async def video_to_music(
         max_mb = await _get_max_upload_size_mb()
         size_mb = resolved.stat().st_size / (1024 * 1024)
         if size_mb > max_mb:
+            # Cheap fail-fast: avoids a wasted ffprobe run for an
+            # obviously-oversized file. NOT the authoritative check — see
+            # the read-time check below.
             raise Exception(
                 f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
             )
         await _check_video_duration(str(resolved))
         data = {"prompt": prompt} if prompt else None
         mime, _ = mimetypes.guess_type(resolved.name)
+        # Authoritative check: the stat() above is now stale — an await on
+        # ffprobe sat between it and this read, during which the file could
+        # have been replaced or grown (a video export still writing, a sync
+        # tool, a concurrent process). Enforce the cap on the bytes actually
+        # read for upload, not on the earlier stat(). Reading at most
+        # max_bytes + 1 both closes that race and bounds memory use.
+        max_bytes = max_mb * 1024 * 1024
         with open(resolved, "rb") as fh:
-            files = {"video": (resolved.name, fh.read(), mime or "application/octet-stream")}
+            content = fh.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise Exception(f"Video file is too large (> {max_mb} MB cap)")
+        files = {"video": (resolved.name, content, mime or "application/octet-stream")}
         return await _post_streaming_generation(
             "/v1/video-to-music",
             out_path,
@@ -1152,6 +1207,9 @@ async def video_to_sfx(
         max_mb = await _get_max_upload_size_mb()
         size_mb = resolved.stat().st_size / (1024 * 1024)
         if size_mb > max_mb:
+            # Cheap fail-fast: avoids a wasted ffprobe run for an
+            # obviously-oversized file. NOT the authoritative check — see
+            # the read-time check below.
             raise Exception(
                 f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
             )
@@ -1159,12 +1217,21 @@ async def video_to_sfx(
             str(resolved), max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
         )
         mime, _ = mimetypes.guess_type(resolved.name)
+        # Authoritative check: the stat() above is now stale — an await on
+        # ffprobe sat between it and this read, during which the file could
+        # have been replaced or grown. Enforce the cap on the bytes actually
+        # read for upload, not on the earlier stat(). Reading at most
+        # max_bytes + 1 both closes that race and bounds memory use.
+        max_bytes = max_mb * 1024 * 1024
         with open(resolved, "rb") as fh:
-            files = {
-                "video": (
-                    resolved.name, fh.read(), mime or "application/octet-stream"
-                )
-            }
+            content = fh.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise Exception(f"Video file is too large (> {max_mb} MB cap)")
+        files = {
+            "video": (
+                resolved.name, content, mime or "application/octet-stream"
+            )
+        }
         task_id = await _post_task_submit(
             "/v1/video-to-sfx", data=form or None, files=files
         )
@@ -1230,6 +1297,7 @@ async def get_sfx_task(
             f'resolve the issue above, then call get_sfx_task("{task_id}") '
             "to retrieve the result."
         ) from e
+    body = _require_task_body(body, task_id)
     if body.get("status") == "processing":
         return [TextContent(
             type="text",

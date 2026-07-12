@@ -539,9 +539,10 @@ async def _post_task_submit(
     if r.status_code >= 400:
         _raise_http_error(r.status_code, r.text)
     try:
-        task_id = r.json().get("task_id")
+        parsed_body = r.json()
     except json.JSONDecodeError:
-        task_id = None
+        parsed_body = None
+    task_id = parsed_body.get("task_id") if isinstance(parsed_body, dict) else None
     if not task_id:
         raise Exception(
             f"Backend accepted the request (status {r.status_code}) but "
@@ -820,9 +821,21 @@ async def _save_task_artifacts(
     """
     task_status = body.get("status")
     if task_status == "failed":
-        err = body.get("error") or {}
-        code = err.get("code") or "GENERATION_FAILED"
-        message = err.get("message") or "Generation failed"
+        err = body.get("error")
+        if isinstance(err, dict):
+            code = err.get("code") or "GENERATION_FAILED"
+            message = err.get("message") or "Generation failed"
+        elif isinstance(err, str) and err:
+            # Backend sent a truthy non-dict error (e.g. a bare string) —
+            # the shape is untrustworthy, but the string is still useful as
+            # a message. Do not let .get() on a non-dict crash here: this
+            # task was charged AND failed, so the task_id/recovery call
+            # below is the only way the user gets it back.
+            code = "GENERATION_FAILED"
+            message = err
+        else:
+            code = "GENERATION_FAILED"
+            message = "Generation failed"
         if body.get("refunded"):
             refund_line = "The charge was reversed — you were not billed."
         else:
@@ -832,7 +845,8 @@ async def _save_task_artifacts(
             )
         raise Exception(
             f"Generation failed ({code}): {message}. {refund_line} "
-            f"Task id: {task_id}."
+            f'Task id: {task_id}. Call get_sfx_task("{task_id}") to check '
+            "for updates."
         )
     if task_status != "succeeded":
         raise Exception(

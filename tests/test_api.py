@@ -1418,6 +1418,23 @@ async def test_post_task_submit_missing_task_id(monkeypatch):
 
 
 @respx.mock
+async def test_post_task_submit_non_dict_body(monkeypatch):
+    # Regression: a 202 with a JSON body that parses but isn't a dict (e.g.
+    # a list) must not crash with a bare AttributeError from `.get` — it
+    # should fall into the same clear "no task_id" error as an unparseable
+    # or task_id-less body, since no task_id ever existed either way.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        return_value=httpx.Response(202, json=[1, 2, 3])
+    )
+    from sonilo_mcp.api import _post_task_submit
+    with pytest.raises(Exception, match="task_id") as exc:
+        await _post_task_submit("/v1/text-to-sfx", data={"prompt": "x"})
+    assert not isinstance(exc.value, AttributeError)
+
+
+@respx.mock
 async def test_poll_task_returns_on_succeeded(monkeypatch):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
@@ -1877,6 +1894,28 @@ async def test_save_task_artifacts_failed_includes_task_id(tmp_path):
         await _save_task_artifacts(body, tmp_path, "x", "t-caller-2")
     msg = str(exc.value)
     assert "t-caller-2" in msg
+
+
+async def test_save_task_artifacts_failed_non_dict_error_mentions_task_id(tmp_path):
+    # Regression: a truthy non-dict "error" (e.g. a bare string) must not
+    # crash with a bare AttributeError — the task was charged AND failed, so
+    # the user needs the task_id, a failure code, the refund status, and the
+    # get_sfx_task recovery call just like every other failure path.
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "t-boom", "status": "failed",
+        "error": "boom",
+        "refunded": False,
+    }
+    with pytest.raises(Exception) as exc:
+        await _save_task_artifacts(body, tmp_path, "x", "t-boom")
+    assert not isinstance(exc.value, AttributeError)
+    msg = str(exc.value)
+    assert "t-boom" in msg
+    assert "get_sfx_task" in msg
+    assert "GENERATION_FAILED" in msg
+    assert "has not" in msg  # refund line: not reversed
+    assert "boom" in msg
 
 
 async def test_save_task_artifacts_succeeded_without_audio(tmp_path):

@@ -47,6 +47,17 @@ def test_slugify_basic():
     assert _slugify("   ") == "sonilo"
 
 
+def test_slugify_caps_length():
+    from sonilo_mcp.api import _slugify
+    long_input = "thunderous booming explosion with reverb " * 10
+    assert len(long_input) > 300
+    slug = _slugify(long_input)
+    assert len(slug) <= 80
+    assert not slug.endswith("-")
+    # Short inputs must be completely unaffected by the cap.
+    assert _slugify("Happy Song Title") == "happy-song-title"
+
+
 def test_is_file_writeable_existing(tmp_path):
     from sonilo_mcp.api import _is_file_writeable
     f = tmp_path / "x.txt"
@@ -1532,6 +1543,28 @@ async def test_save_task_artifacts_video_failure_reports_saved_audio(
     assert audio_dest.read_bytes() == b"wav-bytes-2"
 
 
+async def test_save_task_artifacts_dest_error_mentions_task_id(monkeypatch, tmp_path):
+    # Any exception raised while computing the destination path (e.g. an
+    # OSError from a too-long filename) must still be re-raised with the
+    # task_id and get_sfx_task recovery hint — the backend already
+    # succeeded and charged the user by this point.
+    from sonilo_mcp import api
+
+    def boom(output_path, base_name, ext):
+        raise OSError("boom")
+
+    monkeypatch.setattr(api, "_artifact_dest", boom)
+    body = {
+        "task_id": "t-dest-err", "status": "succeeded",
+        "audio": {"url": "https://r2.test/a.m4a", "content_type": "audio/mp4"},
+    }
+    with pytest.raises(Exception) as exc:
+        await api._save_task_artifacts(body, tmp_path, "x")
+    msg = str(exc.value)
+    assert "t-dest-err" in msg
+    assert "get_sfx_task" in msg
+
+
 async def test_save_task_artifacts_failed_refunded(tmp_path):
     from sonilo_mcp.api import _save_task_artifacts
     body = {
@@ -1611,6 +1644,38 @@ async def test_text_to_sfx_happy_path(monkeypatch, output_dir):
     assert expected.read_bytes() == b"sfx-bytes"
     assert len(result) == 1
     assert str(expected) in result[0].text
+
+
+@respx.mock
+async def test_text_to_sfx_long_prompt_writes_file(monkeypatch, output_dir):
+    # Regression test: a realistic ~300-char prompt (well within the
+    # documented 1-2000 char range) used to produce a slug long enough that
+    # the OS-level filename (slug + collision suffix + extension) exceeded
+    # 255 bytes, crashing _artifact_dest with a bare OSError.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    long_prompt = ("thunderous booming explosion with reverb " * 60)[:300]
+    submit, poll = _sfx_submit_then_poll("t-long", {
+        "task_id": "t-long", "status": "succeeded",
+        "audio": {"url": "https://r2.test/a.m4a", "content_type": "audio/mp4"},
+    })
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"sfx-bytes")
+    )
+    result = await api.text_to_sfx(prompt=long_prompt, duration=8)
+
+    assert len(result) == 1
+    saved_files = list(output_dir.iterdir())
+    assert len(saved_files) == 1
+    path = saved_files[0]
+    assert path.read_bytes() == b"sfx-bytes"
+    assert len(path.name.encode()) < 255
 
 
 @respx.mock

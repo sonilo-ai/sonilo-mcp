@@ -144,10 +144,23 @@ def _make_output_path(output_directory: str | None) -> Path:
     return output_path
 
 
+_SLUG_MAX_LEN = 80
+
+
 def _slugify(text: str) -> str:
-    """Filesystem-safe slug. Fallback to 'sonilo' on empty input."""
+    """Filesystem-safe slug. Fallback to 'sonilo' on empty input.
+
+    Capped at _SLUG_MAX_LEN characters so the resulting filename (slug +
+    a "-12" collision suffix + an extension like ".m4a"/".mp4") stays well
+    under the OS 255-byte filename limit — callers (text_to_sfx,
+    video_to_sfx) accept prompts up to 2000 chars, and an uncapped slug of
+    that length crashes _artifact_dest's exists() check with a bare OSError.
+    `re.ASCII` above already strips non-ASCII characters, so one character
+    is always one byte here and a character cap doubles as a byte cap.
+    """
     safe = re.sub(r"[^\w\s-]", "", text, flags=re.ASCII).strip().lower()
     safe = re.sub(r"[-\s]+", "-", safe).strip("-")
+    safe = safe[:_SLUG_MAX_LEN].rstrip("-")
     return safe or "sonilo"
 
 
@@ -610,12 +623,17 @@ async def _save_task_artifacts(
         raise Exception("Task succeeded but no audio artifact was returned")
 
     saved: list[TextContent] = []
-    dest = _artifact_dest(
-        output_path, base_name, _ext_from_content_type(audio.get("content_type"))
-    )
     try:
+        dest = _artifact_dest(
+            output_path, base_name, _ext_from_content_type(audio.get("content_type"))
+        )
         await _download_artifact(audio["url"], dest)
     except Exception as e:
+        # The backend already succeeded and charged for this task by the
+        # time we get here, so ANY failure in this block — computing the
+        # destination path or downloading — must still carry the task_id
+        # and recovery hint. Otherwise a paid result becomes unrecoverable
+        # from the error message alone.
         raise Exception(
             f'{e} Task id: {task_id} — call get_sfx_task("{task_id}") to '
             "retry."
@@ -625,8 +643,8 @@ async def _save_task_artifacts(
 
     video = body.get("video")
     if isinstance(video, dict) and video.get("url"):
-        dest = _artifact_dest(output_path, base_name, ".mp4")
         try:
+            dest = _artifact_dest(output_path, base_name, ".mp4")
             await _download_artifact(video["url"], dest)
         except Exception as e:
             raise Exception(

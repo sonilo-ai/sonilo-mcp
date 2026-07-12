@@ -1314,3 +1314,62 @@ async def test_post_task_submit_missing_task_id(monkeypatch):
     from sonilo_mcp.api import _post_task_submit
     with pytest.raises(Exception, match="task_id"):
         await _post_task_submit("/v1/text-to-sfx", data={"prompt": "x"})
+
+
+@respx.mock
+async def test_poll_task_returns_on_succeeded(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    route = respx.get("https://api.test.local/v1/tasks/t-1").mock(
+        side_effect=[
+            httpx.Response(200, json={"task_id": "t-1", "status": "processing"}),
+            httpx.Response(200, json={"task_id": "t-1", "status": "processing"}),
+            httpx.Response(200, json={
+                "task_id": "t-1", "status": "succeeded",
+                "audio": {"url": "https://r2.test/audio", "content_type": "audio/mp4"},
+            }),
+        ]
+    )
+    from sonilo_mcp import api
+    sleeps: list[float] = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr(api, "_poll_sleep", fake_sleep)
+    body = await api._poll_task("t-1", timeout_seconds=600)
+    assert body["status"] == "succeeded"
+    assert route.call_count == 3
+    assert sleeps == [5.0, 5.0]
+
+
+@respx.mock
+async def test_poll_task_returns_failed_body(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-2").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-2", "status": "failed",
+            "error": {"code": "UPSTREAM_MALFORMED", "message": "bad output"},
+            "refunded": True,
+        })
+    )
+    from sonilo_mcp.api import _poll_task
+    body = await _poll_task("t-2", timeout_seconds=600)
+    assert body["status"] == "failed"
+    assert body["refunded"] is True
+
+
+@respx.mock
+async def test_poll_task_timeout_mentions_recovery(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-3").mock(
+        return_value=httpx.Response(200, json={"task_id": "t-3", "status": "processing"})
+    )
+    from sonilo_mcp.api import _poll_task
+    # timeout_seconds=0 -> deadline already passed after the first check.
+    with pytest.raises(Exception) as exc:
+        await _poll_task("t-3", timeout_seconds=0)
+    assert "t-3" in str(exc.value)
+    assert "get_sfx_task" in str(exc.value)

@@ -484,6 +484,35 @@ async def _post_task_submit(
     return str(task_id)
 
 
+_POLL_INTERVAL_SECONDS = 5.0
+# Indirection for tests, mirroring the streaming pipeline's test seams:
+# monkeypatch api._poll_sleep to avoid real 5s waits.
+_poll_sleep = asyncio.sleep
+
+
+async def _poll_task(task_id: str, timeout_seconds: float) -> dict:
+    """Poll GET /v1/tasks/{task_id} every _POLL_INTERVAL_SECONDS until the
+    task is terminal (succeeded/failed) or timeout_seconds elapses.
+
+    Returns the terminal task body. On timeout, raises with the task_id and
+    a get_sfx_task recovery hint — the backend keeps running (and charging),
+    so the result stays retrievable.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        body = await _http_get_json(f"/v1/tasks/{task_id}")
+        if body.get("status") in ("succeeded", "failed"):
+            return body
+        if time.monotonic() >= deadline:
+            raise Exception(
+                f"Timed out after {timeout_seconds:.0f}s waiting for task "
+                f"{task_id}. The generation may still complete on the "
+                f'backend — call get_sfx_task("{task_id}") later to '
+                "retrieve the result."
+            )
+        await _poll_sleep(_POLL_INTERVAL_SECONDS)
+
+
 # ---------- Tools: generation ----------
 
 @mcp.tool(

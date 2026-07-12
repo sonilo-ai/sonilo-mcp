@@ -447,6 +447,46 @@ async def test_get_usage_boundary_values_accepted(monkeypatch):
     await get_usage(days=365)
 
 
+@respx.mock
+async def test_get_account_services_rejects_non_dict_body(monkeypatch):
+    # A 200 whose body isn't a JSON object (e.g. `null` or a bare list) must
+    # not be handed to the MCP host as-is: FastMCP maps None -> [] and a
+    # list into unlabeled text fragments, either of which is silently
+    # indistinguishable from a legitimate empty result.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    route = respx.get("https://api.test.local/v1/account/services")
+    from sonilo_mcp.api import get_account_services
+
+    route.mock(return_value=httpx.Response(
+        200, content=b"null", headers={"content-type": "application/json"}
+    ))
+    with pytest.raises(Exception, match="account/services"):
+        await get_account_services()
+
+    route.mock(return_value=httpx.Response(200, json=["not", "a", "dict"]))
+    with pytest.raises(Exception, match="account/services"):
+        await get_account_services()
+
+
+@respx.mock
+async def test_get_usage_rejects_non_dict_body(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    route = respx.get("https://api.test.local/v1/account/usage")
+    from sonilo_mcp.api import get_usage
+
+    route.mock(return_value=httpx.Response(
+        200, content=b"null", headers={"content-type": "application/json"}
+    ))
+    with pytest.raises(Exception, match="account/usage"):
+        await get_usage()
+
+    route.mock(return_value=httpx.Response(200, json=["not", "a", "dict"]))
+    with pytest.raises(Exception, match="account/usage"):
+        await get_usage()
+
+
 async def _async_iter(items):
     for item in items:
         yield item

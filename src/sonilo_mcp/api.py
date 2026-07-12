@@ -583,26 +583,50 @@ def _end_sentence(value: object) -> str:
     return text
 
 
+def _require_json_object(body: object, error_message: str) -> dict:
+    """Validate that a 200 response body is a JSON object.
+
+    A 200 with a body that isn't a dict (e.g. `null` or a bare list) is a
+    backend contract violation, not a 4xx/5xx — _http_get_json returns it
+    unchanged with no exception to catch. Left unguarded, callers either
+    crash with a bare AttributeError from body.get(...), or — for tools
+    that hand the body straight to the MCP host — silently succeed with
+    empty output (FastMCP maps None -> [], and a list destructures into
+    unlabeled text fragments), indistinguishable from a legitimate empty
+    result.
+    """
+    if not isinstance(body, dict):
+        raise Exception(error_message)
+    return body
+
+
 def _require_task_body(body: object, task_id: str) -> dict:
     """Validate that a /v1/tasks/{task_id} 200 response body is a JSON
     object, as both _poll_task and get_sfx_task assume when they call
     body.get(...) right after fetching it.
-
-    A 200 with a body that isn't a dict (e.g. a bare list) is a backend
-    contract violation, not a 4xx/5xx — _http_get_json returns it unchanged
-    with no exception to catch. Without this check, the very next
-    `body.get("status")` raises a bare AttributeError that carries neither
-    the task_id nor a recovery hint, even though the task was already
-    submitted and charged.
     """
-    if not isinstance(body, dict):
-        raise Exception(
-            f"Unexpected response from the backend for task {task_id} "
-            "(expected a JSON object). The task was already submitted and "
-            f'charged — call get_sfx_task("{task_id}") to check for the '
-            "result."
-        )
-    return body
+    return _require_json_object(
+        body,
+        f"Unexpected response from the backend for task {task_id} "
+        "(expected a JSON object). The task was already submitted and "
+        f'charged — call get_sfx_task("{task_id}") to check for the '
+        "result.",
+    )
+
+
+def _require_account_body(body: object, endpoint: str) -> dict:
+    """Validate that a free, read-only account-endpoint 200 response body
+    is a JSON object before it's handed straight to the MCP host.
+
+    Unlike _require_task_body, these endpoints are free and read-only, so
+    the message carries no charge/recovery language — just what went
+    wrong and where.
+    """
+    return _require_json_object(
+        body,
+        f"Unexpected response from the backend for {endpoint} "
+        "(expected a JSON object).",
+    )
 
 
 async def _poll_task(task_id: str, timeout_seconds: float) -> dict:
@@ -1339,7 +1363,8 @@ async def get_sfx_task(
     )
 )
 async def get_account_services() -> dict:
-    return await _http_get_json("/v1/account/services")
+    body = await _http_get_json("/v1/account/services")
+    return _require_account_body(body, "/v1/account/services")
 
 
 @mcp.tool(
@@ -1353,7 +1378,8 @@ async def get_account_services() -> dict:
 async def get_usage(days: int = 30) -> dict:
     if not (1 <= days <= 365):
         raise Exception(f"days must be between 1 and 365 (got {days})")
-    return await _http_get_json("/v1/account/usage", params={"days": days})
+    body = await _http_get_json("/v1/account/usage", params={"days": days})
+    return _require_account_body(body, "/v1/account/usage")
 
 
 # ---------- Tools: local playback ----------

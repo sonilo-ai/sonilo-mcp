@@ -201,8 +201,8 @@ async def _check_video_duration(
 ) -> None:
     """Best-effort local ffprobe pre-check of a video's duration.
 
-    Raises if the duration is known to exceed the backend's 360s cap, so the
-    caller fails fast instead of uploading a video the backend will reject.
+    Raises if the duration is known to exceed `max_seconds`, so the caller
+    fails fast instead of uploading a video the backend will reject.
     `source` may be a local path or a URL (ffprobe handles both).
 
     The check is best-effort: if ffprobe is not installed, times out, or
@@ -485,8 +485,7 @@ async def _post_task_submit(
 
 
 _POLL_INTERVAL_SECONDS = 5.0
-# Indirection for tests, mirroring the streaming pipeline's test seams:
-# monkeypatch api._poll_sleep to avoid real 5s waits.
+# Test seam: monkeypatch api._poll_sleep to avoid real 5s waits in tests.
 _poll_sleep = asyncio.sleep
 
 
@@ -500,7 +499,14 @@ async def _poll_task(task_id: str, timeout_seconds: float) -> dict:
     """
     deadline = time.monotonic() + timeout_seconds
     while True:
-        body = await _http_get_json(f"/v1/tasks/{task_id}")
+        try:
+            body = await _http_get_json(f"/v1/tasks/{task_id}")
+        except Exception as e:
+            raise Exception(
+                f"{e} The generation task {task_id} may still be running on "
+                f'the backend — call get_sfx_task("{task_id}") later to '
+                "retrieve the result."
+            ) from e
         if body.get("status") in ("succeeded", "failed"):
             return body
         if time.monotonic() >= deadline:
@@ -583,6 +589,7 @@ async def _save_task_artifacts(
     video (video-to-sfx only), one TextContent per saved file.
     """
     task_status = body.get("status")
+    task_id = body.get("task_id")
     if task_status == "failed":
         err = body.get("error") or {}
         code = err.get("code") or "GENERATION_FAILED"
@@ -606,13 +613,27 @@ async def _save_task_artifacts(
     dest = _artifact_dest(
         output_path, base_name, _ext_from_content_type(audio.get("content_type"))
     )
-    await _download_artifact(audio["url"], dest)
+    try:
+        await _download_artifact(audio["url"], dest)
+    except Exception as e:
+        raise Exception(
+            f'{e} Task id: {task_id} — call get_sfx_task("{task_id}") to '
+            "retry."
+        ) from e
     saved.append(TextContent(type="text", text=f"Success. File saved as: {dest}"))
+    audio_dest = dest
 
     video = body.get("video")
     if isinstance(video, dict) and video.get("url"):
         dest = _artifact_dest(output_path, base_name, ".mp4")
-        await _download_artifact(video["url"], dest)
+        try:
+            await _download_artifact(video["url"], dest)
+        except Exception as e:
+            raise Exception(
+                f"{e} The audio file was already saved as: {audio_dest}. "
+                f'Task id: {task_id} — call get_sfx_task("{task_id}") to '
+                "retry the video download."
+            ) from e
         saved.append(
             TextContent(type="text", text=f"Success. File saved as: {dest}")
         )

@@ -145,7 +145,7 @@ files. To opt out — e.g. to read a video from elsewhere on disk — set
 
 Tools marked ✅ make API calls that incur charges on your Sonilo account.
 
-> **Optional:** if [`ffprobe`](https://ffmpeg.org/) (part of FFmpeg) is installed, `video_to_music` checks a video's duration locally and rejects anything over 360s before uploading. Without it, the same limit is still enforced by the backend.
+> **Optional:** if [`ffprobe`](https://ffmpeg.org/) (part of FFmpeg) is installed, `video_to_music` checks a video's duration locally and rejects anything over 360s before uploading. `video_to_sfx` performs the same local check with its 180s cap. Without it, the same limits are still enforced by the backend.
 
 ## Output Format
 

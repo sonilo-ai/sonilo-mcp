@@ -1376,6 +1376,21 @@ async def test_poll_task_timeout_mentions_recovery(monkeypatch):
 
 
 @respx.mock
+async def test_poll_task_http_error_mentions_task_id(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-err").mock(
+        return_value=httpx.Response(500, text="boom")
+    )
+    from sonilo_mcp.api import _poll_task
+    with pytest.raises(Exception) as exc:
+        await _poll_task("t-err", timeout_seconds=600)
+    msg = str(exc.value)
+    assert "t-err" in msg
+    assert "get_sfx_task" in msg
+
+
+@respx.mock
 async def test_download_artifact_writes_file_without_auth(monkeypatch, tmp_path):
     monkeypatch.setenv("SONILO_API_KEY", "secret-key")
     route = respx.get("https://r2.test/sfx-results/t-1/audio.m4a").mock(
@@ -1423,7 +1438,7 @@ async def test_download_artifact_cleans_up_partial_file_on_midstream_failure(
     )
     from sonilo_mcp.api import _download_artifact
     dest = tmp_path / "x.m4a"
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="get_sfx_task"):
         await _download_artifact("https://r2.test/broken", dest)
     # A mid-stream failure must not leave a corrupt partial file behind —
     # otherwise a retry would get a new suffixed path from _artifact_dest
@@ -1489,6 +1504,32 @@ async def test_save_task_artifacts_audio_and_video(monkeypatch, tmp_path):
     assert len(result) == 2
     assert (tmp_path / "scene.wav").read_bytes() == b"wav-bytes"
     assert (tmp_path / "scene.mp4").read_bytes() == b"mp4-bytes"
+
+
+@respx.mock
+async def test_save_task_artifacts_video_failure_reports_saved_audio(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/a2.wav").mock(
+        return_value=httpx.Response(200, content=b"wav-bytes-2")
+    )
+    respx.get("https://r2.test/v2.mp4").mock(
+        return_value=httpx.Response(403, text="expired")
+    )
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "t-77", "status": "succeeded",
+        "audio": {"url": "https://r2.test/a2.wav", "content_type": "audio/wav"},
+        "video": {"url": "https://r2.test/v2.mp4", "content_type": "video/mp4"},
+    }
+    audio_dest = tmp_path / "scene2.wav"
+    with pytest.raises(Exception) as exc:
+        await _save_task_artifacts(body, tmp_path, "scene2")
+    msg = str(exc.value)
+    assert "t-77" in msg
+    assert str(audio_dest) in msg
+    assert audio_dest.read_bytes() == b"wav-bytes-2"
 
 
 async def test_save_task_artifacts_failed_refunded(tmp_path):

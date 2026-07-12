@@ -1419,13 +1419,17 @@ async def test_download_artifact_writes_file_without_auth(monkeypatch, tmp_path)
 
 
 @respx.mock
-async def test_download_artifact_error_mentions_recovery(monkeypatch, tmp_path):
+async def test_download_artifact_error_states_status_code(monkeypatch, tmp_path):
+    # _download_artifact doesn't know the caller's task_id, so it states only
+    # the bare fact of the failure — no recovery advice. That's owned by
+    # _save_task_artifacts, which does have the task_id (see
+    # test_save_task_artifacts_video_failure_reports_saved_audio etc.).
     monkeypatch.setenv("SONILO_API_KEY", "k")
     respx.get("https://r2.test/gone").mock(
         return_value=httpx.Response(403, text="expired")
     )
     from sonilo_mcp.api import _download_artifact
-    with pytest.raises(Exception, match="get_sfx_task"):
+    with pytest.raises(Exception, match=r"download failed \(status 403\)"):
         await _download_artifact("https://r2.test/gone", tmp_path / "x.m4a")
 
 
@@ -1449,7 +1453,7 @@ async def test_download_artifact_cleans_up_partial_file_on_midstream_failure(
     )
     from sonilo_mcp.api import _download_artifact
     dest = tmp_path / "x.m4a"
-    with pytest.raises(Exception, match="get_sfx_task"):
+    with pytest.raises(Exception, match="download failed"):
         await _download_artifact("https://r2.test/broken", dest)
     # A mid-stream failure must not leave a corrupt partial file behind —
     # otherwise a retry would get a new suffixed path from _artifact_dest
@@ -1601,7 +1605,7 @@ async def test_save_task_artifacts_failed_refunded(tmp_path):
     msg = str(exc.value)
     assert "UPSTREAM_MALFORMED" in msg
     assert "bad output" in msg
-    assert "reversed" in msg  # refunded -> "charge was reversed"
+    assert "you were not billed" in msg  # unique to the refunded branch
     assert "t-3" in msg
 
 
@@ -1635,6 +1639,13 @@ async def test_save_task_artifacts_succeeded_without_audio(tmp_path):
     body = {"task_id": "t-5", "status": "succeeded"}
     with pytest.raises(Exception, match="no audio"):
         await _save_task_artifacts(body, tmp_path, "x", "t-5")
+
+
+async def test_save_task_artifacts_unexpected_status(tmp_path):
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {"task_id": "t-6", "status": "cancelled"}
+    with pytest.raises(Exception, match="Unexpected task status.*cancelled"):
+        await _save_task_artifacts(body, tmp_path, "x", "t-6")
 
 
 def _sfx_submit_then_poll(task_id: str, envelope: dict):
@@ -1899,14 +1910,20 @@ async def test_video_to_sfx_rejects_non_http_url(monkeypatch, output_dir, bad_ur
         await video_to_sfx(video_url=bad_url)
 
 
+@respx.mock
 async def test_video_to_sfx_rejects_video_over_180s(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     from sonilo_mcp.api import video_to_sfx
     # 200s passes the music cap (360) but must fail the SFX cap (180).
     _patch_ffprobe(monkeypatch, duration=200.0)
+    submit_route = respx.post("https://api.test.local/v1/video-to-sfx").mock(
+        return_value=httpx.Response(202, json={"task_id": "t-should-not-charge"})
+    )
     with pytest.raises(Exception, match="exceeds the maximum"):
         await video_to_sfx(video_url="https://example.com/long.mp4")
+    # Must NOT charge — the duration check must reject before the submit POST.
+    assert submit_route.call_count == 0
 
 
 @respx.mock
@@ -1957,8 +1974,26 @@ async def test_get_sfx_task_failed_raises_with_refund(monkeypatch, output_dir):
         })
     )
     from sonilo_mcp.api import get_sfx_task
-    with pytest.raises(Exception, match="TIMEOUT.*reversed"):
+    with pytest.raises(Exception, match="TIMEOUT.*you were not billed"):
         await get_sfx_task("t-32")
+
+
+@respx.mock
+async def test_get_sfx_task_status_get_transient_failure_mentions_task_id(
+    monkeypatch, output_dir
+):
+    # The status GET can fail transiently (backend 5xx) even after the
+    # generation itself succeeded and charged — the raised message must
+    # still carry the task_id so the paid result stays recoverable.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-33").mock(
+        return_value=httpx.Response(500, text="boom")
+    )
+    from sonilo_mcp.api import get_sfx_task
+    with pytest.raises(Exception) as exc:
+        await get_sfx_task("t-33")
+    assert "t-33" in str(exc.value)
 
 
 @respx.mock

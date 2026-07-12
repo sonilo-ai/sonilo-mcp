@@ -502,6 +502,21 @@ _POLL_INTERVAL_SECONDS = 5.0
 _poll_sleep = asyncio.sleep
 
 
+def _end_sentence(value: object) -> str:
+    """Stringify `value` and ensure it ends with sentence punctuation.
+
+    Used when composing wrapped error messages (`f"{_end_sentence(e)} ..."`)
+    so that appending more prose after an exception's message never produces
+    a run-on sentence — e.g. a bare `OSError("No space left on device")`
+    would otherwise read as "No space left on device Task id: ..." with no
+    separator.
+    """
+    text = str(value)
+    if text and text[-1] not in ".!?":
+        return text + "."
+    return text
+
+
 async def _poll_task(task_id: str, timeout_seconds: float) -> dict:
     """Poll GET /v1/tasks/{task_id} every _POLL_INTERVAL_SECONDS until the
     task is terminal (succeeded/failed) or timeout_seconds elapses.
@@ -516,9 +531,9 @@ async def _poll_task(task_id: str, timeout_seconds: float) -> dict:
             body = await _http_get_json(f"/v1/tasks/{task_id}")
         except Exception as e:
             raise Exception(
-                f"{e} The generation task {task_id} may still be running on "
-                f'the backend — call get_sfx_task("{task_id}") later to '
-                "retrieve the result."
+                f"{_end_sentence(e)} The generation task {task_id} may still "
+                f'be running on the backend — call get_sfx_task("{task_id}") '
+                "later to retrieve the result."
             ) from e
         if body.get("status") in ("succeeded", "failed"):
             return body
@@ -563,6 +578,13 @@ async def _download_artifact(url: str, dest: Path) -> None:
     Sends NO Authorization / X-Sonilo-Client / custom User-Agent headers:
     presigned URLs carry their own auth, and the API key must never be sent
     to the storage domain.
+
+    On failure, raises stating only the FACT of the failure — no recovery
+    advice. This function doesn't know the caller's task_id and isn't the
+    right layer to own the recovery instruction; _save_task_artifacts (which
+    has the task_id) wraps these failures with the single, complete recovery
+    instruction. Duplicating that instruction here would just make the
+    caller's wrapped message repeat itself.
     """
     cfg = _get_config()
     try:
@@ -570,9 +592,7 @@ async def _download_artifact(url: str, dest: Path) -> None:
             async with client.stream("GET", url) as r:
                 if r.status_code >= 400:
                     raise Exception(
-                        f"Artifact download failed (status {r.status_code}). "
-                        "The result is still stored on the backend — retry "
-                        "with get_sfx_task."
+                        f"Artifact download failed (status {r.status_code})."
                     )
                 # If the write loop dies mid-stream (for ANY reason), remove
                 # the truncated file: leaving it would both hand the user a
@@ -586,10 +606,7 @@ async def _download_artifact(url: str, dest: Path) -> None:
                     dest.unlink(missing_ok=True)
                     raise
     except httpx.RequestError as e:
-        raise Exception(
-            f"Artifact download failed: {e}. The result is still stored on "
-            "the backend — retry with get_sfx_task."
-        ) from e
+        raise Exception(f"Artifact download failed: {e}") from e
 
 
 async def _save_task_artifacts(
@@ -641,10 +658,13 @@ async def _save_task_artifacts(
         # time we get here, so ANY failure in this block — computing the
         # destination path or downloading — must still carry the task_id
         # and recovery hint. Otherwise a paid result becomes unrecoverable
-        # from the error message alone.
+        # from the error message alone. _download_artifact (and any other
+        # failure here, e.g. an OSError from _artifact_dest) states only the
+        # bare fact of the failure — this is the one layer that owns the
+        # single, complete recovery instruction, so it isn't repeated.
         raise Exception(
-            f'{e} Task id: {task_id} — call get_sfx_task("{task_id}") to '
-            "retry."
+            f"{_end_sentence(e)} The result is still stored on the backend "
+            f'— call get_sfx_task("{task_id}") to retry.'
         ) from e
     saved.append(TextContent(type="text", text=f"Success. File saved as: {dest}"))
     audio_dest = dest
@@ -656,9 +676,9 @@ async def _save_task_artifacts(
             await _download_artifact(video["url"], dest)
         except Exception as e:
             raise Exception(
-                f"{e} The audio file was already saved as: {audio_dest}. "
-                f'Task id: {task_id} — call get_sfx_task("{task_id}") to '
-                "retry the video download."
+                f"{_end_sentence(e)} The audio file was already saved as: "
+                f"{audio_dest}. The video is still stored on the backend — "
+                f'call get_sfx_task("{task_id}") to retry the download.'
             ) from e
         saved.append(
             TextContent(type="text", text=f"Success. File saved as: {dest}")
@@ -986,7 +1006,18 @@ async def get_sfx_task(
     task_id: str,
     output_directory: str | None = None,
 ) -> list[TextContent]:
-    body = await _http_get_json(f"/v1/tasks/{task_id}")
+    try:
+        body = await _http_get_json(f"/v1/tasks/{task_id}")
+    except Exception as e:
+        # Structurally identical to _poll_task's GET — a transient failure
+        # here (e.g. backend 5xx) must not read as if the paid result is
+        # lost: reassure the caller it's still on the backend and point
+        # them back at this same tool.
+        raise Exception(
+            f"{_end_sentence(e)} The result for task {task_id} may still be "
+            f'available on the backend — call get_sfx_task("{task_id}") '
+            "again shortly."
+        ) from e
     if body.get("status") == "processing":
         return [TextContent(
             type="text",

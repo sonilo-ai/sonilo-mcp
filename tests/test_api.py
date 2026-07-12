@@ -1451,6 +1451,58 @@ async def test_poll_task_http_error_mentions_task_id(monkeypatch):
 
 
 @respx.mock
+async def test_poll_task_402_keeps_task_id(monkeypatch):
+    # 402 mid-poll means the account was suspended for billing AFTER the
+    # task was already submitted and charged (see _raise_http_error's
+    # "Account is suspended" 402 case) — the task_id must survive so the
+    # paid result stays recoverable once billing is fixed.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-402").mock(
+        side_effect=[
+            httpx.Response(200, json={"task_id": "t-402", "status": "processing"}),
+            httpx.Response(402, json={"detail": "Account is suspended"}),
+        ]
+    )
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    with pytest.raises(Exception) as exc:
+        await api._poll_task("t-402", timeout_seconds=600)
+    msg = str(exc.value)
+    assert "t-402" in msg
+    assert "get_sfx_task" in msg
+
+
+@respx.mock
+async def test_poll_task_401_keeps_task_id(monkeypatch):
+    # 401 mid-poll means the API key was rotated/revoked between submit and
+    # a later poll — same recoverability requirement as 402.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-401").mock(
+        side_effect=[
+            httpx.Response(200, json={"task_id": "t-401", "status": "processing"}),
+            httpx.Response(401, json={"detail": "Invalid API key"}),
+        ]
+    )
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    with pytest.raises(Exception) as exc:
+        await api._poll_task("t-401", timeout_seconds=600)
+    msg = str(exc.value)
+    assert "t-401" in msg
+    assert "get_sfx_task" in msg
+
+
+@respx.mock
 async def test_download_artifact_writes_file_without_auth(monkeypatch, tmp_path):
     monkeypatch.setenv("SONILO_API_KEY", "secret-key")
     route = respx.get("https://r2.test/sfx-results/t-1/audio.m4a").mock(
@@ -2149,7 +2201,10 @@ async def test_get_sfx_task_twice_reuses_existing_file(monkeypatch, output_dir):
     respx.get("https://api.test.local/v1/tasks/t-99").mock(
         return_value=httpx.Response(200, json={
             "task_id": "t-99", "status": "succeeded",
-            "audio": {"url": "https://r2.test/dup.mp3", "content_type": "audio/mpeg"},
+            "audio": {
+                "url": "https://r2.test/dup.mp3", "content_type": "audio/mpeg",
+                "file_size": len(b"dup-bytes"),
+            },
         })
     )
     route = respx.get("https://r2.test/dup.mp3").mock(
@@ -2270,3 +2325,134 @@ async def test_poll_task_404_gives_no_retry_advice(monkeypatch):
     msg = str(exc.value)
     assert "Task not found" in msg
     assert "may still be running" not in msg
+
+
+@respx.mock
+async def test_get_sfx_task_402_keeps_task_id(monkeypatch, output_dir):
+    # get_sfx_task's own status GET can 402 if billing is suspended after
+    # the original task was already charged — the task_id must still be
+    # recoverable from the error message.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-402b").mock(
+        return_value=httpx.Response(402, json={"detail": "Account is suspended"})
+    )
+    from sonilo_mcp.api import get_sfx_task
+    with pytest.raises(Exception) as exc:
+        await get_sfx_task("t-402b")
+    msg = str(exc.value)
+    assert "t-402b" in msg
+    assert "get_sfx_task" in msg
+
+
+@respx.mock
+async def test_get_sfx_task_reuse_rejects_size_mismatch(monkeypatch, output_dir):
+    # A hard process kill mid-write can leave a non-empty, TRUNCATED file at
+    # the canonical path with no handler ever having cleaned it up. The
+    # reuse path must verify size against the envelope's file_size and,
+    # on a mismatch, treat the file as corrupt: remove it and re-download
+    # into the SAME canonical path (not a `-1` duplicate).
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    real_bytes = b"REAL-AUDIO-PAYLOAD-BYTES"
+    respx.get("https://api.test.local/v1/tasks/t-corrupt").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-corrupt", "status": "succeeded",
+            "audio": {
+                "url": "https://r2.test/real.mp3",
+                "content_type": "audio/mpeg",
+                "file_size": len(real_bytes),
+            },
+        })
+    )
+    route = respx.get("https://r2.test/real.mp3").mock(
+        return_value=httpx.Response(200, content=real_bytes)
+    )
+    canonical = output_dir / "sfx-t-corrup.mp3"
+    canonical.write_bytes(b"CORRUPT-PARTIAL-GARBAGE")
+
+    from sonilo_mcp.api import get_sfx_task
+    result = await get_sfx_task("t-corrupt")
+
+    assert route.call_count == 1
+    assert canonical.read_bytes() == real_bytes
+    files = list(output_dir.iterdir())
+    assert len(files) == 1
+    assert "Success" in result[0].text
+
+
+@respx.mock
+async def test_get_sfx_task_reuse_accepts_size_match(monkeypatch, output_dir):
+    # When the on-disk size exactly matches the envelope's file_size, the
+    # existing file is genuine and must be reused without re-downloading.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    real_bytes = b"REAL-AUDIO-BYTES-MATCH"
+    respx.get("https://api.test.local/v1/tasks/t-match").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-match", "status": "succeeded",
+            "audio": {
+                "url": "https://r2.test/match.mp3",
+                "content_type": "audio/mpeg",
+                "file_size": len(real_bytes),
+            },
+        })
+    )
+    route = respx.get("https://r2.test/match.mp3").mock(
+        return_value=httpx.Response(200, content=real_bytes)
+    )
+    canonical = output_dir / "sfx-t-match.mp3"
+    canonical.write_bytes(real_bytes)
+
+    from sonilo_mcp.api import get_sfx_task
+    result = await get_sfx_task("t-match")
+
+    assert route.call_count == 0
+    assert "already downloaded" in result[0].text.lower()
+    assert canonical.read_bytes() == real_bytes
+
+
+@respx.mock
+async def test_get_sfx_task_video_task_reuse_returns_both_paths(monkeypatch, output_dir):
+    # A video_to_sfx-style envelope (audio + video) recovered twice via
+    # get_sfx_task: the second call must return BOTH the audio and video
+    # paths and download NEITHER. Pins the early `return saved` in the
+    # video reuse branch of _save_task_artifacts across all four
+    # (audio present/absent) x (video present/absent) combinations.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    audio_bytes = b"AUDIO-BYTES-VIDEO-TASK"
+    video_bytes = b"VIDEO-BYTES-VIDEO-TASK"
+    respx.get("https://api.test.local/v1/tasks/t-vidtask").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-vidtask", "status": "succeeded",
+            "audio": {
+                "url": "https://r2.test/vt-audio.mp3",
+                "content_type": "audio/mpeg",
+                "file_size": len(audio_bytes),
+            },
+            "video": {
+                "url": "https://r2.test/vt-video.mp4",
+                "content_type": "video/mp4",
+                "file_size": len(video_bytes),
+            },
+        })
+    )
+    audio_route = respx.get("https://r2.test/vt-audio.mp3").mock(
+        return_value=httpx.Response(200, content=audio_bytes)
+    )
+    video_route = respx.get("https://r2.test/vt-video.mp4").mock(
+        return_value=httpx.Response(200, content=video_bytes)
+    )
+    from sonilo_mcp.api import get_sfx_task
+
+    first = await get_sfx_task("t-vidtask")
+    assert len(first) == 2
+    assert audio_route.call_count == 1
+    assert video_route.call_count == 1
+
+    second = await get_sfx_task("t-vidtask")
+    assert len(second) == 2
+    assert audio_route.call_count == 1
+    assert video_route.call_count == 1
+    assert sum("already downloaded" in c.text.lower() for c in second) == 2

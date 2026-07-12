@@ -315,20 +315,35 @@ def _raise_http_error(status_code: int, body: str) -> None:
     raise SoniloHTTPError(f"Unexpected status {status_code}: {detail}", status_code)
 
 
-def _is_transient_error(e: BaseException) -> bool:
-    """Whether `e` is worth attaching "try again" recovery advice to.
+def _is_task_not_found(e: BaseException) -> bool:
+    """Whether `e` means the task_id itself is gone/invalid — the only case
+    where recovery advice should be omitted.
 
-    Transient: 429 (rate limit), any 5xx, or a network-level failure with no
-    HTTP status at all (e.g. httpx.RequestError, wrapped as a bare
-    Exception by _http_get_json) — all of these may well succeed on retry.
-    Permanent: any other 4xx (401, 404, 422, ...) — retrying hits the exact
-    same wall every time, so telling the caller to retry is actively
-    misleading.
+    Only a 404 means that: a bad/typo'd id, or a non-SFX (e.g. music) task
+    id — /v1/tasks is SFX-only and 404s those. Every OTHER error (401, 402,
+    413, 422, 429, 5xx, or a network-level failure with no status at all,
+    e.g. httpx.RequestError wrapped as a bare Exception by _http_get_json)
+    still refers to a task that EXISTS and was already CHARGED — the cause
+    is something the caller can fix (renew the key, settle the bill, wait
+    out the rate limit, retry a transient blip) and then recover the paid
+    result, so those must always keep the task_id + get_sfx_task advice.
+    """
+    return getattr(e, "status_code", None) == 404
+
+
+def _is_transient_error(e: BaseException) -> bool:
+    """Whether `e` is a rate-limit/server/network failure worth an immediate
+    retry, as opposed to an auth/billing failure the caller must fix first.
+
+    This no longer decides WHETHER recovery advice is attached (see
+    _is_task_not_found, which owns that) — every non-404 error keeps the
+    task_id. This only picks the PHRASING: transient errors get "try again
+    shortly" wording, while 401/402/413/422 get "resolve the issue above,
+    then retry" wording, since blindly telling someone to retry a revoked
+    key or a suspended account moments later is misleading.
     """
     status = getattr(e, "status_code", None)
-    if status is None:
-        return True
-    return status == 429 or status >= 500
+    return status is None or status == 429 or status >= 500
 
 
 # Short timeout for lightweight GETs (services, usage). Streaming
@@ -580,16 +595,24 @@ async def _poll_task(task_id: str, timeout_seconds: float) -> dict:
         try:
             body = await _http_get_json(f"/v1/tasks/{task_id}")
         except Exception as e:
-            if not _is_transient_error(e):
-                # Permanent failure (e.g. 404/401) — the task_id is already
-                # in the original message where relevant, and no amount of
-                # retrying will change the outcome, so attaching "may still
-                # be running" advice here would be false.
+            if _is_task_not_found(e):
+                # The task_id itself is gone/invalid (404) — no amount of
+                # retrying will change that, so raise as-is with no advice.
                 raise
+            if _is_transient_error(e):
+                raise Exception(
+                    f"{_end_sentence(e)} The generation task {task_id} may "
+                    "still be running on the backend — call "
+                    f'get_sfx_task("{task_id}") later to retrieve the '
+                    "result."
+                ) from e
+            # A non-404 4xx (401 key rotated, 402 billing suspended, ...) —
+            # the task still exists and was already charged. The caller
+            # must fix the underlying cause first, then recover the result.
             raise Exception(
-                f"{_end_sentence(e)} The generation task {task_id} may still "
-                f'be running on the backend — call get_sfx_task("{task_id}") '
-                "later to retrieve the result."
+                f"{_end_sentence(e)} Task {task_id} was already submitted "
+                "and charged — resolve the issue above, then call "
+                f'get_sfx_task("{task_id}") to retrieve the result.'
             ) from e
         if body.get("status") in ("succeeded", "failed"):
             return body
@@ -694,18 +717,44 @@ async def _download_artifact(url: str, dest: Path) -> None:
         raise
 
 
-def _existing_canonical_dest(output_path: Path, base_name: str, ext: str) -> Path | None:
-    """Return the UNSUFFIXED base_name+ext path if it already exists and is
-    non-empty, else None.
+def _existing_canonical_dest(
+    output_path: Path, base_name: str, ext: str, expected_size: int | None
+) -> Path | None:
+    """Return the UNSUFFIXED base_name+ext path if it's safe to reuse
+    instead of re-downloading, else None.
 
     Used only by the reuse_existing path in _save_task_artifacts: it is the
     "did I already download exactly this task's result" check, deliberately
     distinct from _artifact_dest's collision-avoidance (which always finds a
     *new* free name and never revisits an existing one).
+
+    A hard process kill (SIGKILL/OOM/host crash) mid-write can leave a
+    non-empty, TRUNCATED file at the canonical path — _download_artifact's
+    exception handlers never ran, so nothing cleaned it up. A bare
+    exists()-and-non-empty check would silently hand that corrupt file back
+    forever. When `expected_size` (the backend envelope's file_size) is
+    known, this verifies it: reuse only on an EXACT size match; on a
+    mismatch the file is corrupt, so it is removed here so the caller falls
+    through to a fresh download at the SAME canonical path (not a `-1`
+    suffix — the canonical file was garbage, not a distinct result).
+
+    When `expected_size` is None (older/other backend responses without
+    file_size), we cannot verify — trade-off: fall back to the previous
+    non-empty check rather than unconditionally re-downloading, since
+    always re-downloading would defeat the idempotency this function
+    exists for.
     """
     candidate = output_path / f"{base_name}{ext}"
-    if candidate.exists() and candidate.stat().st_size > 0:
+    if not candidate.exists():
+        return None
+    size = candidate.stat().st_size
+    if size == 0:
+        return None
+    if expected_size is None:
         return candidate
+    if size == expected_size:
+        return candidate
+    candidate.unlink(missing_ok=True)
     return None
 
 
@@ -766,7 +815,9 @@ async def _save_task_artifacts(
     saved: list[TextContent] = []
     audio_ext = _ext_from_content_type(audio.get("content_type"))
     existing = (
-        _existing_canonical_dest(output_path, base_name, audio_ext)
+        _existing_canonical_dest(
+            output_path, base_name, audio_ext, audio.get("file_size")
+        )
         if reuse_existing
         else None
     )
@@ -798,7 +849,9 @@ async def _save_task_artifacts(
     video = body.get("video")
     if isinstance(video, dict) and video.get("url"):
         existing_video = (
-            _existing_canonical_dest(output_path, base_name, ".mp4")
+            _existing_canonical_dest(
+                output_path, base_name, ".mp4", video.get("file_size")
+            )
             if reuse_existing
             else None
         )
@@ -1148,20 +1201,30 @@ async def get_sfx_task(
     try:
         body = await _http_get_json(f"/v1/tasks/{task_id}")
     except Exception as e:
-        if not _is_transient_error(e):
-            # Permanent failure (e.g. a 404 for a bad/typo'd id, or a music
-            # task's id — /v1/tasks is SFX-only and 404s those). Retrying
-            # can never help, so raise the original error as-is with no
-            # "call get_sfx_task again" advice attached.
+        if _is_task_not_found(e):
+            # A 404 for a bad/typo'd id, or a music task's id — /v1/tasks
+            # is SFX-only and 404s those. Retrying can never help, so raise
+            # the original error as-is with no "call get_sfx_task again"
+            # advice attached.
             raise
-        # Structurally identical to _poll_task's GET — a transient failure
-        # here (e.g. backend 5xx) must not read as if the paid result is
-        # lost: reassure the caller it's still on the backend and point
-        # them back at this same tool.
+        if _is_transient_error(e):
+            # Structurally identical to _poll_task's GET — a transient
+            # failure here (e.g. backend 5xx) must not read as if the paid
+            # result is lost: reassure the caller it's still on the backend
+            # and point them back at this same tool.
+            raise Exception(
+                f"{_end_sentence(e)} The result for task {task_id} may "
+                "still be available on the backend — call "
+                f'get_sfx_task("{task_id}") again shortly.'
+            ) from e
+        # A non-404 4xx (401 key rotated, 402 billing suspended, ...) — the
+        # task was already charged and its result still exists on the
+        # backend. The caller must fix the underlying cause first, then
+        # recover the result with this same tool.
         raise Exception(
-            f"{_end_sentence(e)} The result for task {task_id} may still be "
-            f'available on the backend — call get_sfx_task("{task_id}") '
-            "again shortly."
+            f"{_end_sentence(e)} Task {task_id} was already charged — "
+            f'resolve the issue above, then call get_sfx_task("{task_id}") '
+            "to retrieve the result."
         ) from e
     if body.get("status") == "processing":
         return [TextContent(

@@ -1883,6 +1883,39 @@ async def test_save_task_artifacts_failed_not_refunded(tmp_path):
     assert "t-4" in str(exc.value)
 
 
+async def test_save_task_artifacts_refunded_string_false_is_not_refunded(tmp_path):
+    # Regression: the backend may send the STRING "false" instead of the
+    # boolean False. A bare truthiness check treats any non-empty string as
+    # truthy, which would tell the user they were refunded when they were
+    # not — the opposite of the truth, and real financial harm.
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "t-str-refund", "status": "failed",
+        "error": {"code": "X", "message": "y"},
+        "refunded": "false",
+    }
+    with pytest.raises(Exception) as exc:
+        await _save_task_artifacts(body, tmp_path, "x", "t-str-refund")
+    msg = str(exc.value)
+    assert "has not been reversed" in msg
+    assert "you were not billed" not in msg
+
+
+async def test_save_task_artifacts_refunded_true_bool(tmp_path):
+    # Guard against over-tightening: the literal boolean True must still
+    # report the refunded branch.
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "t-bool-refund", "status": "failed",
+        "error": {"code": "X", "message": "y"},
+        "refunded": True,
+    }
+    with pytest.raises(Exception) as exc:
+        await _save_task_artifacts(body, tmp_path, "x", "t-bool-refund")
+    msg = str(exc.value)
+    assert "you were not billed" in msg
+
+
 async def test_save_task_artifacts_failed_includes_task_id(tmp_path):
     from sonilo_mcp.api import _save_task_artifacts
     body = {
@@ -2333,6 +2366,7 @@ async def test_get_sfx_task_processing(monkeypatch, output_dir):
     result = await get_sfx_task("t-30")
     assert len(result) == 1
     assert "still processing" in result[0].text
+    assert "t-30" in result[0].text
 
 
 @respx.mock

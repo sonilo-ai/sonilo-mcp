@@ -836,7 +836,7 @@ async def _save_task_artifacts(
         else:
             code = "GENERATION_FAILED"
             message = "Generation failed"
-        if body.get("refunded"):
+        if body.get("refunded") is True:
             refund_line = "The charge was reversed — you were not billed."
         else:
             refund_line = (

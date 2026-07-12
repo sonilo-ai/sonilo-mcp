@@ -1248,3 +1248,69 @@ async def test_http_get_json_omits_host_headers_when_no_context(monkeypatch):
     assert "X-Sonilo-Client-Host" not in req.headers
     # The base client marker is still present — only host attribution is absent.
     assert req.headers["X-Sonilo-Client"] == "mcp"
+
+
+# ---------- SFX task pipeline ----------
+
+
+@respx.mock
+async def test_post_task_submit_returns_task_id(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    route = respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-123", "status": "processing"}
+        )
+    )
+    from sonilo_mcp.api import _post_task_submit
+    task_id = await _post_task_submit(
+        "/v1/text-to-sfx", data={"prompt": "boom", "duration": 5}
+    )
+    assert task_id == "t-123"
+    sent = route.calls.last.request
+    assert sent.headers["authorization"] == "Bearer k"
+    assert b"prompt=boom" in sent.content
+
+
+@respx.mock
+async def test_post_task_submit_missing_api_key():
+    from sonilo_mcp.api import _post_task_submit
+    with pytest.raises(Exception, match="SONILO_API_KEY"):
+        await _post_task_submit("/v1/text-to-sfx", data={"prompt": "x"})
+
+
+@respx.mock
+async def test_post_task_submit_maps_errors(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        return_value=httpx.Response(422, json={"detail": "duration too long"})
+    )
+    from sonilo_mcp.api import _post_task_submit
+    with pytest.raises(Exception, match="duration too long"):
+        await _post_task_submit("/v1/text-to-sfx", data={"prompt": "x"})
+
+
+@respx.mock
+async def test_post_task_submit_no_retry_on_5xx(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    route = respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        return_value=httpx.Response(503, text="busy")
+    )
+    from sonilo_mcp.api import _post_task_submit
+    with pytest.raises(Exception, match="Server error"):
+        await _post_task_submit("/v1/text-to-sfx", data={"prompt": "x"})
+    assert route.call_count == 1  # generation submits must never retry
+
+
+@respx.mock
+async def test_post_task_submit_missing_task_id(monkeypatch):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        return_value=httpx.Response(202, json={"status": "processing"})
+    )
+    from sonilo_mcp.api import _post_task_submit
+    with pytest.raises(Exception, match="task_id"):
+        await _post_task_submit("/v1/text-to-sfx", data={"prompt": "x"})

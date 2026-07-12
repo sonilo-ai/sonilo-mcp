@@ -444,6 +444,46 @@ async def _post_streaming_generation(
     return saved
 
 
+# ---------- SFX task pipeline ----------
+
+
+async def _post_task_submit(
+    path: str,
+    data: dict | None = None,
+    files: dict | None = None,
+) -> str:
+    """POST a task-based generation request; expect 202 with {"task_id": ...}.
+
+    No retry — SFX endpoints charge on acceptance, same policy as
+    _post_streaming_generation. Uses cfg["timeout"] (video uploads are slow).
+    """
+    cfg = _get_config()
+    if not cfg["api_key"]:
+        raise Exception(f"SONILO_API_KEY not set — see {_API_KEYS_URL}")
+    url = cfg["api_url"].rstrip("/") + path
+    headers = {"Authorization": f"Bearer {cfg['api_key']}", **_CLIENT_HEADERS, **_host_headers()}
+    try:
+        async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:
+            r = await client.post(url, headers=headers, data=data, files=files)
+    except httpx.RequestError as e:
+        raise Exception(
+            f"HTTP request failed: {e}. Verify SONILO_API_URL "
+            f"({cfg['api_url']}) is reachable."
+        ) from e
+    if r.status_code >= 400:
+        _raise_http_error(r.status_code, r.text)
+    try:
+        task_id = r.json().get("task_id")
+    except json.JSONDecodeError:
+        task_id = None
+    if not task_id:
+        raise Exception(
+            f"Backend accepted the request (status {r.status_code}) but "
+            "returned no task_id"
+        )
+    return str(task_id)
+
+
 # ---------- Tools: generation ----------
 
 @mcp.tool(

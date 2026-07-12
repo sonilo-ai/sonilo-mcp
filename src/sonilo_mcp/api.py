@@ -271,30 +271,64 @@ _BILLING_URL = "https://platform.sonilo.com/dashboard/billing"
 _API_KEYS_URL = "https://platform.sonilo.com/dashboard/api-keys"
 
 
+class SoniloHTTPError(Exception):
+    """A backend HTTP error, carrying the status code.
+
+    Subclasses Exception so every existing `pytest.raises(Exception, ...)` /
+    generic `except Exception` still works unchanged. The status_code lets
+    callers that wrap this error (e.g. _poll_task, get_sfx_task) distinguish
+    a permanent 4xx (retrying can never help — bad id, revoked key, ...)
+    from a transient 429/5xx (retrying may well succeed), so they only
+    attach "try again" recovery advice when it's actually true.
+    """
+
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def _raise_http_error(status_code: int, body: str) -> None:
     """Map a backend HTTP error to a clear user-facing exception. Always raises."""
     detail = _extract_detail(body)
     if status_code == 401:
-        raise Exception(
-            f"Invalid SONILO_API_KEY — verify the key at {_API_KEYS_URL}"
+        raise SoniloHTTPError(
+            f"Invalid SONILO_API_KEY — verify the key at {_API_KEYS_URL}",
+            status_code,
         )
     if status_code == 402:
         if "minute" in detail.lower() or "credit" in detail.lower():
-            raise Exception(f"{detail}. Top up at {_BILLING_URL}")
-        raise Exception(detail)
+            raise SoniloHTTPError(f"{detail}. Top up at {_BILLING_URL}", status_code)
+        raise SoniloHTTPError(detail, status_code)
     if status_code == 413:
-        raise Exception(f"File too large: {detail}")
+        raise SoniloHTTPError(f"File too large: {detail}", status_code)
     if status_code == 422:
-        raise Exception(detail)
+        raise SoniloHTTPError(detail, status_code)
     if status_code == 429:
-        raise Exception(f"Rate limit exceeded: {detail}")
+        raise SoniloHTTPError(f"Rate limit exceeded: {detail}", status_code)
     if 400 <= status_code < 500:
-        raise Exception(detail)
+        raise SoniloHTTPError(detail, status_code)
     if 500 <= status_code:
-        raise Exception(
-            f"Server error ({status_code}): {detail}. Please retry shortly."
+        raise SoniloHTTPError(
+            f"Server error ({status_code}): {detail}. Please retry shortly.",
+            status_code,
         )
-    raise Exception(f"Unexpected status {status_code}: {detail}")
+    raise SoniloHTTPError(f"Unexpected status {status_code}: {detail}", status_code)
+
+
+def _is_transient_error(e: BaseException) -> bool:
+    """Whether `e` is worth attaching "try again" recovery advice to.
+
+    Transient: 429 (rate limit), any 5xx, or a network-level failure with no
+    HTTP status at all (e.g. httpx.RequestError, wrapped as a bare
+    Exception by _http_get_json) — all of these may well succeed on retry.
+    Permanent: any other 4xx (401, 404, 422, ...) — retrying hits the exact
+    same wall every time, so telling the caller to retry is actively
+    misleading.
+    """
+    status = getattr(e, "status_code", None)
+    if status is None:
+        return True
+    return status == 429 or status >= 500
 
 
 # Short timeout for lightweight GETs (services, usage). Streaming
@@ -546,6 +580,12 @@ async def _poll_task(task_id: str, timeout_seconds: float) -> dict:
         try:
             body = await _http_get_json(f"/v1/tasks/{task_id}")
         except Exception as e:
+            if not _is_transient_error(e):
+                # Permanent failure (e.g. 404/401) — the task_id is already
+                # in the original message where relevant, and no amount of
+                # retrying will change the outcome, so attaching "may still
+                # be running" advice here would be false.
+                raise
             raise Exception(
                 f"{_end_sentence(e)} The generation task {task_id} may still "
                 f'be running on the backend — call get_sfx_task("{task_id}") '
@@ -654,8 +694,27 @@ async def _download_artifact(url: str, dest: Path) -> None:
         raise
 
 
+def _existing_canonical_dest(output_path: Path, base_name: str, ext: str) -> Path | None:
+    """Return the UNSUFFIXED base_name+ext path if it already exists and is
+    non-empty, else None.
+
+    Used only by the reuse_existing path in _save_task_artifacts: it is the
+    "did I already download exactly this task's result" check, deliberately
+    distinct from _artifact_dest's collision-avoidance (which always finds a
+    *new* free name and never revisits an existing one).
+    """
+    candidate = output_path / f"{base_name}{ext}"
+    if candidate.exists() and candidate.stat().st_size > 0:
+        return candidate
+    return None
+
+
 async def _save_task_artifacts(
-    body: dict, output_path: Path, base_name: str, task_id: str
+    body: dict,
+    output_path: Path,
+    base_name: str,
+    task_id: str,
+    reuse_existing: bool = False,
 ) -> list[TextContent]:
     """Turn a terminal /v1/tasks/{id} body into saved local files.
 
@@ -668,6 +727,18 @@ async def _save_task_artifacts(
     backend's terminal body is not a trustworthy source for the recovery
     id, and a missing/incorrect id here would make a paid result
     unrecoverable.
+
+    reuse_existing: when True (get_sfx_task's recovery path only — never
+    text_to_sfx/video_to_sfx), an artifact whose canonical unsuffixed path
+    already exists and is non-empty is treated as already downloaded rather
+    than re-fetched into a new -1/-2 suffixed file. get_sfx_task is the
+    documented recovery tool and its own messages actively invite repeat
+    calls ("still processing, try again later"), so without this, every
+    extra call after success would silently pile up duplicate downloads of
+    the same paid result. text_to_sfx/video_to_sfx must NOT set this: two
+    calls with the same prompt are two different generations and must
+    always land in two distinct files (see _artifact_dest's atomic
+    reservation), so they keep the default of False.
     """
     task_status = body.get("status")
     if task_status == "failed":
@@ -693,29 +764,52 @@ async def _save_task_artifacts(
         raise Exception("Task succeeded but no audio artifact was returned")
 
     saved: list[TextContent] = []
-    try:
-        dest = _artifact_dest(
-            output_path, base_name, _ext_from_content_type(audio.get("content_type"))
+    audio_ext = _ext_from_content_type(audio.get("content_type"))
+    existing = (
+        _existing_canonical_dest(output_path, base_name, audio_ext)
+        if reuse_existing
+        else None
+    )
+    if existing is not None:
+        dest = existing
+        saved.append(
+            TextContent(type="text", text=f"Already downloaded. File saved as: {dest}")
         )
-        await _download_artifact(audio["url"], dest)
-    except Exception as e:
-        # The backend already succeeded and charged for this task by the
-        # time we get here, so ANY failure in this block — computing the
-        # destination path or downloading — must still carry the task_id
-        # and recovery hint. Otherwise a paid result becomes unrecoverable
-        # from the error message alone. _download_artifact (and any other
-        # failure here, e.g. an OSError from _artifact_dest) states only the
-        # bare fact of the failure — this is the one layer that owns the
-        # single, complete recovery instruction, so it isn't repeated.
-        raise Exception(
-            f"{_end_sentence(e)} The result is still stored on the backend "
-            f'— call get_sfx_task("{task_id}") to retry.'
-        ) from e
-    saved.append(TextContent(type="text", text=f"Success. File saved as: {dest}"))
+    else:
+        try:
+            dest = _artifact_dest(output_path, base_name, audio_ext)
+            await _download_artifact(audio["url"], dest)
+        except Exception as e:
+            # The backend already succeeded and charged for this task by the
+            # time we get here, so ANY failure in this block — computing the
+            # destination path or downloading — must still carry the task_id
+            # and recovery hint. Otherwise a paid result becomes unrecoverable
+            # from the error message alone. _download_artifact (and any other
+            # failure here, e.g. an OSError from _artifact_dest) states only the
+            # bare fact of the failure — this is the one layer that owns the
+            # single, complete recovery instruction, so it isn't repeated.
+            raise Exception(
+                f"{_end_sentence(e)} The result is still stored on the backend "
+                f'— call get_sfx_task("{task_id}") to retry.'
+            ) from e
+        saved.append(TextContent(type="text", text=f"Success. File saved as: {dest}"))
     audio_dest = dest
 
     video = body.get("video")
     if isinstance(video, dict) and video.get("url"):
+        existing_video = (
+            _existing_canonical_dest(output_path, base_name, ".mp4")
+            if reuse_existing
+            else None
+        )
+        if existing_video is not None:
+            dest = existing_video
+            saved.append(
+                TextContent(
+                    type="text", text=f"Already downloaded. File saved as: {dest}"
+                )
+            )
+            return saved
         try:
             dest = _artifact_dest(output_path, base_name, ".mp4")
             await _download_artifact(video["url"], dest)
@@ -1054,6 +1148,12 @@ async def get_sfx_task(
     try:
         body = await _http_get_json(f"/v1/tasks/{task_id}")
     except Exception as e:
+        if not _is_transient_error(e):
+            # Permanent failure (e.g. a 404 for a bad/typo'd id, or a music
+            # task's id — /v1/tasks is SFX-only and 404s those). Retrying
+            # can never help, so raise the original error as-is with no
+            # "call get_sfx_task again" advice attached.
+            raise
         # Structurally identical to _poll_task's GET — a transient failure
         # here (e.g. backend 5xx) must not read as if the paid result is
         # lost: reassure the caller it's still on the backend and point
@@ -1074,7 +1174,9 @@ async def get_sfx_task(
     out_path = _make_output_path(output_directory)
     # No prompt available on recovery — name by task id; extension comes
     # from the envelope's content_type.
-    return await _save_task_artifacts(body, out_path, f"sfx-{task_id[:8]}", task_id)
+    return await _save_task_artifacts(
+        body, out_path, f"sfx-{task_id[:8]}", task_id, reuse_existing=True
+    )
 
 
 # ---------- Tools: account ----------

@@ -1876,6 +1876,57 @@ async def test_text_to_sfx_sends_audio_format(monkeypatch, output_dir):
 
 
 @respx.mock
+async def test_text_to_sfx_same_prompt_twice_writes_two_files(monkeypatch, output_dir):
+    # Guard against the get_sfx_task idempotency fix leaking into the
+    # generation path: two text_to_sfx calls with the same prompt are two
+    # DIFFERENT paid results and must never collapse onto one file.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+
+    submit_route = respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        side_effect=[
+            httpx.Response(202, json={"task_id": "t-echo-1"}),
+            httpx.Response(202, json={"task_id": "t-echo-2"}),
+        ]
+    )
+    respx.get("https://api.test.local/v1/tasks/t-echo-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-echo-1", "status": "succeeded",
+            "audio": {"url": "https://r2.test/echo-1.m4a", "content_type": "audio/mp4"},
+        })
+    )
+    respx.get("https://api.test.local/v1/tasks/t-echo-2").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-echo-2", "status": "succeeded",
+            "audio": {"url": "https://r2.test/echo-2.m4a", "content_type": "audio/mp4"},
+        })
+    )
+    respx.get("https://r2.test/echo-1.m4a").mock(
+        return_value=httpx.Response(200, content=b"echo-payload-1")
+    )
+    respx.get("https://r2.test/echo-2.m4a").mock(
+        return_value=httpx.Response(200, content=b"echo-payload-2")
+    )
+
+    result1 = await api.text_to_sfx(prompt="echo", duration=2)
+    result2 = await api.text_to_sfx(prompt="echo", duration=2)
+
+    assert submit_route.call_count == 2
+    files = sorted(output_dir.iterdir())
+    assert len(files) == 2
+    payloads = {p.read_bytes() for p in files}
+    assert payloads == {b"echo-payload-1", b"echo-payload-2"}
+    assert "Success" in result1[0].text
+    assert "Success" in result2[0].text
+
+
+@respx.mock
 async def test_text_to_sfx_backend_rejection_surfaces(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
@@ -2088,6 +2139,36 @@ async def test_get_sfx_task_succeeded_downloads(monkeypatch, output_dir):
 
 
 @respx.mock
+async def test_get_sfx_task_twice_reuses_existing_file(monkeypatch, output_dir):
+    # get_sfx_task is the documented recovery tool and its own messages
+    # invite repeat calls ("still processing, try again later"). Once the
+    # task has succeeded, a second call must NOT re-download a duplicate
+    # copy of the same paid result.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-99").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-99", "status": "succeeded",
+            "audio": {"url": "https://r2.test/dup.mp3", "content_type": "audio/mpeg"},
+        })
+    )
+    route = respx.get("https://r2.test/dup.mp3").mock(
+        return_value=httpx.Response(200, content=b"dup-bytes")
+    )
+    from sonilo_mcp.api import get_sfx_task
+
+    first = await get_sfx_task("t-99")
+    second = await get_sfx_task("t-99")
+
+    files = list(output_dir.iterdir())
+    assert len(files) == 1
+    assert files[0].read_bytes() == b"dup-bytes"
+    assert route.call_count == 1
+    assert "Success" in first[0].text
+    assert "already downloaded" in second[0].text.lower()
+
+
+@respx.mock
 async def test_get_sfx_task_failed_raises_with_refund(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
@@ -2131,3 +2212,61 @@ async def test_get_sfx_task_unknown_task_404(monkeypatch, output_dir):
     from sonilo_mcp.api import get_sfx_task
     with pytest.raises(Exception, match="Task not found"):
         await get_sfx_task("nope")
+
+
+@respx.mock
+async def test_get_sfx_task_404_gives_no_retry_advice(monkeypatch, output_dir):
+    # A 404 is permanent (bad/typo'd id, or a non-SFX task id — /v1/tasks is
+    # SFX-only). Retrying can never help, so the message must NOT tell the
+    # caller to call get_sfx_task again / that the result "may still be
+    # available" — that advice is only true for transient failures.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/music-task-1").mock(
+        return_value=httpx.Response(404, json={"detail": "Task not found"})
+    )
+    from sonilo_mcp.api import get_sfx_task
+    with pytest.raises(Exception) as exc:
+        await get_sfx_task("music-task-1")
+    msg = str(exc.value)
+    assert "Task not found" in msg
+    assert "again shortly" not in msg
+    assert "may still be available" not in msg
+
+
+@respx.mock
+async def test_get_sfx_task_transient_5xx_keeps_retry_advice(monkeypatch, output_dir):
+    # A 500 is transient — _http_get_json retries once internally, so mock
+    # two 500 responses. The recovery advice must still be present.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-transient").mock(
+        side_effect=[
+            httpx.Response(500, text="boom"),
+            httpx.Response(500, text="boom"),
+        ]
+    )
+    from sonilo_mcp.api import get_sfx_task
+    with pytest.raises(Exception) as exc:
+        await get_sfx_task("t-transient")
+    msg = str(exc.value)
+    assert "t-transient" in msg
+    assert "again shortly" in msg
+    assert "may still be available" in msg
+
+
+@respx.mock
+async def test_poll_task_404_gives_no_retry_advice(monkeypatch):
+    # Same permanent-vs-transient distinction as get_sfx_task, but during
+    # polling (e.g. auth revoked or the task id vanishes mid-poll).
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-404-poll").mock(
+        return_value=httpx.Response(404, json={"detail": "Task not found"})
+    )
+    from sonilo_mcp.api import _poll_task
+    with pytest.raises(Exception) as exc:
+        await _poll_task("t-404-poll", timeout_seconds=600)
+    msg = str(exc.value)
+    assert "Task not found" in msg
+    assert "may still be running" not in msg

@@ -2,7 +2,26 @@
 
 <!-- mcp-name: io.github.sonilo-ai/sonilo-mcp -->
 
-An MCP (Model Context Protocol) server that exposes [Sonilo](https://platform.sonilo.com)'s AI music generation API to MCP-compatible clients (Claude Desktop, Codex).
+An MCP (Model Context Protocol) server that exposes [Sonilo](https://sonilo.com)'s licensed video-to-music API to MCP-compatible clients (Claude Code, Claude Desktop, Codex).
+
+The flagship tool is **`video_to_music`**: hand it your finished video and it composes an original soundtrack matched to the cut — the music follows the pacing, emotion, and edits because the model saw them. Length matches the video automatically. Every track is licensed and safe for commercial use (terms apply). `text_to_music` is also available for fixed-length tracks with no video to match.
+
+**▶ [Example result](https://github.com/cindyxu1030/sonilo-video-to-music-cookbook/blob/main/assets/demo-trailer.mp4)** — an AI-generated trailer with its soundtrack composed by `video_to_music` from the assembled cut. For recipes covering any AI-video pipeline (stitch → grade → add music → mux), see the [Sonilo video-to-music cookbook](https://github.com/cindyxu1030/sonilo-video-to-music-cookbook).
+
+## Quickstart with Claude Code
+
+```bash
+claude mcp add sonilo --env SONILO_API_KEY=sks_... -- uvx sonilo-mcp
+```
+
+Get your API key from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys), then start a session and ask, e.g. *"Make background music that matches this video: `~/Desktop/promo.mp4`."*
+
+## Why Sonilo
+
+- **Video-to-music** — give it a video and Sonilo composes a full-length score matched to its pacing, motion, and emotion. Transitions and beat drops align to your cut points, and the track matches the video's duration exactly — no prompts or manual syncing required.
+- **Text-to-music** — generate tracks from a text description (genre, mood, tempo, instrumentation) at an exact duration (1–360s).
+- **Fully licensed, commercial-safe** — music licensed via Shutterstock; every generated track is cleared for commercial use on social, brand content, and advertising, with no Content ID worries.
+- **Pay as you go** — billed only for the seconds of music you generate; new accounts get free credits on signup.
 
 ### Audio Playback Dependencies
 
@@ -79,10 +98,11 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
 
 Once the server is connected, just ask your assistant in natural language. For example:
 
-- *"Use Sonilo mcp to generate 30 seconds of upbeat lo-fi hip-hop for a study playlist and save it to my Desktop."*
-- *"Use Sonilo to write an epic orchestral cinematic track, about 60 seconds long."*
 - *"Make background music that matches this video: `~/Desktop/promo.mp4`."*
 - *"Compose music for `https://example.com/clip.mp4` with a calm, ambient style."*
+- *"I stitched my AI-generated clips into `~/Desktop/trailer.mp4` — add a soundtrack that matches the cut."*
+- *"Use Sonilo mcp to generate 30 seconds of upbeat lo-fi hip-hop for a study playlist and save it to my Desktop."*
+- *"Use Sonilo to write an epic orchestral cinematic track, about 60 seconds long."*
 - *"What Sonilo services and limits does my account have?"*
 - *"Show my Sonilo usage for the last 7 days."*
 - *"Play the track you just generated."*

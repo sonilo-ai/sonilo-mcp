@@ -573,6 +573,52 @@ async def _download_artifact(url: str, dest: Path) -> None:
         ) from e
 
 
+async def _save_task_artifacts(
+    body: dict, output_path: Path, base_name: str
+) -> list[TextContent]:
+    """Turn a terminal /v1/tasks/{id} body into saved local files.
+
+    failed -> raise with the backend's error code/message and whether the
+    charge was refunded. succeeded -> download audio (always present) and
+    video (video-to-sfx only), one TextContent per saved file.
+    """
+    task_status = body.get("status")
+    if task_status == "failed":
+        err = body.get("error") or {}
+        code = err.get("code") or "GENERATION_FAILED"
+        message = err.get("message") or "Generation failed"
+        if body.get("refunded"):
+            refund_line = "The charge was reversed — you were not billed."
+        else:
+            refund_line = (
+                "The charge has not been reversed — check get_usage to "
+                "reconcile."
+            )
+        raise Exception(f"Generation failed ({code}): {message}. {refund_line}")
+    if task_status != "succeeded":
+        raise Exception(f"Unexpected task status: {task_status}")
+
+    audio = body.get("audio")
+    if not isinstance(audio, dict) or not audio.get("url"):
+        raise Exception("Task succeeded but no audio artifact was returned")
+
+    saved: list[TextContent] = []
+    dest = _artifact_dest(
+        output_path, base_name, _ext_from_content_type(audio.get("content_type"))
+    )
+    await _download_artifact(audio["url"], dest)
+    saved.append(TextContent(type="text", text=f"Success. File saved as: {dest}"))
+
+    video = body.get("video")
+    if isinstance(video, dict) and video.get("url"):
+        dest = _artifact_dest(output_path, base_name, ".mp4")
+        await _download_artifact(video["url"], dest)
+        saved.append(
+            TextContent(type="text", text=f"Success. File saved as: {dest}")
+        )
+    return saved
+
+
 # ---------- Tools: generation ----------
 
 @mcp.tool(

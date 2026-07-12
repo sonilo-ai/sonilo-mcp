@@ -1450,3 +1450,75 @@ def test_artifact_dest_avoids_collisions(tmp_path):
     assert second == tmp_path / "boom-1.m4a"
     second.write_bytes(b"y")
     assert _artifact_dest(tmp_path, "boom", ".m4a") == tmp_path / "boom-2.m4a"
+
+
+@respx.mock
+async def test_save_task_artifacts_audio_only(monkeypatch, tmp_path):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"audio-bytes")
+    )
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "t-1", "status": "succeeded",
+        "audio": {"url": "https://r2.test/a.m4a", "content_type": "audio/mp4"},
+    }
+    result = await _save_task_artifacts(body, tmp_path, "boom")
+    assert len(result) == 1
+    expected = tmp_path / "boom.m4a"
+    assert expected.read_bytes() == b"audio-bytes"
+    assert str(expected) in result[0].text
+
+
+@respx.mock
+async def test_save_task_artifacts_audio_and_video(monkeypatch, tmp_path):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/a.wav").mock(
+        return_value=httpx.Response(200, content=b"wav-bytes")
+    )
+    respx.get("https://r2.test/v.mp4").mock(
+        return_value=httpx.Response(200, content=b"mp4-bytes")
+    )
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "t-2", "status": "succeeded",
+        "audio": {"url": "https://r2.test/a.wav", "content_type": "audio/wav"},
+        "video": {"url": "https://r2.test/v.mp4", "content_type": "video/mp4"},
+    }
+    result = await _save_task_artifacts(body, tmp_path, "scene")
+    assert len(result) == 2
+    assert (tmp_path / "scene.wav").read_bytes() == b"wav-bytes"
+    assert (tmp_path / "scene.mp4").read_bytes() == b"mp4-bytes"
+
+
+async def test_save_task_artifacts_failed_refunded(tmp_path):
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "t-3", "status": "failed",
+        "error": {"code": "UPSTREAM_MALFORMED", "message": "bad output"},
+        "refunded": True,
+    }
+    with pytest.raises(Exception) as exc:
+        await _save_task_artifacts(body, tmp_path, "x")
+    msg = str(exc.value)
+    assert "UPSTREAM_MALFORMED" in msg
+    assert "bad output" in msg
+    assert "reversed" in msg  # refunded -> "charge was reversed"
+
+
+async def test_save_task_artifacts_failed_not_refunded(tmp_path):
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "t-4", "status": "failed",
+        "error": {"code": "GENERATION_FAILED", "message": "boom"},
+        "refunded": False,
+    }
+    with pytest.raises(Exception, match="not .*reversed|has not"):
+        await _save_task_artifacts(body, tmp_path, "x")
+
+
+async def test_save_task_artifacts_succeeded_without_audio(tmp_path):
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {"task_id": "t-5", "status": "succeeded"}
+    with pytest.raises(Exception, match="no audio"):
+        await _save_task_artifacts(body, tmp_path, "x")

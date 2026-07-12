@@ -806,7 +806,11 @@ async def _save_task_artifacts(
             f"Task id: {task_id}."
         )
     if task_status != "succeeded":
-        raise Exception(f"Unexpected task status: {task_status}")
+        raise Exception(
+            f"Unexpected task status: {task_status}. Task id: {task_id}. "
+            "This may be transient — check again with "
+            f'get_sfx_task("{task_id}").'
+        )
 
     audio = body.get("audio")
     if not isinstance(audio, dict) or not audio.get("url"):

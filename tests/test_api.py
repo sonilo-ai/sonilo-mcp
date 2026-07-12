@@ -1821,8 +1821,12 @@ async def test_save_task_artifacts_succeeded_without_audio(tmp_path):
 async def test_save_task_artifacts_unexpected_status(tmp_path):
     from sonilo_mcp.api import _save_task_artifacts
     body = {"task_id": "t-6", "status": "cancelled"}
-    with pytest.raises(Exception, match="Unexpected task status.*cancelled"):
+    with pytest.raises(Exception, match="Unexpected task status.*cancelled") as exc:
         await _save_task_artifacts(body, tmp_path, "x", "t-6")
+    # The task was already charged, and get_sfx_task is the only recovery
+    # path — the task_id and the recovery call must be in the message.
+    assert "t-6" in str(exc.value)
+    assert "get_sfx_task" in str(exc.value)
 
 
 def _sfx_submit_then_poll(task_id: str, envelope: dict):
@@ -2237,6 +2241,26 @@ async def test_get_sfx_task_failed_raises_with_refund(monkeypatch, output_dir):
     from sonilo_mcp.api import get_sfx_task
     with pytest.raises(Exception, match="TIMEOUT.*you were not billed"):
         await get_sfx_task("t-32")
+
+
+@respx.mock
+async def test_get_sfx_task_unexpected_status_mentions_task_id(monkeypatch, output_dir):
+    # A terminal-looking status this client doesn't recognize (e.g. a new
+    # status the backend adds later, or "cancelled") must still surface the
+    # task_id and the get_sfx_task recovery call — get_sfx_task is the only
+    # way to recover a charged task's result.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/t-6").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-6", "status": "cancelled",
+        })
+    )
+    from sonilo_mcp.api import get_sfx_task
+    with pytest.raises(Exception) as exc:
+        await get_sfx_task("t-6")
+    assert "t-6" in str(exc.value)
+    assert "get_sfx_task" in str(exc.value)
 
 
 @respx.mock

@@ -7,3 +7,4 @@ dist/
 .venv/
 venv/
 .coverage
+docs/superpowers/

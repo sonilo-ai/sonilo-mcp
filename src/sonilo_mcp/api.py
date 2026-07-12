@@ -140,14 +140,31 @@ def _make_output_path(output_directory: str | None) -> Path:
         )
     if not _is_file_writeable(output_path):
         raise Exception(f"Directory ({output_path}) is not writeable")
+    if output_path.exists() and not output_path.is_dir():
+        raise Exception(
+            f"Output directory ({output_path}) exists but is not a directory"
+        )
     output_path.mkdir(parents=True, exist_ok=True)
     return output_path
 
 
+_SLUG_MAX_LEN = 80
+
+
 def _slugify(text: str) -> str:
-    """Filesystem-safe slug. Fallback to 'sonilo' on empty input."""
+    """Filesystem-safe slug. Fallback to 'sonilo' on empty input.
+
+    Capped at _SLUG_MAX_LEN characters so the resulting filename (slug +
+    a "-12" collision suffix + an extension like ".m4a"/".mp4") stays well
+    under the OS 255-byte filename limit — callers (text_to_sfx,
+    video_to_sfx) accept prompts up to 2000 chars, and an uncapped slug of
+    that length crashes _artifact_dest's exists() check with a bare OSError.
+    `re.ASCII` above already strips non-ASCII characters, so one character
+    is always one byte here and a character cap doubles as a byte cap.
+    """
     safe = re.sub(r"[^\w\s-]", "", text, flags=re.ASCII).strip().lower()
     safe = re.sub(r"[-\s]+", "-", safe).strip("-")
+    safe = safe[:_SLUG_MAX_LEN].rstrip("-")
     return safe or "sonilo"
 
 
@@ -192,14 +209,17 @@ def _resolve_input_file(
 
 # The backend rejects videos longer than this, so we pre-check locally to fail
 # fast and skip a wasted upload. Keep in sync with the backend's limit.
-_MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes
+_MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — music endpoints
+_SFX_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sfx
 
 
-async def _check_video_duration(source: str) -> None:
+async def _check_video_duration(
+    source: str, max_seconds: int = _MAX_VIDEO_DURATION_SECONDS
+) -> None:
     """Best-effort local ffprobe pre-check of a video's duration.
 
-    Raises if the duration is known to exceed the backend's 360s cap, so the
-    caller fails fast instead of uploading a video the backend will reject.
+    Raises if the duration is known to exceed `max_seconds`, so the caller
+    fails fast instead of uploading a video the backend will reject.
     `source` may be a local path or a URL (ffprobe handles both).
 
     The check is best-effort: if ffprobe is not installed, times out, or
@@ -227,54 +247,130 @@ async def _check_video_duration(source: str) -> None:
         duration = float(json.loads(stdout)["format"]["duration"])
     except (json.JSONDecodeError, KeyError, ValueError, TypeError):
         return
-    if duration > _MAX_VIDEO_DURATION_SECONDS:
+    if duration > max_seconds:
         raise Exception(
             f"Video duration {duration:.1f}s exceeds the maximum of "
-            f"{_MAX_VIDEO_DURATION_SECONDS}s (6 minutes)"
+            f"{max_seconds}s"
         )
 
 
 # ---------- HTTP plumbing ----------
 
 def _extract_detail(body: str) -> str:
-    """Pull the `detail` field out of a FastAPI error body, falling back to the raw body."""
+    """Pull the human-readable error text out of a backend error body.
+
+    The real backend's public /v1/* contract (see factory.py's exception
+    handlers) is `{"code": ..., "message": ...}` — including for 422
+    validation errors, whose body also carries an `errors` array alongside
+    `message`. `message` is preferred. `detail` is checked as a fallback:
+    it's FastAPI's default shape for non-public paths, which the MCP client
+    never calls today, but falling back to it is harmless and keeps this
+    robust if that ever changes. Falls back to the raw body if neither key
+    is present or the body isn't JSON.
+
+    The value may be a non-string (a backend bug) — stringify it rather
+    than let a `str.lower()` call elsewhere crash on it.
+    """
     try:
         parsed = json.loads(body)
-        if isinstance(parsed, dict) and "detail" in parsed:
-            return str(parsed["detail"])
-        return body
     except (json.JSONDecodeError, TypeError):
         return body
+    if isinstance(parsed, dict):
+        if "message" in parsed:
+            return str(parsed["message"])
+        if "detail" in parsed:
+            return str(parsed["detail"])
+    return body
+
+
+def _describe_exc(e: BaseException) -> str:
+    """Render an exception for a user-facing message.
+
+    Several httpx transport errors (notably ReadError) stringify to '',
+    which would leave a hole in the message (e.g. "failed: . Verify ...");
+    fall back to the exception's class name in that case.
+    """
+    text = str(e).strip()
+    return text or type(e).__name__
 
 
 _BILLING_URL = "https://platform.sonilo.com/dashboard/billing"
 _API_KEYS_URL = "https://platform.sonilo.com/dashboard/api-keys"
 
 
+class SoniloHTTPError(Exception):
+    """A backend HTTP error, carrying the status code.
+
+    Subclasses Exception so every existing `pytest.raises(Exception, ...)` /
+    generic `except Exception` still works unchanged. The status_code lets
+    callers that wrap this error (e.g. _poll_task, get_sfx_task) distinguish
+    a permanent 4xx (retrying can never help — bad id, revoked key, ...)
+    from a transient 429/5xx (retrying may well succeed), so they only
+    attach "try again" recovery advice when it's actually true.
+    """
+
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def _raise_http_error(status_code: int, body: str) -> None:
     """Map a backend HTTP error to a clear user-facing exception. Always raises."""
     detail = _extract_detail(body)
     if status_code == 401:
-        raise Exception(
-            f"Invalid SONILO_API_KEY — verify the key at {_API_KEYS_URL}"
+        raise SoniloHTTPError(
+            f"Invalid SONILO_API_KEY — verify the key at {_API_KEYS_URL}",
+            status_code,
         )
     if status_code == 402:
         if "minute" in detail.lower() or "credit" in detail.lower():
-            raise Exception(f"{detail}. Top up at {_BILLING_URL}")
-        raise Exception(detail)
+            raise SoniloHTTPError(f"{detail}. Top up at {_BILLING_URL}", status_code)
+        raise SoniloHTTPError(detail, status_code)
     if status_code == 413:
-        raise Exception(f"File too large: {detail}")
+        raise SoniloHTTPError(f"File too large: {detail}", status_code)
     if status_code == 422:
-        raise Exception(detail)
+        raise SoniloHTTPError(detail, status_code)
     if status_code == 429:
-        raise Exception(f"Rate limit exceeded: {detail}")
+        raise SoniloHTTPError(f"Rate limit exceeded: {detail}", status_code)
     if 400 <= status_code < 500:
-        raise Exception(detail)
+        raise SoniloHTTPError(detail, status_code)
     if 500 <= status_code:
-        raise Exception(
-            f"Server error ({status_code}): {detail}. Please retry shortly."
+        raise SoniloHTTPError(
+            f"Server error ({status_code}): {detail}. Please retry shortly.",
+            status_code,
         )
-    raise Exception(f"Unexpected status {status_code}: {detail}")
+    raise SoniloHTTPError(f"Unexpected status {status_code}: {detail}", status_code)
+
+
+def _is_task_not_found(e: BaseException) -> bool:
+    """Whether `e` means the task_id itself is gone/invalid — the only case
+    where recovery advice should be omitted.
+
+    Only a 404 means that: a bad/typo'd id, or a non-SFX (e.g. music) task
+    id — /v1/tasks is SFX-only and 404s those. Every OTHER error (401, 402,
+    413, 422, 429, 5xx, or a network-level failure with no status at all,
+    e.g. httpx.RequestError wrapped as a bare Exception by _http_get_json)
+    still refers to a task that EXISTS and was already CHARGED — the cause
+    is something the caller can fix (renew the key, settle the bill, wait
+    out the rate limit, retry a transient blip) and then recover the paid
+    result, so those must always keep the task_id + get_sfx_task advice.
+    """
+    return getattr(e, "status_code", None) == 404
+
+
+def _is_transient_error(e: BaseException) -> bool:
+    """Whether `e` is a rate-limit/server/network failure worth an immediate
+    retry, as opposed to an auth/billing failure the caller must fix first.
+
+    This no longer decides WHETHER recovery advice is attached (see
+    _is_task_not_found, which owns that) — every non-404 error keeps the
+    task_id. This only picks the PHRASING: transient errors get "try again
+    shortly" wording, while 401/402/413/422 get "resolve the issue above,
+    then retry" wording, since blindly telling someone to retry a revoked
+    key or a suspended account moments later is misleading.
+    """
+    status = getattr(e, "status_code", None)
+    return status is None or status == 429 or status >= 500
 
 
 # Short timeout for lightweight GETs (services, usage). Streaming
@@ -308,7 +404,7 @@ async def _http_get_json(path: str, params: dict | None = None) -> dict:
             if attempt == 1:
                 await asyncio.sleep(1)
                 continue
-            raise Exception(f"HTTP request failed: {e}") from e
+            raise Exception(f"HTTP request failed: {_describe_exc(e)}") from e
 
 
 # ---------- Streaming consumer ----------
@@ -422,7 +518,7 @@ async def _post_streaming_generation(
         ) from e
     except httpx.RequestError as e:
         raise Exception(
-            f"HTTP request failed: {e}. Verify SONILO_API_URL "
+            f"HTTP request failed: {_describe_exc(e)}. Verify SONILO_API_URL "
             f"({cfg['api_url']}) is reachable."
         ) from e
 
@@ -438,6 +534,465 @@ async def _post_streaming_generation(
         ))
     if not saved:
         raise Exception("Stream completed but no audio chunks were received")
+    return saved
+
+
+# ---------- SFX task pipeline ----------
+
+
+async def _post_task_submit(
+    path: str,
+    data: dict | None = None,
+    files: dict | None = None,
+) -> str:
+    """POST a task-based generation request; expect 202 with {"task_id": ...}.
+
+    No retry — SFX endpoints charge on acceptance, same policy as
+    _post_streaming_generation. Uses cfg["timeout"] (video uploads are slow).
+    """
+    cfg = _get_config()
+    if not cfg["api_key"]:
+        raise Exception(f"SONILO_API_KEY not set — see {_API_KEYS_URL}")
+    url = cfg["api_url"].rstrip("/") + path
+    headers = {"Authorization": f"Bearer {cfg['api_key']}", **_CLIENT_HEADERS, **_host_headers()}
+    try:
+        async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:
+            r = await client.post(url, headers=headers, data=data, files=files)
+    except httpx.RequestError as e:
+        # A connection reset/timeout here means the request never fully
+        # reached the backend — the backend only creates and charges a task
+        # once it has fully received and accepted the request, so this is
+        # safe to retry (unlike a failure *after* a 202 response, which would
+        # mean the task was already created).
+        raise Exception(
+            f"Upload failed before the request completed "
+            f"({_describe_exc(e)}). No task was created and nothing was "
+            "charged — retry. If this keeps happening with large videos, "
+            "the connection is being reset during upload."
+        ) from e
+    if r.status_code >= 400:
+        _raise_http_error(r.status_code, r.text)
+    try:
+        parsed_body = r.json()
+    except json.JSONDecodeError:
+        parsed_body = None
+    task_id = parsed_body.get("task_id") if isinstance(parsed_body, dict) else None
+    if not task_id:
+        raise Exception(
+            f"Backend accepted the request (status {r.status_code}) but "
+            "returned no task_id"
+        )
+    task_id = str(task_id)
+    # The user is charged as of this point. If the tool call is cancelled
+    # before anything else records the id (e.g. asyncio.CancelledError
+    # during polling/download, which propagates as a BaseException and
+    # bypasses the recovery-wrapping Exception handlers), this stderr line
+    # is the only surviving record — without it a cancelled call makes a
+    # paid task genuinely unrecoverable (no list-tasks endpoint exists).
+    print(
+        f"[sonilo-mcp] task submitted: {task_id} (recover with get_sfx_task)",
+        file=sys.stderr,
+        flush=True,
+    )
+    return task_id
+
+
+_POLL_INTERVAL_SECONDS = 5.0
+# Test seam: monkeypatch api._poll_sleep to avoid real 5s waits in tests.
+_poll_sleep = asyncio.sleep
+
+
+def _end_sentence(value: object) -> str:
+    """Stringify `value` and ensure it ends with sentence punctuation.
+
+    Used when composing wrapped error messages (`f"{_end_sentence(e)} ..."`)
+    so that appending more prose after an exception's message never produces
+    a run-on sentence — e.g. a bare `OSError("No space left on device")`
+    would otherwise read as "No space left on device Task id: ..." with no
+    separator.
+    """
+    text = str(value).rstrip()
+    if text and text[-1] not in ".!?":
+        return text + "."
+    return text
+
+
+def _require_json_object(body: object, error_message: str) -> dict:
+    """Validate that a 200 response body is a JSON object.
+
+    A 200 with a body that isn't a dict (e.g. `null` or a bare list) is a
+    backend contract violation, not a 4xx/5xx — _http_get_json returns it
+    unchanged with no exception to catch. Left unguarded, callers either
+    crash with a bare AttributeError from body.get(...), or — for tools
+    that hand the body straight to the MCP host — silently succeed with
+    empty output (FastMCP maps None -> [], and a list destructures into
+    unlabeled text fragments), indistinguishable from a legitimate empty
+    result.
+    """
+    if not isinstance(body, dict):
+        raise Exception(error_message)
+    return body
+
+
+def _require_task_body(body: object, task_id: str) -> dict:
+    """Validate that a /v1/tasks/{task_id} 200 response body is a JSON
+    object, as both _poll_task and get_sfx_task assume when they call
+    body.get(...) right after fetching it.
+    """
+    return _require_json_object(
+        body,
+        f"Unexpected response from the backend for task {task_id} "
+        "(expected a JSON object). The task was already submitted and "
+        f'charged — call get_sfx_task("{task_id}") to check for the '
+        "result.",
+    )
+
+
+def _require_account_body(body: object, endpoint: str) -> dict:
+    """Validate that a free, read-only account-endpoint 200 response body
+    is a JSON object before it's handed straight to the MCP host.
+
+    Unlike _require_task_body, these endpoints are free and read-only, so
+    the message carries no charge/recovery language — just what went
+    wrong and where.
+    """
+    return _require_json_object(
+        body,
+        f"Unexpected response from the backend for {endpoint} "
+        "(expected a JSON object).",
+    )
+
+
+async def _poll_task(task_id: str, timeout_seconds: float) -> dict:
+    """Poll GET /v1/tasks/{task_id} every _POLL_INTERVAL_SECONDS until the
+    task is terminal (succeeded/failed) or timeout_seconds elapses.
+
+    Returns the terminal task body. On timeout, raises with the task_id and
+    a get_sfx_task recovery hint — the backend keeps running (and charging),
+    so the result stays retrievable.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            body = await _http_get_json(f"/v1/tasks/{task_id}")
+        except Exception as e:
+            if _is_task_not_found(e):
+                # The task_id itself is gone/invalid (404) — no amount of
+                # retrying will change that, so raise as-is with no advice.
+                raise
+            if _is_transient_error(e):
+                raise Exception(
+                    f"{_end_sentence(e)} The generation task {task_id} may "
+                    "still be running on the backend — call "
+                    f'get_sfx_task("{task_id}") later to retrieve the '
+                    "result."
+                ) from e
+            # A non-404 4xx (401 key rotated, 402 billing suspended, ...) —
+            # the task still exists and was already charged. The caller
+            # must fix the underlying cause first, then recover the result.
+            raise Exception(
+                f"{_end_sentence(e)} Task {task_id} was already submitted "
+                "and charged — resolve the issue above, then call "
+                f'get_sfx_task("{task_id}") to retrieve the result.'
+            ) from e
+        body = _require_task_body(body, task_id)
+        if body.get("status") in ("succeeded", "failed"):
+            return body
+        if time.monotonic() >= deadline:
+            raise Exception(
+                f"Timed out after {timeout_seconds:.0f}s waiting for task "
+                f"{task_id}. The generation may still complete on the "
+                f'backend — call get_sfx_task("{task_id}") later to '
+                "retrieve the result."
+            )
+        await _poll_sleep(_POLL_INTERVAL_SECONDS)
+
+
+# content_type -> extension for SFX audio artifacts. The backend sets
+# content_type from the requested audio_format, so deriving the extension
+# here matches the caller's requested format. Video artifacts are always mp4.
+_AUDIO_CONTENT_TYPE_EXTS = {
+    "audio/wav": ".wav",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/flac": ".flac",
+}
+
+
+def _ext_from_content_type(content_type: str | None) -> str:
+    # The backend is expected to send a string, but a truthy non-string
+    # value (a backend bug) must not crash this with an AttributeError from
+    # `.lower()` — treat it as unknown and fall back to the default, same
+    # as a missing/empty content_type.
+    if not isinstance(content_type, str):
+        return ".m4a"
+    return _AUDIO_CONTENT_TYPE_EXTS.get(content_type.lower(), ".m4a")
+
+
+_ARTIFACT_DEST_MAX_ATTEMPTS = 10_000
+
+
+def _artifact_dest(output_path: Path, base_name: str, ext: str) -> Path:
+    """Reserve and return the first available path for base_name+ext,
+    appending -1, -2, … on collision.
+
+    Reservation is ATOMIC: each candidate is claimed with
+    os.O_CREAT | os.O_EXCL, which fails if the file already exists, instead
+    of a plain exists() probe. This closes a TOCTOU race: the caller's
+    actual write happens later, after an `await` on the network GET — with
+    a mere existence check, two concurrent callers (e.g. an MCP host
+    retrying a slow call while the first is still in flight) can both pick
+    the same free name and one clobbers the other's paid result. Reserving
+    the name up front (via the exclusive create) means the second caller's
+    O_EXCL fails and it moves on to the next suffix.
+
+    The returned path exists (empty) by the time this returns; the caller
+    is responsible for removing it on any failure to actually populate it
+    (see _download_artifact).
+    """
+    for n in range(_ARTIFACT_DEST_MAX_ATTEMPTS):
+        dest = output_path / (f"{base_name}{ext}" if n == 0 else f"{base_name}-{n}{ext}")
+        try:
+            fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return dest
+    raise Exception(
+        f"Could not reserve a free filename for {base_name}{ext} in "
+        f"{output_path} after {_ARTIFACT_DEST_MAX_ATTEMPTS} attempts"
+    )
+
+
+async def _download_artifact(url: str, dest: Path) -> None:
+    """Stream-download a presigned result URL to dest.
+
+    Sends NO Authorization / X-Sonilo-Client / custom User-Agent headers:
+    presigned URLs carry their own auth, and the API key must never be sent
+    to the storage domain.
+
+    On failure, raises stating only the FACT of the failure — no recovery
+    advice. This function doesn't know the caller's task_id and isn't the
+    right layer to own the recovery instruction; _save_task_artifacts (which
+    has the task_id) wraps these failures with the single, complete recovery
+    instruction. Duplicating that instruction here would just make the
+    caller's wrapped message repeat itself.
+
+    `dest` is expected to already exist (empty) — _artifact_dest reserves it
+    atomically before this is called, to close a TOCTOU race where two
+    concurrent callers could otherwise pick the same free path. On ANY
+    failure here (bad status, a network error, or the write loop dying
+    mid-stream), the reserved file is removed: leaving it behind would both
+    hand the user a corrupt/empty artifact and make a retry pick a new
+    suffixed path from _artifact_dest, permanently orphaning the file.
+    """
+    cfg = _get_config()
+    try:
+        async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:
+            async with client.stream("GET", url) as r:
+                if r.status_code >= 400:
+                    raise Exception(
+                        f"Artifact download failed (status {r.status_code})."
+                    )
+                with open(dest, "wb") as fh:
+                    async for chunk in r.aiter_bytes():
+                        fh.write(chunk)
+    except httpx.RequestError as e:
+        dest.unlink(missing_ok=True)
+        raise Exception(f"Artifact download failed: {_describe_exc(e)}") from e
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
+
+
+def _existing_canonical_dest(
+    output_path: Path, base_name: str, ext: str, expected_size: int | None
+) -> Path | None:
+    """Return the UNSUFFIXED base_name+ext path if it's safe to reuse
+    instead of re-downloading, else None.
+
+    Used only by the reuse_existing path in _save_task_artifacts: it is the
+    "did I already download exactly this task's result" check, deliberately
+    distinct from _artifact_dest's collision-avoidance (which always finds a
+    *new* free name and never revisits an existing one).
+
+    A hard process kill (SIGKILL/OOM/host crash) mid-write can leave a
+    non-empty, TRUNCATED file at the canonical path — _download_artifact's
+    exception handlers never ran, so nothing cleaned it up. A bare
+    exists()-and-non-empty check would silently hand that corrupt file back
+    forever. When `expected_size` (the backend envelope's file_size) is
+    known, this verifies it: reuse only on an EXACT size match; on a
+    mismatch the file is corrupt, so it is removed here so the caller falls
+    through to a fresh download at the SAME canonical path (not a `-1`
+    suffix — the canonical file was garbage, not a distinct result).
+
+    When `expected_size` is None (older/other backend responses without
+    file_size), we cannot verify — trade-off: fall back to the previous
+    non-empty check rather than unconditionally re-downloading, since
+    always re-downloading would defeat the idempotency this function
+    exists for.
+    """
+    candidate = output_path / f"{base_name}{ext}"
+    if not candidate.exists():
+        return None
+    size = candidate.stat().st_size
+    if size == 0:
+        return None
+    if expected_size is None:
+        return candidate
+    if size == expected_size:
+        return candidate
+    candidate.unlink(missing_ok=True)
+    return None
+
+
+async def _save_task_artifacts(
+    body: dict,
+    output_path: Path,
+    base_name: str,
+    task_id: str,
+    reuse_existing: bool = False,
+) -> list[TextContent]:
+    """Turn a terminal /v1/tasks/{id} body into saved local files.
+
+    failed -> raise with the backend's error code/message and whether the
+    charge was refunded. succeeded -> download audio (always present) and
+    video (video-to-sfx only), one TextContent per saved file.
+
+    task_id must be the caller's own known-good id (from _post_task_submit
+    or the tool's own task_id argument), NOT derived from body — the
+    backend's terminal body is not a trustworthy source for the recovery
+    id, and a missing/incorrect id here would make a paid result
+    unrecoverable.
+
+    reuse_existing: when True (get_sfx_task's recovery path only — never
+    text_to_sfx/video_to_sfx), an artifact whose canonical unsuffixed path
+    already exists and is non-empty is treated as already downloaded rather
+    than re-fetched into a new -1/-2 suffixed file. get_sfx_task is the
+    documented recovery tool and its own messages actively invite repeat
+    calls ("still processing, try again later"), so without this, every
+    extra call after success would silently pile up duplicate downloads of
+    the same paid result. text_to_sfx/video_to_sfx must NOT set this: two
+    calls with the same prompt are two different generations and must
+    always land in two distinct files (see _artifact_dest's atomic
+    reservation), so they keep the default of False.
+    """
+    task_status = body.get("status")
+    if task_status == "failed":
+        err = body.get("error")
+        if isinstance(err, dict):
+            code = err.get("code") or "GENERATION_FAILED"
+            message = err.get("message") or "Generation failed"
+        elif isinstance(err, str) and err:
+            # Backend sent a truthy non-dict error (e.g. a bare string) —
+            # the shape is untrustworthy, but the string is still useful as
+            # a message. Do not let .get() on a non-dict crash here: this
+            # task was charged AND failed, so the task_id/recovery call
+            # below is the only way the user gets it back.
+            code = "GENERATION_FAILED"
+            message = err
+        else:
+            code = "GENERATION_FAILED"
+            message = "Generation failed"
+        if body.get("refunded") is True:
+            refund_line = "The charge was reversed — you were not billed."
+        else:
+            refund_line = (
+                "The charge has not been reversed — check get_usage to "
+                "reconcile."
+            )
+        raise Exception(
+            f"Generation failed ({code}): {message}. {refund_line} "
+            f'Task id: {task_id}. Call get_sfx_task("{task_id}") to check '
+            "for updates."
+        )
+    if task_status != "succeeded":
+        raise Exception(
+            f"Unexpected task status: {task_status}. Task id: {task_id}. "
+            "This may be transient — check again with "
+            f'get_sfx_task("{task_id}").'
+        )
+
+    audio = body.get("audio")
+    if not isinstance(audio, dict) or not audio.get("url"):
+        # The backend already succeeded and charged for this task — a
+        # missing/malformed audio envelope must still carry the task_id and
+        # the get_sfx_task recovery call, or a paid result becomes
+        # unrecoverable from the error message alone.
+        raise Exception(
+            "Task succeeded but no audio artifact was returned. Task id: "
+            f'{task_id} — call get_sfx_task("{task_id}") to check for the '
+            "result."
+        )
+
+    saved: list[TextContent] = []
+    try:
+        # Everything below — deriving the extension, checking for a
+        # reusable existing file, computing the destination path, and the
+        # actual download — must stay inside this wrap. The backend already
+        # succeeded and charged for this task by the time we get here, so
+        # ANY failure here must still carry the task_id and recovery hint.
+        # _download_artifact (and any other failure here, e.g. an OSError
+        # from _artifact_dest) states only the bare fact of the failure —
+        # this is the one layer that owns the single, complete recovery
+        # instruction, so it isn't repeated.
+        audio_ext = _ext_from_content_type(audio.get("content_type"))
+        existing = (
+            _existing_canonical_dest(
+                output_path, base_name, audio_ext, audio.get("file_size")
+            )
+            if reuse_existing
+            else None
+        )
+        if existing is None:
+            dest = _artifact_dest(output_path, base_name, audio_ext)
+            await _download_artifact(audio["url"], dest)
+        else:
+            dest = existing
+    except Exception as e:
+        raise Exception(
+            f"{_end_sentence(e)} The result is still stored on the backend "
+            f'— call get_sfx_task("{task_id}") to retry.'
+        ) from e
+    if existing is not None:
+        saved.append(
+            TextContent(type="text", text=f"Already downloaded. File saved as: {dest}")
+        )
+    else:
+        saved.append(TextContent(type="text", text=f"Success. File saved as: {dest}"))
+    audio_dest = dest
+
+    video = body.get("video")
+    if isinstance(video, dict) and video.get("url"):
+        try:
+            existing_video = (
+                _existing_canonical_dest(
+                    output_path, base_name, ".mp4", video.get("file_size")
+                )
+                if reuse_existing
+                else None
+            )
+            if existing_video is None:
+                dest = _artifact_dest(output_path, base_name, ".mp4")
+                await _download_artifact(video["url"], dest)
+            else:
+                dest = existing_video
+        except Exception as e:
+            raise Exception(
+                f"{_end_sentence(e)} The audio file was already saved as: "
+                f"{audio_dest}. The video is still stored on the backend — "
+                f'call get_sfx_task("{task_id}") to retry the download.'
+            ) from e
+        if existing_video is not None:
+            saved.append(
+                TextContent(
+                    type="text", text=f"Already downloaded. File saved as: {dest}"
+                )
+            )
+            return saved
+        saved.append(
+            TextContent(type="text", text=f"Success. File saved as: {dest}")
+        )
     return saved
 
 
@@ -566,14 +1121,27 @@ async def video_to_music(
         max_mb = await _get_max_upload_size_mb()
         size_mb = resolved.stat().st_size / (1024 * 1024)
         if size_mb > max_mb:
+            # Cheap fail-fast: avoids a wasted ffprobe run for an
+            # obviously-oversized file. NOT the authoritative check — see
+            # the read-time check below.
             raise Exception(
                 f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
             )
         await _check_video_duration(str(resolved))
         data = {"prompt": prompt} if prompt else None
         mime, _ = mimetypes.guess_type(resolved.name)
+        # Authoritative check: the stat() above is now stale — an await on
+        # ffprobe sat between it and this read, during which the file could
+        # have been replaced or grown (a video export still writing, a sync
+        # tool, a concurrent process). Enforce the cap on the bytes actually
+        # read for upload, not on the earlier stat(). Reading at most
+        # max_bytes + 1 both closes that race and bounds memory use.
+        max_bytes = max_mb * 1024 * 1024
         with open(resolved, "rb") as fh:
-            files = {"video": (resolved.name, fh.read(), mime or "application/octet-stream")}
+            content = fh.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise Exception(f"Video file is too large (> {max_mb} MB cap)")
+        files = {"video": (resolved.name, content, mime or "application/octet-stream")}
         return await _post_streaming_generation(
             "/v1/video-to-music",
             out_path,
@@ -596,6 +1164,228 @@ async def video_to_music(
     )
 
 
+# ---------- Tools: sound effects ----------
+
+@mcp.tool(
+    description=(
+        "Generate a sound effect from a text prompt and save the audio file "
+        "to a local directory. Generation is asynchronous on the backend; "
+        "this tool waits for completion (typically well under the timeout) "
+        "and returns the saved file path.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges. Only use when explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    prompt (str): Description of the sound effect "
+        "(1–2000 chars).\n"
+        "    duration (int): Length in seconds (1–180).\n"
+        "    audio_format (str, optional): One of wav, mp3, aac, flac. "
+        "Defaults to aac (.m4a file).\n"
+        "    output_directory (str, optional): Absolute path, or relative "
+        "to SONILO_MCP_BASE_PATH. Defaults to SONILO_MCP_BASE_PATH "
+        "(~/Desktop unless overridden).\n\n"
+        "Returns:\n"
+        "    TextContent with the absolute path of the saved audio file. "
+        "If the call times out, the error message includes the task_id — "
+        "recover the result later with get_sfx_task."
+    )
+)
+async def text_to_sfx(
+    prompt: str,
+    duration: int,
+    audio_format: str | None = None,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    out_path = _make_output_path(output_directory)
+    data: dict = {"prompt": prompt, "duration": duration}
+    if audio_format:
+        data["audio_format"] = audio_format
+    task_id = await _post_task_submit("/v1/text-to-sfx", data=data)
+    body = await _poll_task(task_id, _get_config()["timeout"])
+    return await _save_task_artifacts(body, out_path, _slugify(prompt), task_id)
+
+
+@mcp.tool(
+    description=(
+        "Generate sound effects for a video: Sonilo analyzes the video and "
+        "creates matching SFX. Returns BOTH the sound-effects audio file "
+        "and the finished video with the effects mixed in. Provide either a "
+        "local video file path or a publicly accessible video URL. "
+        "Generation is asynchronous on the backend; this tool waits for "
+        "completion and returns the saved file paths.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges. Only use when explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    video_path (str, optional): Absolute local path, or relative "
+        "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.avi/.wmv/.webm/.mkv. "
+        "Subject to the account's max upload size (typically 300 MB). "
+        "Maximum video duration is 180 seconds (3 minutes).\n"
+        "    video_url (str, optional): HTTPS URL to a video file.\n"
+        "    prompt (str, optional): Overall description of the desired "
+        "sound effects (max 2000 chars).\n"
+        "    segments (list, optional): Per-segment SFX descriptions, each "
+        '{"start": float, "end": float, "prompt": str}. Backend rules: '
+        "first start must be 0; segments must be contiguous (each end == "
+        "next start); every end > start; every prompt non-empty (max 200 "
+        "chars); last end must not exceed the video duration; max 30 "
+        "segments. Invalid segments are rejected before any charge.\n"
+        "    audio_format (str, optional): One of wav, mp3, aac, flac. "
+        "Defaults to aac (.m4a file).\n"
+        "    output_directory (str, optional): Where to save the resulting "
+        "files. Defaults to SONILO_MCP_BASE_PATH.\n\n"
+        "Exactly one of video_path and video_url must be provided.\n\n"
+        "Returns:\n"
+        "    Two TextContents: the saved audio file path and the saved "
+        ".mp4 video path. If the call times out, the error message "
+        "includes the task_id — recover with get_sfx_task."
+    )
+)
+async def video_to_sfx(
+    video_path: str | None = None,
+    video_url: str | None = None,
+    prompt: str | None = None,
+    segments: list[dict] | None = None,
+    audio_format: str | None = None,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    if (video_path and video_url) or (not video_path and not video_url):
+        raise Exception(
+            "Provide either video_path or video_url (exactly one, not both)"
+        )
+
+    if video_url:
+        # Same scheme guard as video_to_music: keeps file:// and flag-like
+        # values away from ffprobe and the backend.
+        scheme = urlparse(video_url).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise Exception("video_url must be an http:// or https:// URL")
+
+    out_path = _make_output_path(output_directory)
+    cfg = _get_config()
+
+    form: dict = {}
+    if prompt and prompt.strip():
+        form["prompt"] = prompt
+    if segments is not None:
+        # Pass-through: the backend validates segments strictly and rejects
+        # bad input with a 400 before charging.
+        form["segments"] = json.dumps(segments)
+    if audio_format:
+        form["audio_format"] = audio_format
+
+    if video_path:
+        resolved = _resolve_input_file(
+            video_path, cfg["base_path"], _VIDEO_EXTS, "video"
+        )
+        max_mb = await _get_max_upload_size_mb()
+        size_mb = resolved.stat().st_size / (1024 * 1024)
+        if size_mb > max_mb:
+            # Cheap fail-fast: avoids a wasted ffprobe run for an
+            # obviously-oversized file. NOT the authoritative check — see
+            # the read-time check below.
+            raise Exception(
+                f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
+            )
+        await _check_video_duration(
+            str(resolved), max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
+        )
+        mime, _ = mimetypes.guess_type(resolved.name)
+        # Authoritative check: the stat() above is now stale — an await on
+        # ffprobe sat between it and this read, during which the file could
+        # have been replaced or grown. Enforce the cap on the bytes actually
+        # read for upload, not on the earlier stat(). Reading at most
+        # max_bytes + 1 both closes that race and bounds memory use.
+        max_bytes = max_mb * 1024 * 1024
+        with open(resolved, "rb") as fh:
+            content = fh.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise Exception(f"Video file is too large (> {max_mb} MB cap)")
+        files = {
+            "video": (
+                resolved.name, content, mime or "application/octet-stream"
+            )
+        }
+        task_id = await _post_task_submit(
+            "/v1/video-to-sfx", data=form or None, files=files
+        )
+    else:
+        await _check_video_duration(
+            video_url, max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
+        )
+        form["video_url"] = video_url
+        task_id = await _post_task_submit("/v1/video-to-sfx", data=form)
+
+    body = await _poll_task(task_id, cfg["timeout"])
+    base = _slugify(prompt) if prompt and prompt.strip() else f"sfx-{task_id[:8]}"
+    return await _save_task_artifacts(body, out_path, base, task_id)
+
+
+@mcp.tool(
+    description=(
+        "Check a sound-effects generation task and, if finished, download "
+        "its result file(s). Use this to recover a result when text_to_sfx "
+        "or video_to_sfx timed out — their error message contains the "
+        "task_id. Does not poll: a single status check per call. This tool "
+        "itself never charges.\n\n"
+        "Args:\n"
+        "    task_id (str): The task id returned in the timeout message.\n"
+        "    output_directory (str, optional): Where to save result files. "
+        "Defaults to SONILO_MCP_BASE_PATH.\n\n"
+        "Returns:\n"
+        "    Still processing -> a status message; try again later. "
+        "Succeeded -> the saved file path(s) (audio, plus video for "
+        "video_to_sfx tasks). Failed -> an error including whether the "
+        "charge was refunded."
+    )
+)
+async def get_sfx_task(
+    task_id: str,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    try:
+        body = await _http_get_json(f"/v1/tasks/{task_id}")
+    except Exception as e:
+        if _is_task_not_found(e):
+            # A 404 for a bad/typo'd id, or a music task's id — /v1/tasks
+            # is SFX-only and 404s those. Retrying can never help, so raise
+            # the original error as-is with no "call get_sfx_task again"
+            # advice attached.
+            raise
+        if _is_transient_error(e):
+            # Structurally identical to _poll_task's GET — a transient
+            # failure here (e.g. backend 5xx) must not read as if the paid
+            # result is lost: reassure the caller it's still on the backend
+            # and point them back at this same tool.
+            raise Exception(
+                f"{_end_sentence(e)} The result for task {task_id} may "
+                "still be available on the backend — call "
+                f'get_sfx_task("{task_id}") again shortly.'
+            ) from e
+        # A non-404 4xx (401 key rotated, 402 billing suspended, ...) — the
+        # task was already charged and its result still exists on the
+        # backend. The caller must fix the underlying cause first, then
+        # recover the result with this same tool.
+        raise Exception(
+            f"{_end_sentence(e)} Task {task_id} was already charged — "
+            f'resolve the issue above, then call get_sfx_task("{task_id}") '
+            "to retrieve the result."
+        ) from e
+    body = _require_task_body(body, task_id)
+    if body.get("status") == "processing":
+        return [TextContent(
+            type="text",
+            text=(
+                f"Task {task_id} is still processing. Try again in a "
+                "little while."
+            ),
+        )]
+    out_path = _make_output_path(output_directory)
+    # No prompt available on recovery — name by task id; extension comes
+    # from the envelope's content_type.
+    return await _save_task_artifacts(
+        body, out_path, f"sfx-{task_id[:8]}", task_id, reuse_existing=True
+    )
+
+
 # ---------- Tools: account ----------
 
 @mcp.tool(
@@ -607,7 +1397,8 @@ async def video_to_music(
     )
 )
 async def get_account_services() -> dict:
-    return await _http_get_json("/v1/account/services")
+    body = await _http_get_json("/v1/account/services")
+    return _require_account_body(body, "/v1/account/services")
 
 
 @mcp.tool(
@@ -621,7 +1412,8 @@ async def get_account_services() -> dict:
 async def get_usage(days: int = 30) -> dict:
     if not (1 <= days <= 365):
         raise Exception(f"days must be between 1 and 365 (got {days})")
-    return await _http_get_json("/v1/account/usage", params={"days": days})
+    body = await _http_get_json("/v1/account/usage", params={"days": days})
+    return _require_account_body(body, "/v1/account/usage")
 
 
 # ---------- Tools: local playback ----------

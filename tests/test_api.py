@@ -227,9 +227,33 @@ import httpx
 import respx
 
 
-def test_extract_detail_json():
+def test_extract_detail_message_field():
+    # The real backend's public /v1/* contract is {"code", "message"} — NOT
+    # FastAPI's default {"detail"}. `message` must be preferred.
+    from sonilo_mcp.api import _extract_detail
+    assert _extract_detail('{"code":"not_found","message":"oops"}') == "oops"
+
+
+def test_extract_detail_prefers_message_over_detail():
+    from sonilo_mcp.api import _extract_detail
+    assert _extract_detail(
+        '{"code":"x","message":"real message","detail":"decoy"}'
+    ) == "real message"
+
+
+def test_extract_detail_detail_fallback():
+    # Non-public FastAPI routes (and any other future shape) still use the
+    # default `detail` key — the MCP client never calls one, but falling
+    # back to it is harmless and keeps this robust.
     from sonilo_mcp.api import _extract_detail
     assert _extract_detail('{"detail":"oops"}') == "oops"
+
+
+def test_extract_detail_non_string_message_not_crash():
+    # A backend bug could send a non-string message (e.g. an int/dict) —
+    # must stringify, never raise.
+    from sonilo_mcp.api import _extract_detail
+    assert _extract_detail('{"code":"x","message":123}') == "123"
 
 
 def test_extract_detail_plain_text():
@@ -245,19 +269,31 @@ def test_extract_detail_malformed_json():
 def test_raise_http_error_401():
     from sonilo_mcp.api import _raise_http_error
     with pytest.raises(Exception, match="Invalid SONILO_API_KEY"):
+        _raise_http_error(401, '{"code":"unauthorized","message":"Invalid API key"}')
+
+
+def test_raise_http_error_401_detail_fallback():
+    # Non-public path shape ({"detail": ...}) must still work.
+    from sonilo_mcp.api import _raise_http_error
+    with pytest.raises(Exception, match="Invalid SONILO_API_KEY"):
         _raise_http_error(401, '{"detail":"Invalid API key"}')
 
 
 def test_raise_http_error_402_minutes():
     from sonilo_mcp.api import _raise_http_error
     with pytest.raises(Exception, match="Top up"):
-        _raise_http_error(402, '{"detail":"Insufficient minutes: 30 needed"}')
+        _raise_http_error(
+            402,
+            '{"code":"insufficient_credit","message":"Insufficient minutes: 30 needed"}',
+        )
 
 
 def test_raise_http_error_402_suspended():
     from sonilo_mcp.api import _raise_http_error
     with pytest.raises(Exception) as exc:
-        _raise_http_error(402, '{"detail":"Account is suspended"}')
+        _raise_http_error(
+            402, '{"code":"account_suspended","message":"Account is suspended"}'
+        )
     assert "suspended" in str(exc.value).lower()
     assert "top up" not in str(exc.value).lower()
 
@@ -265,25 +301,31 @@ def test_raise_http_error_402_suspended():
 def test_raise_http_error_413():
     from sonilo_mcp.api import _raise_http_error
     with pytest.raises(Exception, match="File too large"):
-        _raise_http_error(413, '{"detail":"Max 300MB"}')
+        _raise_http_error(413, '{"code":"payload_too_large","message":"Max 300MB"}')
 
 
 def test_raise_http_error_422():
+    # The backend's 422 body also carries an `errors` array; `message` is
+    # still the right field to surface.
     from sonilo_mcp.api import _raise_http_error
     with pytest.raises(Exception, match="Could not read video duration"):
-        _raise_http_error(422, '{"detail":"Could not read video duration"}')
+        _raise_http_error(
+            422,
+            '{"code":"validation_error","message":"Could not read video duration",'
+            '"errors":[]}',
+        )
 
 
 def test_raise_http_error_429():
     from sonilo_mcp.api import _raise_http_error
     with pytest.raises(Exception, match="Rate limit exceeded"):
-        _raise_http_error(429, '{"detail":"Rate limit exceeded"}')
+        _raise_http_error(429, '{"code":"rate_limited","message":"Rate limit exceeded"}')
 
 
 def test_raise_http_error_500():
     from sonilo_mcp.api import _raise_http_error
     with pytest.raises(Exception, match="Server error.*retry"):
-        _raise_http_error(500, '{"detail":"internal"}')
+        _raise_http_error(500, '{"code":"internal_error","message":"internal"}')
 
 
 @respx.mock
@@ -338,7 +380,9 @@ async def test_http_get_json_401_no_retry(monkeypatch):
     monkeypatch.setenv("SONILO_API_KEY", "bad")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     route = respx.get("https://api.test.local/v1/foo").mock(
-        return_value=httpx.Response(401, json={"detail": "Invalid API key"})
+        return_value=httpx.Response(
+            401, json={"code": "unauthorized", "message": "Invalid API key"}
+        )
     )
     from sonilo_mcp.api import _http_get_json
     with pytest.raises(Exception, match="Invalid SONILO_API_KEY"):
@@ -818,7 +862,9 @@ async def test_text_to_music_401_error(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "bad")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     respx.post("https://api.test.local/v1/text-to-music").mock(
-        return_value=httpx.Response(401, json={"detail": "Invalid API key"})
+        return_value=httpx.Response(
+            401, json={"code": "unauthorized", "message": "Invalid API key"}
+        )
     )
     from sonilo_mcp.api import text_to_music
     with pytest.raises(Exception, match="Invalid SONILO_API_KEY"):
@@ -830,7 +876,9 @@ async def test_text_to_music_429_error(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     respx.post("https://api.test.local/v1/text-to-music").mock(
-        return_value=httpx.Response(429, json={"detail": "Rate limit exceeded"})
+        return_value=httpx.Response(
+            429, json={"code": "rate_limited", "message": "Rate limit exceeded"}
+        )
     )
     from sonilo_mcp.api import text_to_music
     with pytest.raises(Exception, match="Rate limit exceeded"):
@@ -1425,7 +1473,14 @@ async def test_post_task_submit_maps_errors(monkeypatch):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     respx.post("https://api.test.local/v1/text-to-sfx").mock(
-        return_value=httpx.Response(422, json={"detail": "duration too long"})
+        return_value=httpx.Response(
+            422,
+            json={
+                "code": "validation_error",
+                "message": "duration too long",
+                "errors": [],
+            },
+        )
     )
     from sonilo_mcp.api import _post_task_submit
     with pytest.raises(Exception, match="duration too long"):
@@ -1559,7 +1614,10 @@ async def test_poll_task_402_keeps_task_id(monkeypatch):
     respx.get("https://api.test.local/v1/tasks/t-402").mock(
         side_effect=[
             httpx.Response(200, json={"task_id": "t-402", "status": "processing"}),
-            httpx.Response(402, json={"detail": "Account is suspended"}),
+            httpx.Response(
+                402,
+                json={"code": "account_suspended", "message": "Account is suspended"},
+            ),
         ]
     )
     from sonilo_mcp import api
@@ -1584,7 +1642,9 @@ async def test_poll_task_401_keeps_task_id(monkeypatch):
     respx.get("https://api.test.local/v1/tasks/t-401").mock(
         side_effect=[
             httpx.Response(200, json={"task_id": "t-401", "status": "processing"}),
-            httpx.Response(401, json={"detail": "Invalid API key"}),
+            httpx.Response(
+                401, json={"code": "unauthorized", "message": "Invalid API key"}
+            ),
         ]
     )
     from sonilo_mcp import api
@@ -2181,7 +2241,11 @@ async def test_text_to_sfx_backend_rejection_surfaces(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     respx.post("https://api.test.local/v1/text-to-sfx").mock(
         return_value=httpx.Response(
-            400, json={"detail": "audio_format must be one of wav, mp3, aac, flac"}
+            400,
+            json={
+                "code": "bad_request",
+                "message": "audio_format must be one of wav, mp3, aac, flac",
+            },
         )
     )
     from sonilo_mcp.api import text_to_sfx
@@ -2522,7 +2586,9 @@ async def test_get_sfx_task_unknown_task_404(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     respx.get("https://api.test.local/v1/tasks/nope").mock(
-        return_value=httpx.Response(404, json={"detail": "Task not found"})
+        return_value=httpx.Response(
+            404, json={"code": "not_found", "message": "Task not found"}
+        )
     )
     from sonilo_mcp.api import get_sfx_task
     with pytest.raises(Exception, match="Task not found"):
@@ -2538,7 +2604,9 @@ async def test_get_sfx_task_404_gives_no_retry_advice(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     respx.get("https://api.test.local/v1/tasks/music-task-1").mock(
-        return_value=httpx.Response(404, json={"detail": "Task not found"})
+        return_value=httpx.Response(
+            404, json={"code": "not_found", "message": "Task not found"}
+        )
     )
     from sonilo_mcp.api import get_sfx_task
     with pytest.raises(Exception) as exc:
@@ -2577,7 +2645,9 @@ async def test_poll_task_404_gives_no_retry_advice(monkeypatch):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     respx.get("https://api.test.local/v1/tasks/t-404-poll").mock(
-        return_value=httpx.Response(404, json={"detail": "Task not found"})
+        return_value=httpx.Response(
+            404, json={"code": "not_found", "message": "Task not found"}
+        )
     )
     from sonilo_mcp.api import _poll_task
     with pytest.raises(Exception) as exc:
@@ -2595,7 +2665,9 @@ async def test_get_sfx_task_402_keeps_task_id(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     respx.get("https://api.test.local/v1/tasks/t-402b").mock(
-        return_value=httpx.Response(402, json={"detail": "Account is suspended"})
+        return_value=httpx.Response(
+            402, json={"code": "account_suspended", "message": "Account is suspended"}
+        )
     )
     from sonilo_mcp.api import get_sfx_task
     with pytest.raises(Exception) as exc:

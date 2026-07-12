@@ -257,14 +257,30 @@ async def _check_video_duration(
 # ---------- HTTP plumbing ----------
 
 def _extract_detail(body: str) -> str:
-    """Pull the `detail` field out of a FastAPI error body, falling back to the raw body."""
+    """Pull the human-readable error text out of a backend error body.
+
+    The real backend's public /v1/* contract (see factory.py's exception
+    handlers) is `{"code": ..., "message": ...}` — including for 422
+    validation errors, whose body also carries an `errors` array alongside
+    `message`. `message` is preferred. `detail` is checked as a fallback:
+    it's FastAPI's default shape for non-public paths, which the MCP client
+    never calls today, but falling back to it is harmless and keeps this
+    robust if that ever changes. Falls back to the raw body if neither key
+    is present or the body isn't JSON.
+
+    The value may be a non-string (a backend bug) — stringify it rather
+    than let a `str.lower()` call elsewhere crash on it.
+    """
     try:
         parsed = json.loads(body)
-        if isinstance(parsed, dict) and "detail" in parsed:
-            return str(parsed["detail"])
-        return body
     except (json.JSONDecodeError, TypeError):
         return body
+    if isinstance(parsed, dict):
+        if "message" in parsed:
+            return str(parsed["message"])
+        if "detail" in parsed:
+            return str(parsed["detail"])
+    return body
 
 
 _BILLING_URL = "https://platform.sonilo.com/dashboard/billing"

@@ -7,3 +7,6 @@ dist/
 .venv/
 venv/
 .coverage
+
+# Superpowers working docs (specs/plans) — local only
+docs/superpowers/

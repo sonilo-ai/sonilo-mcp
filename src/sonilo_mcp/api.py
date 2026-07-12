@@ -814,6 +814,109 @@ async def text_to_sfx(
     return await _save_task_artifacts(body, out_path, _slugify(prompt))
 
 
+@mcp.tool(
+    description=(
+        "Generate sound effects for a video: Sonilo analyzes the video and "
+        "creates matching SFX. Returns BOTH the sound-effects audio file "
+        "and the finished video with the effects mixed in. Provide either a "
+        "local video file path or a publicly accessible video URL. "
+        "Generation is asynchronous on the backend; this tool waits for "
+        "completion and returns the saved file paths.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges. Only use when explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    video_path (str, optional): Absolute local path, or relative "
+        "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.avi/.wmv/.webm/.mkv. "
+        "Subject to the account's max upload size (typically 300 MB). "
+        "Maximum video duration is 180 seconds (3 minutes).\n"
+        "    video_url (str, optional): HTTPS URL to a video file.\n"
+        "    prompt (str, optional): Overall description of the desired "
+        "sound effects (max 2000 chars).\n"
+        "    segments (list, optional): Per-segment SFX descriptions, each "
+        '{"start": float, "end": float, "prompt": str}. Backend rules: '
+        "first start must be 0; segments must be contiguous (each end == "
+        "next start); every end > start; every prompt non-empty (max 200 "
+        "chars); last end must not exceed the video duration; max 30 "
+        "segments. Invalid segments are rejected before any charge.\n"
+        "    audio_format (str, optional): One of wav, mp3, aac, flac. "
+        "Defaults to aac (.m4a file).\n"
+        "    output_directory (str, optional): Where to save the resulting "
+        "files. Defaults to SONILO_MCP_BASE_PATH.\n\n"
+        "Exactly one of video_path and video_url must be provided.\n\n"
+        "Returns:\n"
+        "    Two TextContents: the saved audio file path and the saved "
+        ".mp4 video path. If the call times out, the error message "
+        "includes the task_id — recover with get_sfx_task."
+    )
+)
+async def video_to_sfx(
+    video_path: str | None = None,
+    video_url: str | None = None,
+    prompt: str | None = None,
+    segments: list[dict] | None = None,
+    audio_format: str | None = None,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    if (video_path and video_url) or (not video_path and not video_url):
+        raise Exception(
+            "Provide either video_path or video_url (exactly one, not both)"
+        )
+
+    if video_url:
+        # Same scheme guard as video_to_music: keeps file:// and flag-like
+        # values away from ffprobe and the backend.
+        scheme = urlparse(video_url).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise Exception("video_url must be an http:// or https:// URL")
+
+    out_path = _make_output_path(output_directory)
+    cfg = _get_config()
+
+    form: dict = {}
+    if prompt and prompt.strip():
+        form["prompt"] = prompt
+    if segments is not None:
+        # Pass-through: the backend validates segments strictly and rejects
+        # bad input with a 400 before charging.
+        form["segments"] = json.dumps(segments)
+    if audio_format:
+        form["audio_format"] = audio_format
+
+    if video_path:
+        resolved = _resolve_input_file(
+            video_path, cfg["base_path"], _VIDEO_EXTS, "video"
+        )
+        max_mb = await _get_max_upload_size_mb()
+        size_mb = resolved.stat().st_size / (1024 * 1024)
+        if size_mb > max_mb:
+            raise Exception(
+                f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
+            )
+        await _check_video_duration(
+            str(resolved), max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
+        )
+        mime, _ = mimetypes.guess_type(resolved.name)
+        with open(resolved, "rb") as fh:
+            files = {
+                "video": (
+                    resolved.name, fh.read(), mime or "application/octet-stream"
+                )
+            }
+        task_id = await _post_task_submit(
+            "/v1/video-to-sfx", data=form or None, files=files
+        )
+    else:
+        await _check_video_duration(
+            video_url, max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
+        )
+        form["video_url"] = video_url
+        task_id = await _post_task_submit("/v1/video-to-sfx", data=form)
+
+    body = await _poll_task(task_id, cfg["timeout"])
+    base = _slugify(prompt) if prompt and prompt.strip() else f"sfx-{task_id[:8]}"
+    return await _save_task_artifacts(body, out_path, base)
+
+
 # ---------- Tools: account ----------
 
 @mcp.tool(

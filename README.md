@@ -1,5 +1,7 @@
 # Sonilo MCP Server
 
+<!-- mcp-name: io.github.sonilo-ai/sonilo-mcp -->
+
 An MCP (Model Context Protocol) server that exposes [Sonilo](https://sonilo.com)'s licensed video-to-music API to MCP-compatible clients (Claude Code, Claude Desktop, Codex).
 
 The flagship tool is **`video_to_music`**: hand it your finished video and it composes an original soundtrack matched to the cut — the music follows the pacing, emotion, and edits because the model saw them. Length matches the video automatically. Every track is licensed and safe for commercial use (terms apply). `text_to_music` is also available for fixed-length tracks with no video to match.

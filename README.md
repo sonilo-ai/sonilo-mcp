@@ -30,7 +30,7 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
 - **macOS**: `brew install portaudio`
 - **Debian/Ubuntu**: `sudo apt-get install libportaudio2`
 
-`uvx sonilo-mcp` and `pip install` will pull the Python bindings, but the system PortAudio library must be installed separately. The other tools (`text_to_music`, `video_to_music`, `get_account_services`, `get_usage`) work without PortAudio.
+`uvx sonilo-mcp` and `pip install` will pull the Python bindings, but the system PortAudio library must be installed separately. The other tools (`text_to_music`, `video_to_music`, `text_to_sfx`, `video_to_sfx`, `get_sfx_task`, `get_account_services`, `get_usage`) work without PortAudio.
 
 ## Quickstart with Claude Desktop
 
@@ -107,7 +107,7 @@ Once the server is connected, just ask your assistant in natural language. For e
 - *"Show my Sonilo usage for the last 7 days."*
 - *"Play the track you just generated."*
 
-The assistant will call the matching tool (`text_to_music`, `video_to_music`, `get_account_services`, `get_usage`, or `play_audio`) and save generated audio to your configured output directory.
+The assistant will call the matching tool (`text_to_music`, `video_to_music`, `text_to_sfx`, `video_to_sfx`, `get_sfx_task`, `get_account_services`, `get_usage`, or `play_audio`) and save generated audio to your configured output directory.
 
 ## Configuration
 
@@ -136,6 +136,9 @@ files. To opt out — e.g. to read a video from elsewhere on disk — set
 |---|---|---|
 | `text_to_music(prompt, duration, output_directory?)` | Generate music from a text prompt. | ✅ |
 | `video_to_music(video_path? \| video_url?, prompt?, output_directory?)` | Generate music matched to a video. Max duration **360s (6 min)**; subject to the account's upload-size cap (typically 300 MB). | ✅ |
+| `text_to_sfx(prompt, duration, audio_format?, output_directory?)` | Generate a sound effect from text. Duration 1–180s; formats wav/mp3/aac/flac (default aac). | ✅ |
+| `video_to_sfx(video_path? \| video_url?, prompt?, segments?, audio_format?, output_directory?)` | Generate SFX for a video; saves the SFX audio **and** the finished video with effects mixed in. Max video duration **180s (3 min)**. | ✅ |
+| `get_sfx_task(task_id, output_directory?)` | Check an SFX task and download its result — recovery for timed-out SFX calls. | ❌ |
 | `get_account_services()` | List available services and limits. | ❌ |
 | `get_usage(days=30)` | Show usage summary + per-day breakdown. | ❌ |
 | `play_audio(input_file_path)` | Play a local audio file. | ❌ |

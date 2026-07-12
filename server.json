@@ -1,8 +1,8 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.sonilo-ai/sonilo-mcp",
-  "title": "Sonilo Video-to-Music",
-  "description": "An original, licensed soundtrack matched to your video. Safe for commercial use (terms apply).",
+  "title": "Sonilo Music & Sound Effects",
+  "description": "Licensed soundtracks and sound effects matched to your video. Commercial use OK.",
   "repository": {
     "url": "https://github.com/sonilo-ai/sonilo-mcp",
     "source": "github"

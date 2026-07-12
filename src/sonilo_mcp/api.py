@@ -555,9 +555,17 @@ async def _download_artifact(url: str, dest: Path) -> None:
                         "The result is still stored on the backend — retry "
                         "with get_sfx_task."
                     )
-                with open(dest, "wb") as fh:
-                    async for chunk in r.aiter_bytes():
-                        fh.write(chunk)
+                # If the write loop dies mid-stream (for ANY reason), remove
+                # the truncated file: leaving it would both hand the user a
+                # corrupt artifact and make a retry pick a new suffixed path
+                # from _artifact_dest, permanently orphaning the partial file.
+                try:
+                    with open(dest, "wb") as fh:
+                        async for chunk in r.aiter_bytes():
+                            fh.write(chunk)
+                except BaseException:
+                    dest.unlink(missing_ok=True)
+                    raise
     except httpx.RequestError as e:
         raise Exception(
             f"Artifact download failed: {e}. The result is still stored on "

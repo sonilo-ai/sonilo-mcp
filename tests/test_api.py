@@ -1403,6 +1403,34 @@ async def test_download_artifact_error_mentions_recovery(monkeypatch, tmp_path):
         await _download_artifact("https://r2.test/gone", tmp_path / "x.m4a")
 
 
+@respx.mock
+async def test_download_artifact_cleans_up_partial_file_on_midstream_failure(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+
+    # respx can't take a raising generator as `content` (it drains it while
+    # building the response), so use an httpx.AsyncByteStream that yields one
+    # chunk and then dies — the failure happens mid `aiter_bytes()`, after
+    # bytes have already been written to dest.
+    class _BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"first-chunk"
+            raise httpx.ReadError("connection lost")
+
+    respx.get("https://r2.test/broken").mock(
+        return_value=httpx.Response(200, stream=_BrokenStream())
+    )
+    from sonilo_mcp.api import _download_artifact
+    dest = tmp_path / "x.m4a"
+    with pytest.raises(Exception):
+        await _download_artifact("https://r2.test/broken", dest)
+    # A mid-stream failure must not leave a corrupt partial file behind —
+    # otherwise a retry would get a new suffixed path from _artifact_dest
+    # and the truncated file would be permanently orphaned.
+    assert not dest.exists()
+
+
 def test_ext_from_content_type():
     from sonilo_mcp.api import _ext_from_content_type
     assert _ext_from_content_type("audio/wav") == ".wav"

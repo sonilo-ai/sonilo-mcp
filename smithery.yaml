@@ -1,0 +1,29 @@
+# Smithery configuration — https://smithery.ai/docs/config
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - soniloApiKey
+    properties:
+      soniloApiKey:
+        type: string
+        description: Sonilo API key from platform.sonilo.com/dashboard/api-keys
+      soniloApiUrl:
+        type: string
+        default: https://api.sonilo.com
+        description: Public API base URL
+      timeoutSeconds:
+        type: number
+        default: 600
+        description: Generation timeout in seconds
+  commandFunction: |-
+    (config) => ({
+      command: 'uvx',
+      args: ['sonilo-mcp'],
+      env: {
+        SONILO_API_KEY: config.soniloApiKey,
+        SONILO_API_URL: config.soniloApiUrl || 'https://api.sonilo.com',
+        TIME_OUT_SECONDS: String(config.timeoutSeconds || 600)
+      }
+    })

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.sonilo-ai/sonilo-mcp",
+  "title": "Sonilo Video-to-Music",
+  "description": "Generate an original, licensed soundtrack matched to your video. video_to_music watches the finished cut and composes music that follows its pacing and edits; text_to_music covers fixed-length tracks. Safe for commercial use (terms apply).",
+  "repository": {
+    "url": "https://github.com/sonilo-ai/sonilo-mcp",
+    "source": "github"
+  },
+  "version": "0.2.1",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "sonilo-mcp",
+      "version": "0.2.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "SONILO_API_KEY",
+          "description": "Sonilo API key from platform.sonilo.com/dashboard/api-keys",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "SONILO_API_URL",
+          "description": "Public API base URL",
+          "isRequired": false,
+          "format": "string",
+          "default": "https://api.sonilo.com"
+        },
+        {
+          "name": "SONILO_MCP_BASE_PATH",
+          "description": "Default output directory and file-access confinement boundary",
+          "isRequired": false,
+          "format": "string",
+          "default": "~/Desktop"
+        },
+        {
+          "name": "TIME_OUT_SECONDS",
+          "description": "Generation timeout in seconds",
+          "isRequired": false,
+          "format": "number",
+          "default": "600"
+        }
+      ]
+    }
+  ]
+}

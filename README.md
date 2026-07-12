@@ -1,5 +1,7 @@
 # Sonilo MCP Server
 
+<!-- mcp-name: io.github.sonilo-ai/sonilo-mcp -->
+
 An MCP (Model Context Protocol) server that exposes [Sonilo](https://platform.sonilo.com)'s AI music generation API to MCP-compatible clients (Claude Desktop, Codex).
 
 ### Audio Playback Dependencies

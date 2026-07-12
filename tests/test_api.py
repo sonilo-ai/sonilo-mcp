@@ -1522,3 +1522,87 @@ async def test_save_task_artifacts_succeeded_without_audio(tmp_path):
     body = {"task_id": "t-5", "status": "succeeded"}
     with pytest.raises(Exception, match="no audio"):
         await _save_task_artifacts(body, tmp_path, "x")
+
+
+def _sfx_submit_then_poll(task_id: str, envelope: dict):
+    """Mock POST 202 + one processing poll + terminal poll for an SFX flow."""
+    submit = respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": task_id, "status": "processing"}
+        )
+    )
+    poll = respx.get(f"https://api.test.local/v1/tasks/{task_id}").mock(
+        side_effect=[
+            httpx.Response(200, json={"task_id": task_id, "status": "processing"}),
+            httpx.Response(200, json=envelope),
+        ]
+    )
+    return submit, poll
+
+
+@respx.mock
+async def test_text_to_sfx_happy_path(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit, poll = _sfx_submit_then_poll("t-9", {
+        "task_id": "t-9", "status": "succeeded",
+        "audio": {"url": "https://r2.test/a.m4a", "content_type": "audio/mp4"},
+    })
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"sfx-bytes")
+    )
+    result = await api.text_to_sfx(prompt="Thunder Clap", duration=8)
+
+    sent = submit.calls.last.request
+    assert sent.headers["content-type"].startswith(
+        "application/x-www-form-urlencoded"
+    )
+    assert b"prompt=Thunder+Clap" in sent.content
+    assert b"duration=8" in sent.content
+    assert poll.call_count == 2
+    expected = output_dir / "thunder-clap.m4a"
+    assert expected.read_bytes() == b"sfx-bytes"
+    assert len(result) == 1
+    assert str(expected) in result[0].text
+
+
+@respx.mock
+async def test_text_to_sfx_sends_audio_format(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit, _ = _sfx_submit_then_poll("t-10", {
+        "task_id": "t-10", "status": "succeeded",
+        "audio": {"url": "https://r2.test/a.wav", "content_type": "audio/wav"},
+    })
+    respx.get("https://r2.test/a.wav").mock(
+        return_value=httpx.Response(200, content=b"wav")
+    )
+    await api.text_to_sfx(prompt="beep", duration=2, audio_format="wav")
+    assert b"audio_format=wav" in submit.calls.last.request.content
+    assert (output_dir / "beep.wav").exists()
+
+
+@respx.mock
+async def test_text_to_sfx_backend_rejection_surfaces(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        return_value=httpx.Response(
+            400, json={"detail": "audio_format must be one of wav, mp3, aac, flac"}
+        )
+    )
+    from sonilo_mcp.api import text_to_sfx
+    with pytest.raises(Exception, match="audio_format must be one of"):
+        await text_to_sfx(prompt="beep", duration=2, audio_format="ogg")

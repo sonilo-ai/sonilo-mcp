@@ -774,6 +774,46 @@ async def video_to_music(
     )
 
 
+# ---------- Tools: sound effects ----------
+
+@mcp.tool(
+    description=(
+        "Generate a sound effect from a text prompt and save the audio file "
+        "to a local directory. Generation is asynchronous on the backend; "
+        "this tool waits for completion (typically well under the timeout) "
+        "and returns the saved file path.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges. Only use when explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    prompt (str): Description of the sound effect "
+        "(1–2000 chars).\n"
+        "    duration (int): Length in seconds (1–180).\n"
+        "    audio_format (str, optional): One of wav, mp3, aac, flac. "
+        "Defaults to aac (.m4a file).\n"
+        "    output_directory (str, optional): Absolute path, or relative "
+        "to SONILO_MCP_BASE_PATH. Defaults to SONILO_MCP_BASE_PATH "
+        "(~/Desktop unless overridden).\n\n"
+        "Returns:\n"
+        "    TextContent with the absolute path of the saved audio file. "
+        "If the call times out, the error message includes the task_id — "
+        "recover the result later with get_sfx_task."
+    )
+)
+async def text_to_sfx(
+    prompt: str,
+    duration: int,
+    audio_format: str | None = None,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    out_path = _make_output_path(output_directory)
+    data: dict = {"prompt": prompt, "duration": duration}
+    if audio_format:
+        data["audio_format"] = audio_format
+    task_id = await _post_task_submit("/v1/text-to-sfx", data=data)
+    body = await _poll_task(task_id, _get_config()["timeout"])
+    return await _save_task_artifacts(body, out_path, _slugify(prompt))
+
+
 # ---------- Tools: account ----------
 
 @mcp.tool(

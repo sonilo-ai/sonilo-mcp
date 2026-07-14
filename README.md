@@ -34,7 +34,7 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
 - **macOS**: `brew install portaudio`
 - **Debian/Ubuntu**: `sudo apt-get install libportaudio2`
 
-`uvx sonilo-mcp` and `pip install` will pull the Python bindings, but the system PortAudio library must be installed separately. The other tools (`text_to_music`, `video_to_music`, `text_to_sfx`, `video_to_sfx`, `get_sfx_task`, `get_account_services`, `get_usage`) work without PortAudio.
+`uvx sonilo-mcp` and `pip install` will pull the Python bindings, but the system PortAudio library must be installed separately. The other tools (`text_to_music`, `video_to_music`, `text_to_sfx`, `video_to_sfx`, `audio_ducking`, `get_sfx_task`, `get_account_services`, `get_usage`) work without PortAudio.
 
 ## Quickstart with Claude Desktop
 
@@ -111,7 +111,7 @@ Once the server is connected, just ask your assistant in natural language. For e
 - *"Show my Sonilo usage for the last 7 days."*
 - *"Play the track you just generated."*
 
-The assistant will call the matching tool (`text_to_music`, `video_to_music`, `text_to_sfx`, `video_to_sfx`, `get_sfx_task`, `get_account_services`, `get_usage`, or `play_audio`) and save generated audio to your configured output directory.
+The assistant will call the matching tool (`text_to_music`, `video_to_music`, `text_to_sfx`, `video_to_sfx`, `audio_ducking`, `get_sfx_task`, `get_account_services`, `get_usage`, or `play_audio`) and save generated audio to your configured output directory.
 
 ## Configuration
 
@@ -142,18 +142,19 @@ files. To opt out — e.g. to read a video from elsewhere on disk — set
 | `video_to_music(video_path? \| video_url?, prompt?, output_directory?)` | Generate music matched to a video. Max duration **360s (6 min)**; subject to the account's upload-size cap (typically 300 MB). | ✅ |
 | `text_to_sfx(prompt, duration, audio_format?, output_directory?)` | Generate a sound effect from text. Duration 1–180s; formats wav/mp3/aac/flac (default aac). | ✅ |
 | `video_to_sfx(video_path? \| video_url?, prompt?, segments?, audio_format?, output_directory?)` | Generate SFX for a video; saves the SFX audio **and** the finished video with effects mixed in. Max video duration **180s (3 min)**. | ✅ |
-| `get_sfx_task(task_id, output_directory?)` | Check an SFX task and download its result — recovery for timed-out SFX calls. | ❌ |
+| `audio_ducking(voice_path? \| voice_url?, music_path? \| music_url?, output_directory?)` | Duck a music bed under a voice track. The voice input may be a video — the ducked mix is muxed back into a new `.mp4`. Each input max **360s (6 min)**; subject to the account's upload-size cap. | ✅ |
+| `get_sfx_task(task_id, output_directory?)` | Check an SFX or audio-ducking task and download its result — recovery for timed-out `text_to_sfx`, `video_to_sfx`, and `audio_ducking` calls. | ❌ |
 | `get_account_services()` | List available services and limits. | ❌ |
 | `get_usage(days=30)` | Show usage summary + per-day breakdown. | ❌ |
 | `play_audio(input_file_path)` | Play a local audio file. | ❌ |
 
 Tools marked ✅ make API calls that incur charges on your Sonilo account.
 
-> **Optional:** if [`ffprobe`](https://ffmpeg.org/) (part of FFmpeg) is installed, `video_to_music` checks a video's duration locally and rejects anything over 360s before uploading. `video_to_sfx` performs the same local check with its 180s cap. Without it, the same limits are still enforced by the backend.
+> **Optional:** if [`ffprobe`](https://ffmpeg.org/) (part of FFmpeg) is installed, `video_to_music` checks a video's duration locally and rejects anything over 360s before uploading. `video_to_sfx` performs the same local check with its 180s cap. `audio_ducking` does the same for both of its inputs against its 360s cap. Without it, the same limits are still enforced by the backend.
 
-### Sound effects run as tasks
+### Sound effects and ducking run as tasks
 
-The music tools stream their result and finish in one call. The SFX tools submit a *task*, then poll it until it completes — `text_to_sfx` and `video_to_sfx` do this for you and return the saved file paths, so you normally never see the task.
+The music tools stream their result and finish in one call. The SFX tools submit a *task*, then poll it until it completes — `text_to_sfx` and `video_to_sfx` do this for you and return the saved file paths, so you normally never see the task. `audio_ducking` uses the same submit-then-poll flow and the same `get_sfx_task` recovery path.
 
 If a call times out, the generation keeps running (and is already charged). The error message carries the task id, and `get_sfx_task("<id>")` retrieves the result once it's ready. The task id is also printed to stderr the moment a task is submitted, so it survives even a cancelled call. `get_sfx_task` is safe to call repeatedly: if the file is already on disk it reports that instead of downloading a second copy.
 
@@ -164,6 +165,8 @@ If a call times out, the generation keeps running (and is already charged). The 
 **Sound effects** are saved in the requested `audio_format` — `wav`, `mp3`, `flac`, or `aac` (the default, written as `.m4a`). `video_to_sfx` additionally saves the finished video as `.mp4` alongside the audio.
 
 File names come from the prompt (slugified, truncated to 80 characters). When there is no prompt to name a file after — `video_to_sfx` without one, or any file recovered via `get_sfx_task` — the name is `sfx-<first 8 chars of the task id>` instead. Existing files are never overwritten: a `-1`, `-2`, … suffix is added instead.
+
+**Ducking** results are saved as a single file: a `.wav`, or a `.mp4` when the voice input was a video (the ducked mix is muxed back into it). The file name is the voice input's name plus `-ducked` (e.g. `interview.mp4` → `interview-ducked.mp4`), falling back to `ducked-<first 8 chars of the task id>` when there is no usable name. A ducking result recovered via `get_sfx_task` is named `sfx-<first 8 chars of the task id>` instead, since that tool has no voice file name to work from.
 
 ## Common Errors
 

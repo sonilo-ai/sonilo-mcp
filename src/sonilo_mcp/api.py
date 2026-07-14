@@ -168,6 +168,32 @@ def _slugify(text: str) -> str:
     return safe or "sonilo"
 
 
+def _ducking_base_name(
+    voice_path: str | None, voice_url: str | None, task_id: str
+) -> str:
+    """Name a ducking result after its voice input: interview.mp4 ->
+    interview-ducked(.mp4).
+
+    The voice track is what the user recognizes — the music bed is
+    interchangeable — so it is the half worth naming the output after. For
+    a URL, the last path segment is used (query and fragment are dropped by
+    urlparse). When neither input yields a usable stem, fall back to
+    ducked-{task_id[:8]}, mirroring get_sfx_task's sfx-{task_id[:8]}.
+
+    The extension is NOT decided here: it comes from the task envelope
+    (.wav, or .mp4 when the voice input was a video) — see
+    _normalize_task_envelope.
+    """
+    raw = ""
+    if voice_path:
+        raw = Path(os.path.expanduser(voice_path)).stem
+    elif voice_url:
+        raw = Path(urlparse(voice_url).path).stem
+    if not raw.strip():
+        return f"ducked-{task_id[:8]}"
+    return f"{_slugify(raw)}-ducked"
+
+
 _AUDIO_EXTS = frozenset({".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac"})
 _VIDEO_EXTS = frozenset({".mp4", ".mov", ".avi", ".wmv", ".webm", ".mkv"})
 
@@ -207,19 +233,59 @@ def _resolve_input_file(
     return path
 
 
+def _require_http_url(url: str, label: str) -> None:
+    """Restrict a caller-supplied URL to http(s) before it reaches ffprobe or
+    the backend — keeps file:// (local file disclosure), internal addresses
+    (SSRF from this machine), and "-"-prefixed values (ffprobe flag injection)
+    out.
+
+    `label` names the offending argument (e.g. "video" -> "video_url must be
+    an http:// or https:// URL"). The single copy of this guard: every tool
+    that accepts a URL (video_to_music, video_to_sfx, audio_ducking) calls it.
+    """
+    if urlparse(url).scheme.lower() not in ("http", "https"):
+        raise Exception(f"{label}_url must be an http:// or https:// URL")
+
+
+def _read_capped(path: Path, max_mb: int, label: str) -> bytes:
+    """Read a file for upload, enforcing the account's size cap on the bytes
+    actually read.
+
+    An earlier stat() is stale by the time we get here (an await on ffprobe
+    sat in between, during which the file could have been replaced or grown —
+    a still-writing export, a sync tool). Reading at most max_bytes + 1 both
+    closes that race and bounds memory use.
+
+    `label` names the input in the error message (e.g. "Video", "Voice",
+    "Music"). The single copy of the read-time cap: every tool that uploads a
+    local file calls it.
+    """
+    max_bytes = max_mb * 1024 * 1024
+    with open(path, "rb") as fh:
+        content = fh.read(max_bytes + 1)
+    if len(content) > max_bytes:
+        raise Exception(f"{label} file is too large (> {max_mb} MB cap)")
+    return content
+
+
 # The backend rejects videos longer than this, so we pre-check locally to fail
 # fast and skip a wasted upload. Keep in sync with the backend's limit.
 _MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — music endpoints
 _SFX_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sfx
+_DUCKING_MAX_DURATION_SECONDS = 360  # 6 minutes — /v1/audio-ducking, per input
 
 
-async def _check_video_duration(
+async def _check_media_duration(
     source: str, max_seconds: int = _MAX_VIDEO_DURATION_SECONDS
 ) -> None:
-    """Best-effort local ffprobe pre-check of a video's duration.
+    """Best-effort local ffprobe pre-check of a media file's duration.
+
+    Reads `format.duration`, which ffprobe reports for audio files as well
+    as videos — so this serves the video endpoints and the audio-ducking
+    endpoint alike.
 
     Raises if the duration is known to exceed `max_seconds`, so the caller
-    fails fast instead of uploading a video the backend will reject.
+    fails fast instead of uploading media the backend will reject.
     `source` may be a local path or a URL (ffprobe handles both).
 
     The check is best-effort: if ffprobe is not installed, times out, or
@@ -239,7 +305,11 @@ async def _check_video_duration(
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except (asyncio.TimeoutError, OSError):
+    except (asyncio.TimeoutError, OSError, ValueError):
+        # ValueError: create_subprocess_exec rejects a source containing an
+        # embedded NUL byte (or similar odd chars) before spawning. This
+        # helper is best-effort, so fail open and let the backend decide
+        # rather than crash the whole request with a raw traceback.
         return  # fail open — let the backend decide
     if proc.returncode != 0:
         return
@@ -249,7 +319,7 @@ async def _check_video_duration(
         return
     if duration > max_seconds:
         raise Exception(
-            f"Video duration {duration:.1f}s exceeds the maximum of "
+            f"Media duration {duration:.1f}s exceeds the maximum of "
             f"{max_seconds}s"
         )
 
@@ -346,8 +416,10 @@ def _is_task_not_found(e: BaseException) -> bool:
     """Whether `e` means the task_id itself is gone/invalid — the only case
     where recovery advice should be omitted.
 
-    Only a 404 means that: a bad/typo'd id, or a non-SFX (e.g. music) task
-    id — /v1/tasks is SFX-only and 404s those. Every OTHER error (401, 402,
+    Only a 404 means that: a bad/typo'd id, or an id for a task type
+    /v1/tasks does not serve. It serves SFX and audio-ducking tasks; a
+    streaming (e.g. music) generation has no task at all, so its id 404s
+    here. Every OTHER error (401, 402,
     413, 422, 429, 5xx, or a network-level failure with no status at all,
     e.g. httpx.RequestError wrapped as a bare Exception by _http_get_json)
     still refers to a task that EXISTS and was already CHARGED — the cause
@@ -729,6 +801,73 @@ def _ext_from_content_type(content_type: str | None) -> str:
     return _AUDIO_CONTENT_TYPE_EXTS.get(content_type.lower(), ".m4a")
 
 
+# Ducking renders wav, and re-muxes into mp4 when the voice input was a
+# video. Its envelope carries no content_type, so the type is synthesized
+# here from output_type. Only the "audio" value is ever read back:
+# _save_task_artifacts derives the audio extension from it via
+# _ext_from_content_type, so "audio/wav" must stay a key of
+# _AUDIO_CONTENT_TYPE_EXTS. The video branch hard-codes ".mp4" and never
+# looks at content_type — the "video/mp4" entry is carried only so the
+# normalized slot is shaped like an SFX one.
+#
+# This dict is also the authoritative set of output_type values: an
+# output_type outside these keys is NOT a ducking envelope (see
+# _normalize_task_envelope).
+_DUCKING_CONTENT_TYPES = {"audio": "audio/wav", "video": "video/mp4"}
+
+
+def _normalize_task_envelope(body: dict) -> tuple[dict, bool]:
+    """Rewrite audio-ducking's flat success envelope into the SFX shape.
+
+    Returns `(body, is_ducking)`, where `is_ducking` says whether a ducking
+    envelope was actually recognized and normalized.
+
+    SFX tasks return `{"audio": {...}, "video": {...}}`; audio-ducking
+    returns `{"output_url": ..., "output_type": "audio" | "video"}` — one
+    artifact, never both. Normalizing here means _save_task_artifacts and
+    everything under it (extension, reuse check, atomic name reservation,
+    download, recovery wording) stays single-path.
+
+    A video output is the ONLY artifact of that task: the ducked audio is
+    inside the re-muxed mp4, so no audio slot is produced. The `is_ducking`
+    flag is what lets _save_task_artifacts allow that video-only case
+    WITHOUT weakening the audio requirement for SFX bodies (where a missing
+    audio slot means half a paid result went missing) — it is reported from
+    here, the one place that knows which envelope it saw, rather than
+    re-sniffed downstream.
+
+    Returns `(body, False)` when there is no usable `output_url`, or when
+    `output_type` is anything other than "audio" or "video" — every SFX
+    body, and any malformed ducking body, which is then held to the SFX
+    contract and falls through to _save_task_artifacts' missing-artifact
+    error, task_id and all. Never mutates the caller's dict.
+
+    output_type is matched STRICTLY (no defaulting to "audio"): a missing or
+    unrecognized type alongside a valid output_url would otherwise be
+    downloaded and written with a fabricated .wav extension and reported as a
+    success — a paid result silently mislabeled. Refusing it here routes the
+    body to the charged-and-recoverable error path instead, which hands the
+    caller the task_id and the get_sfx_task hint; the artifact is still on
+    the backend, so nothing is lost.
+    """
+    url = body.get("output_url")
+    if not isinstance(url, str) or not url:
+        return body, False
+    slot = body.get("output_type")
+    # isinstance first: a non-string (an unhashable list/dict from a backend
+    # bug) would make the membership test raise instead of falling through.
+    if not isinstance(slot, str) or slot not in _DUCKING_CONTENT_TYPES:
+        return body, False
+    normalized = dict(body)
+    normalized[slot] = {"url": url, "content_type": _DUCKING_CONTENT_TYPES[slot]}
+    return normalized, True
+
+
+def _has_artifact(slot: object) -> bool:
+    """Whether a task envelope's audio/video slot actually carries a URL."""
+    return isinstance(slot, dict) and bool(slot.get("url"))
+
+
 _ARTIFACT_DEST_MAX_ATTEMPTS = 10_000
 
 
@@ -856,8 +995,12 @@ async def _save_task_artifacts(
     """Turn a terminal /v1/tasks/{id} body into saved local files.
 
     failed -> raise with the backend's error code/message and whether the
-    charge was refunded. succeeded -> download audio (always present) and
-    video (video-to-sfx only), one TextContent per saved file.
+    charge was refunded. succeeded -> download whichever artifacts the task
+    produced — audio and/or video — one TextContent per saved file. An audio
+    artifact is required: an SFX task always has audio (plus video for
+    video-to-sfx). The sole exemption is an audio-ducking task with a video
+    voice input, whose only artifact is the re-muxed mp4 (see
+    _normalize_task_envelope, which reports whether it saw that envelope).
 
     task_id must be the caller's own known-good id (from _post_task_submit
     or the tool's own task_id argument), NOT derived from body — the
@@ -913,12 +1056,38 @@ async def _save_task_artifacts(
             f'get_sfx_task("{task_id}").'
         )
 
+    body, is_ducking = _normalize_task_envelope(body)
+
     audio = body.get("audio")
-    if not isinstance(audio, dict) or not audio.get("url"):
-        # The backend already succeeded and charged for this task — a
-        # missing/malformed audio envelope must still carry the task_id and
-        # the get_sfx_task recovery call, or a paid result becomes
-        # unrecoverable from the error message alone.
+    video = body.get("video")
+    # An audio artifact is required, with exactly one exemption: a ducking
+    # task whose voice input was a video renders a single artifact, the
+    # re-muxed mp4, and has no audio slot at all. The exemption is keyed off
+    # _normalize_task_envelope having recognized a ducking envelope — NOT off
+    # "some artifact is present". An SFX body is still held to the audio
+    # requirement even when it carries a video: a video-without-audio SFX
+    # result means the audio half of an already-charged generation went
+    # missing, and quietly downloading just the mp4 would report success
+    # while losing it, with no recovery hint. Raising here keeps the task_id
+    # and the get_sfx_task call in the user's hands, which is the only way a
+    # paid result stays recoverable from the error message alone.
+    if not _has_artifact(audio) and not (is_ducking and _has_artifact(video)):
+        # Distinguish an unrecognized-output_type ducking result from a genuine
+        # missing artifact. When there is a usable output_url but the
+        # output_type is not one _normalize_task_envelope handles, get_sfx_task
+        # would re-run the same normalization and produce this identical error
+        # forever — so instead of the (useless) recovery hint, surface the
+        # output_url and output_type so the user can fetch the paid result
+        # manually. The genuine no-artifact case (no usable output_url) keeps
+        # the original message unchanged.
+        url = body.get("output_url")
+        if isinstance(url, str) and url:
+            slot = body.get("output_type")
+            raise Exception(
+                f"Task succeeded but its output_type {slot!r} is not "
+                "recognized, so the result could not be saved automatically. "
+                f"Download it directly from: {url}. Task id: {task_id}."
+            )
         raise Exception(
             "Task succeeded but no audio artifact was returned. Task id: "
             f'{task_id} — call get_sfx_task("{task_id}") to check for the '
@@ -926,44 +1095,52 @@ async def _save_task_artifacts(
         )
 
     saved: list[TextContent] = []
-    try:
-        # Everything below — deriving the extension, checking for a
-        # reusable existing file, computing the destination path, and the
-        # actual download — must stay inside this wrap. The backend already
-        # succeeded and charged for this task by the time we get here, so
-        # ANY failure here must still carry the task_id and recovery hint.
-        # _download_artifact (and any other failure here, e.g. an OSError
-        # from _artifact_dest) states only the bare fact of the failure —
-        # this is the one layer that owns the single, complete recovery
-        # instruction, so it isn't repeated.
-        audio_ext = _ext_from_content_type(audio.get("content_type"))
-        existing = (
-            _existing_canonical_dest(
-                output_path, base_name, audio_ext, audio.get("file_size")
+    # Stays None for a video-only ducking result, where no audio artifact
+    # exists — the video block's failure message keys off this so it never
+    # claims an audio file was saved when none was.
+    audio_dest: Path | None = None
+    if _has_artifact(audio):
+        try:
+            # Everything below — deriving the extension, checking for a
+            # reusable existing file, computing the destination path, and the
+            # actual download — must stay inside this wrap. The backend already
+            # succeeded and charged for this task by the time we get here, so
+            # ANY failure here must still carry the task_id and recovery hint.
+            # _download_artifact (and any other failure here, e.g. an OSError
+            # from _artifact_dest) states only the bare fact of the failure —
+            # this is the one layer that owns the single, complete recovery
+            # instruction, so it isn't repeated.
+            audio_ext = _ext_from_content_type(audio.get("content_type"))
+            existing = (
+                _existing_canonical_dest(
+                    output_path, base_name, audio_ext, audio.get("file_size")
+                )
+                if reuse_existing
+                else None
             )
-            if reuse_existing
-            else None
-        )
-        if existing is None:
-            dest = _artifact_dest(output_path, base_name, audio_ext)
-            await _download_artifact(audio["url"], dest)
+            if existing is None:
+                dest = _artifact_dest(output_path, base_name, audio_ext)
+                await _download_artifact(audio["url"], dest)
+            else:
+                dest = existing
+        except Exception as e:
+            raise Exception(
+                f"{_end_sentence(e)} The result is still stored on the backend "
+                f'— call get_sfx_task("{task_id}") to retry.'
+            ) from e
+        if existing is not None:
+            saved.append(
+                TextContent(
+                    type="text", text=f"Already downloaded. File saved as: {dest}"
+                )
+            )
         else:
-            dest = existing
-    except Exception as e:
-        raise Exception(
-            f"{_end_sentence(e)} The result is still stored on the backend "
-            f'— call get_sfx_task("{task_id}") to retry.'
-        ) from e
-    if existing is not None:
-        saved.append(
-            TextContent(type="text", text=f"Already downloaded. File saved as: {dest}")
-        )
-    else:
-        saved.append(TextContent(type="text", text=f"Success. File saved as: {dest}"))
-    audio_dest = dest
+            saved.append(
+                TextContent(type="text", text=f"Success. File saved as: {dest}")
+            )
+        audio_dest = dest
 
-    video = body.get("video")
-    if isinstance(video, dict) and video.get("url"):
+    if _has_artifact(video):
         try:
             existing_video = (
                 _existing_canonical_dest(
@@ -978,10 +1155,15 @@ async def _save_task_artifacts(
             else:
                 dest = existing_video
         except Exception as e:
+            if audio_dest is not None:
+                raise Exception(
+                    f"{_end_sentence(e)} The audio file was already saved as: "
+                    f"{audio_dest}. The video is still stored on the backend — "
+                    f'call get_sfx_task("{task_id}") to retry the download.'
+                ) from e
             raise Exception(
-                f"{_end_sentence(e)} The audio file was already saved as: "
-                f"{audio_dest}. The video is still stored on the backend — "
-                f'call get_sfx_task("{task_id}") to retry the download.'
+                f"{_end_sentence(e)} The result is still stored on the backend "
+                f'— call get_sfx_task("{task_id}") to retry.'
             ) from e
         if existing_video is not None:
             saved.append(
@@ -1103,13 +1285,8 @@ async def video_to_music(
 
     if video_url:
         # Restrict to http(s) before the URL ever reaches the local ffprobe
-        # pre-check or the backend. Without this, a caller (e.g. via prompt
-        # injection) could pass file:// to probe local files, an internal
-        # address to trigger SSRF from this machine, or a "-"-prefixed value
-        # to inject ffprobe flags.
-        scheme = urlparse(video_url).scheme.lower()
-        if scheme not in ("http", "https"):
-            raise Exception("video_url must be an http:// or https:// URL")
+        # pre-check or the backend (see _require_http_url).
+        _require_http_url(video_url, "video")
 
     out_path = _make_output_path(output_directory)
     cfg = _get_config()
@@ -1123,24 +1300,14 @@ async def video_to_music(
         if size_mb > max_mb:
             # Cheap fail-fast: avoids a wasted ffprobe run for an
             # obviously-oversized file. NOT the authoritative check — see
-            # the read-time check below.
+            # _read_capped, which enforces the cap on the bytes actually read.
             raise Exception(
                 f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
             )
-        await _check_video_duration(str(resolved))
+        await _check_media_duration(str(resolved))
         data = {"prompt": prompt} if prompt else None
         mime, _ = mimetypes.guess_type(resolved.name)
-        # Authoritative check: the stat() above is now stale — an await on
-        # ffprobe sat between it and this read, during which the file could
-        # have been replaced or grown (a video export still writing, a sync
-        # tool, a concurrent process). Enforce the cap on the bytes actually
-        # read for upload, not on the earlier stat(). Reading at most
-        # max_bytes + 1 both closes that race and bounds memory use.
-        max_bytes = max_mb * 1024 * 1024
-        with open(resolved, "rb") as fh:
-            content = fh.read(max_bytes + 1)
-        if len(content) > max_bytes:
-            raise Exception(f"Video file is too large (> {max_mb} MB cap)")
+        content = _read_capped(resolved, max_mb, "Video")
         files = {"video": (resolved.name, content, mime or "application/octet-stream")}
         return await _post_streaming_generation(
             "/v1/video-to-music",
@@ -1150,7 +1317,7 @@ async def video_to_music(
         )
 
     # video_url path — backend expects multipart form, not JSON
-    await _check_video_duration(video_url)
+    await _check_media_duration(video_url)
     form: dict = {"video_url": video_url}
     if prompt:
         form["prompt"] = prompt
@@ -1255,9 +1422,7 @@ async def video_to_sfx(
     if video_url:
         # Same scheme guard as video_to_music: keeps file:// and flag-like
         # values away from ffprobe and the backend.
-        scheme = urlparse(video_url).scheme.lower()
-        if scheme not in ("http", "https"):
-            raise Exception("video_url must be an http:// or https:// URL")
+        _require_http_url(video_url, "video")
 
     out_path = _make_output_path(output_directory)
     cfg = _get_config()
@@ -1281,24 +1446,15 @@ async def video_to_sfx(
         if size_mb > max_mb:
             # Cheap fail-fast: avoids a wasted ffprobe run for an
             # obviously-oversized file. NOT the authoritative check — see
-            # the read-time check below.
+            # _read_capped, which enforces the cap on the bytes actually read.
             raise Exception(
                 f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
             )
-        await _check_video_duration(
+        await _check_media_duration(
             str(resolved), max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
         )
         mime, _ = mimetypes.guess_type(resolved.name)
-        # Authoritative check: the stat() above is now stale — an await on
-        # ffprobe sat between it and this read, during which the file could
-        # have been replaced or grown. Enforce the cap on the bytes actually
-        # read for upload, not on the earlier stat(). Reading at most
-        # max_bytes + 1 both closes that race and bounds memory use.
-        max_bytes = max_mb * 1024 * 1024
-        with open(resolved, "rb") as fh:
-            content = fh.read(max_bytes + 1)
-        if len(content) > max_bytes:
-            raise Exception(f"Video file is too large (> {max_mb} MB cap)")
+        content = _read_capped(resolved, max_mb, "Video")
         files = {
             "video": (
                 resolved.name, content, mime or "application/octet-stream"
@@ -1308,7 +1464,7 @@ async def video_to_sfx(
             "/v1/video-to-sfx", data=form or None, files=files
         )
     else:
-        await _check_video_duration(
+        await _check_media_duration(
             video_url, max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
         )
         form["video_url"] = video_url
@@ -1321,20 +1477,21 @@ async def video_to_sfx(
 
 @mcp.tool(
     description=(
-        "Check a sound-effects generation task and, if finished, download "
-        "its result file(s). Use this to recover a result when text_to_sfx "
-        "or video_to_sfx timed out — their error message contains the "
-        "task_id. Does not poll: a single status check per call. This tool "
-        "itself never charges.\n\n"
+        "Check a sound-effects or audio-ducking generation task and, if "
+        "finished, download its result file(s). Use this to recover a "
+        "result when text_to_sfx, video_to_sfx, or audio_ducking timed out "
+        "— their error message contains the task_id. Does not poll: a "
+        "single status check per call. This tool itself never charges.\n\n"
         "Args:\n"
         "    task_id (str): The task id returned in the timeout message.\n"
         "    output_directory (str, optional): Where to save result files. "
         "Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Returns:\n"
         "    Still processing -> a status message; try again later. "
-        "Succeeded -> the saved file path(s) (audio, plus video for "
-        "video_to_sfx tasks). Failed -> an error including whether the "
-        "charge was refunded."
+        "Succeeded -> the saved file path(s): audio, plus video for "
+        "video_to_sfx tasks; a single .wav or .mp4 for audio_ducking "
+        "tasks. Failed -> an error including whether the charge was "
+        "refunded."
     )
 )
 async def get_sfx_task(
@@ -1345,10 +1502,11 @@ async def get_sfx_task(
         body = await _http_get_json(f"/v1/tasks/{task_id}")
     except Exception as e:
         if _is_task_not_found(e):
-            # A 404 for a bad/typo'd id, or a music task's id — /v1/tasks
-            # is SFX-only and 404s those. Retrying can never help, so raise
-            # the original error as-is with no "call get_sfx_task again"
-            # advice attached.
+            # A 404 for a bad/typo'd id, or for an id /v1/tasks does not
+            # serve — it serves SFX and audio-ducking tasks, so a streaming
+            # (e.g. music) generation's id 404s here. Retrying can never
+            # help, so raise the original error as-is with no "call
+            # get_sfx_task again" advice attached.
             raise
         if _is_transient_error(e):
             # Structurally identical to _poll_task's GET — a transient
@@ -1384,6 +1542,154 @@ async def get_sfx_task(
     return await _save_task_artifacts(
         body, out_path, f"sfx-{task_id[:8]}", task_id, reuse_existing=True
     )
+
+
+# ---------- Tools: audio ducking ----------
+
+
+def _require_exactly_one(path: str | None, url: str | None, label: str) -> None:
+    """Exactly-one-of check for a ducking input pair.
+
+    Called for BOTH inputs before any I/O, mirroring the backend's
+    _validate_presence: a missing music input must be reported even when the
+    voice input is what would have failed to resolve.
+    """
+    if path and url:
+        raise Exception(
+            f"Provide either {label}_path or {label}_url (exactly one, not both)"
+        )
+    if not path and not url:
+        raise Exception(f"Provide either {label}_path or {label}_url")
+
+
+@mcp.tool(
+    description=(
+        "Duck a music bed under a voice track: Sonilo lowers the music "
+        "wherever the voice is speaking and lifts it back in the gaps, then "
+        "returns the mixed result. The voice input may be a video — its "
+        "audio track is used as the voice, and the ducked mix is muxed back "
+        "into a new video.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges. Only use when explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    voice_path (str, optional): Absolute local path, or relative to "
+        "SONILO_MCP_BASE_PATH. Audio (.wav/.mp3/.m4a/.aac/.ogg/.flac) or "
+        "video (.mp4/.mov/.avi/.wmv/.webm/.mkv).\n"
+        "    voice_url (str, optional): HTTPS URL to the voice audio/video.\n"
+        "    music_path (str, optional): Absolute local path, or relative to "
+        "SONILO_MCP_BASE_PATH. Audio only.\n"
+        "    music_url (str, optional): HTTPS URL to the music audio.\n"
+        "    output_directory (str, optional): Where to save the result. "
+        "Defaults to SONILO_MCP_BASE_PATH.\n\n"
+        "Exactly one of voice_path/voice_url, and exactly one of "
+        "music_path/music_url, must be provided. A local file and a URL may "
+        "be mixed across the two inputs. Each input is capped at 360 seconds "
+        "(6 minutes) and by the account's upload-size limit (typically "
+        "300 MB).\n\n"
+        "Returns:\n"
+        "    TextContent with the absolute path of the saved file: a .wav, "
+        "or a .mp4 when the voice input was a video. If the call times out, "
+        "the error message includes the task_id — recover the result later "
+        "with get_sfx_task."
+    )
+)
+async def audio_ducking(
+    voice_path: str | None = None,
+    voice_url: str | None = None,
+    music_path: str | None = None,
+    music_url: str | None = None,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    # Both pairs are validated before any I/O — see _require_exactly_one.
+    _require_exactly_one(voice_path, voice_url, "voice")
+    _require_exactly_one(music_path, music_url, "music")
+    if voice_url:
+        _require_http_url(voice_url, "voice")
+    if music_url:
+        _require_http_url(music_url, "music")
+
+    out_path = _make_output_path(output_directory)
+    cfg = _get_config()
+
+    # Resolve local inputs (existence + extension + base-path confinement)
+    # before anything hits the network: a bad path is a caller error and
+    # should not cost an /v1/account/services round trip.
+    #
+    # A voice input may be audio OR video: the backend extracts a video's
+    # audio track and re-muxes the ducked result back into it. Music is audio
+    # only — the backend never probes it for a video stream, so a video there
+    # would be silently mishandled.
+    voice_file = (
+        _resolve_input_file(
+            voice_path,
+            cfg["base_path"],
+            _AUDIO_EXTS | _VIDEO_EXTS,
+            "audio or video",
+        )
+        if voice_path
+        else None
+    )
+    music_file = (
+        _resolve_input_file(music_path, cfg["base_path"], _AUDIO_EXTS, "audio")
+        if music_path
+        else None
+    )
+
+    data: dict = {}
+    files: dict = {}
+    max_mb = await _get_max_upload_size_mb() if (voice_file or music_file) else 0
+
+    if voice_file is not None:
+        size_mb = voice_file.stat().st_size / (1024 * 1024)
+        if size_mb > max_mb:
+            # Cheap fail-fast before a wasted ffprobe run. NOT authoritative —
+            # see _read_capped.
+            raise Exception(
+                f"Voice file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
+            )
+        await _check_media_duration(
+            str(voice_file), max_seconds=_DUCKING_MAX_DURATION_SECONDS
+        )
+        mime, _ = mimetypes.guess_type(voice_file.name)
+        files["voice_file"] = (
+            voice_file.name,
+            _read_capped(voice_file, max_mb, "Voice"),
+            mime or "application/octet-stream",
+        )
+    else:
+        await _check_media_duration(
+            voice_url, max_seconds=_DUCKING_MAX_DURATION_SECONDS
+        )
+        data["voice_url"] = voice_url
+
+    if music_file is not None:
+        size_mb = music_file.stat().st_size / (1024 * 1024)
+        if size_mb > max_mb:
+            raise Exception(
+                f"Music file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
+            )
+        await _check_media_duration(
+            str(music_file), max_seconds=_DUCKING_MAX_DURATION_SECONDS
+        )
+        mime, _ = mimetypes.guess_type(music_file.name)
+        files["music_file"] = (
+            music_file.name,
+            _read_capped(music_file, max_mb, "Music"),
+            mime or "application/octet-stream",
+        )
+    else:
+        await _check_media_duration(
+            music_url, max_seconds=_DUCKING_MAX_DURATION_SECONDS
+        )
+        data["music_url"] = music_url
+
+    # Everything below this line can charge the user: no validation past here.
+    task_id = await _post_task_submit(
+        "/v1/audio-ducking", data=data or None, files=files or None
+    )
+    body = await _poll_task(task_id, cfg["timeout"])
+    base = _ducking_base_name(voice_path, voice_url, task_id)
+    return await _save_task_artifacts(body, out_path, base, task_id)
 
 
 # ---------- Tools: account ----------

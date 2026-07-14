@@ -237,6 +237,7 @@ def _resolve_input_file(
 # fast and skip a wasted upload. Keep in sync with the backend's limit.
 _MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — music endpoints
 _SFX_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sfx
+_DUCKING_MAX_DURATION_SECONDS = 360  # 6 minutes — /v1/audio-ducking, per input
 
 
 async def _check_media_duration(
@@ -1487,6 +1488,181 @@ async def get_sfx_task(
     return await _save_task_artifacts(
         body, out_path, f"sfx-{task_id[:8]}", task_id, reuse_existing=True
     )
+
+
+# ---------- Tools: audio ducking ----------
+
+
+def _require_exactly_one(path: str | None, url: str | None, label: str) -> None:
+    """Exactly-one-of check for a ducking input pair.
+
+    Called for BOTH inputs before any I/O, mirroring the backend's
+    _validate_presence: a missing music input must be reported even when the
+    voice input is what would have failed to resolve.
+    """
+    if path and url:
+        raise Exception(
+            f"Provide either {label}_path or {label}_url (exactly one, not both)"
+        )
+    if not path and not url:
+        raise Exception(f"Provide either {label}_path or {label}_url")
+
+
+def _require_http_url(url: str, label: str) -> None:
+    """Restrict a caller-supplied URL to http(s) before it reaches ffprobe or
+    the backend — keeps file:// (local file disclosure), internal addresses
+    (SSRF from this machine), and "-"-prefixed values (ffprobe flag injection)
+    out. Same guard as video_to_music.
+    """
+    if urlparse(url).scheme.lower() not in ("http", "https"):
+        raise Exception(f"{label}_url must be an http:// or https:// URL")
+
+
+def _read_capped(path: Path, max_mb: int, label: str) -> bytes:
+    """Read a file for upload, enforcing the account's size cap on the bytes
+    actually read.
+
+    An earlier stat() is stale by the time we get here (an await on ffprobe
+    sat in between, during which the file could have been replaced or grown —
+    a still-writing export, a sync tool). Reading at most max_bytes + 1 both
+    closes that race and bounds memory use.
+    """
+    max_bytes = max_mb * 1024 * 1024
+    with open(path, "rb") as fh:
+        content = fh.read(max_bytes + 1)
+    if len(content) > max_bytes:
+        raise Exception(f"{label} file is too large (> {max_mb} MB cap)")
+    return content
+
+
+@mcp.tool(
+    description=(
+        "Duck a music bed under a voice track: Sonilo lowers the music "
+        "wherever the voice is speaking and lifts it back in the gaps, then "
+        "returns the mixed result. The voice input may be a video — its "
+        "audio track is used as the voice, and the ducked mix is muxed back "
+        "into a new video.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges. Only use when explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    voice_path (str, optional): Absolute local path, or relative to "
+        "SONILO_MCP_BASE_PATH. Audio (.wav/.mp3/.m4a/.aac/.ogg/.flac) or "
+        "video (.mp4/.mov/.avi/.wmv/.webm/.mkv).\n"
+        "    voice_url (str, optional): HTTPS URL to the voice audio/video.\n"
+        "    music_path (str, optional): Absolute local path, or relative to "
+        "SONILO_MCP_BASE_PATH. Audio only.\n"
+        "    music_url (str, optional): HTTPS URL to the music audio.\n"
+        "    output_directory (str, optional): Where to save the result. "
+        "Defaults to SONILO_MCP_BASE_PATH.\n\n"
+        "Exactly one of voice_path/voice_url, and exactly one of "
+        "music_path/music_url, must be provided. A local file and a URL may "
+        "be mixed across the two inputs. Each input is capped at 360 seconds "
+        "(6 minutes) and by the account's upload-size limit (typically "
+        "300 MB).\n\n"
+        "Returns:\n"
+        "    TextContent with the absolute path of the saved file: a .wav, "
+        "or a .mp4 when the voice input was a video. If the call times out, "
+        "the error message includes the task_id — recover the result later "
+        "with get_sfx_task."
+    )
+)
+async def audio_ducking(
+    voice_path: str | None = None,
+    voice_url: str | None = None,
+    music_path: str | None = None,
+    music_url: str | None = None,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    # Both pairs are validated before any I/O — see _require_exactly_one.
+    _require_exactly_one(voice_path, voice_url, "voice")
+    _require_exactly_one(music_path, music_url, "music")
+    if voice_url:
+        _require_http_url(voice_url, "voice")
+    if music_url:
+        _require_http_url(music_url, "music")
+
+    out_path = _make_output_path(output_directory)
+    cfg = _get_config()
+
+    # Resolve local inputs (existence + extension + base-path confinement)
+    # before anything hits the network: a bad path is a caller error and
+    # should not cost an /v1/account/services round trip.
+    #
+    # A voice input may be audio OR video: the backend extracts a video's
+    # audio track and re-muxes the ducked result back into it. Music is audio
+    # only — the backend never probes it for a video stream, so a video there
+    # would be silently mishandled.
+    voice_file = (
+        _resolve_input_file(
+            voice_path,
+            cfg["base_path"],
+            _AUDIO_EXTS | _VIDEO_EXTS,
+            "audio or video",
+        )
+        if voice_path
+        else None
+    )
+    music_file = (
+        _resolve_input_file(music_path, cfg["base_path"], _AUDIO_EXTS, "audio")
+        if music_path
+        else None
+    )
+
+    data: dict = {}
+    files: dict = {}
+    max_mb = await _get_max_upload_size_mb() if (voice_file or music_file) else 0
+
+    if voice_file is not None:
+        size_mb = voice_file.stat().st_size / (1024 * 1024)
+        if size_mb > max_mb:
+            # Cheap fail-fast before a wasted ffprobe run. NOT authoritative —
+            # see _read_capped.
+            raise Exception(
+                f"Voice file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
+            )
+        await _check_media_duration(
+            str(voice_file), max_seconds=_DUCKING_MAX_DURATION_SECONDS
+        )
+        mime, _ = mimetypes.guess_type(voice_file.name)
+        files["voice_file"] = (
+            voice_file.name,
+            _read_capped(voice_file, max_mb, "Voice"),
+            mime or "application/octet-stream",
+        )
+    else:
+        await _check_media_duration(
+            voice_url, max_seconds=_DUCKING_MAX_DURATION_SECONDS
+        )
+        data["voice_url"] = voice_url
+
+    if music_file is not None:
+        size_mb = music_file.stat().st_size / (1024 * 1024)
+        if size_mb > max_mb:
+            raise Exception(
+                f"Music file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
+            )
+        await _check_media_duration(
+            str(music_file), max_seconds=_DUCKING_MAX_DURATION_SECONDS
+        )
+        mime, _ = mimetypes.guess_type(music_file.name)
+        files["music_file"] = (
+            music_file.name,
+            _read_capped(music_file, max_mb, "Music"),
+            mime or "application/octet-stream",
+        )
+    else:
+        await _check_media_duration(
+            music_url, max_seconds=_DUCKING_MAX_DURATION_SECONDS
+        )
+        data["music_url"] = music_url
+
+    # Everything below this line can charge the user: no validation past here.
+    task_id = await _post_task_submit(
+        "/v1/audio-ducking", data=data or None, files=files or None
+    )
+    body = await _poll_task(task_id, cfg["timeout"])
+    base = _ducking_base_name(voice_path, voice_url, task_id)
+    return await _save_task_artifacts(body, out_path, base, task_id)
 
 
 # ---------- Tools: account ----------

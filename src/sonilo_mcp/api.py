@@ -213,13 +213,17 @@ _MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — music endpoints
 _SFX_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sfx
 
 
-async def _check_video_duration(
+async def _check_media_duration(
     source: str, max_seconds: int = _MAX_VIDEO_DURATION_SECONDS
 ) -> None:
-    """Best-effort local ffprobe pre-check of a video's duration.
+    """Best-effort local ffprobe pre-check of a media file's duration.
+
+    Reads `format.duration`, which ffprobe reports for audio files as well
+    as videos — so this serves the video endpoints and the audio-ducking
+    endpoint alike.
 
     Raises if the duration is known to exceed `max_seconds`, so the caller
-    fails fast instead of uploading a video the backend will reject.
+    fails fast instead of uploading media the backend will reject.
     `source` may be a local path or a URL (ffprobe handles both).
 
     The check is best-effort: if ffprobe is not installed, times out, or
@@ -1127,7 +1131,7 @@ async def video_to_music(
             raise Exception(
                 f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
             )
-        await _check_video_duration(str(resolved))
+        await _check_media_duration(str(resolved))
         data = {"prompt": prompt} if prompt else None
         mime, _ = mimetypes.guess_type(resolved.name)
         # Authoritative check: the stat() above is now stale — an await on
@@ -1150,7 +1154,7 @@ async def video_to_music(
         )
 
     # video_url path — backend expects multipart form, not JSON
-    await _check_video_duration(video_url)
+    await _check_media_duration(video_url)
     form: dict = {"video_url": video_url}
     if prompt:
         form["prompt"] = prompt
@@ -1285,7 +1289,7 @@ async def video_to_sfx(
             raise Exception(
                 f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
             )
-        await _check_video_duration(
+        await _check_media_duration(
             str(resolved), max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
         )
         mime, _ = mimetypes.guess_type(resolved.name)
@@ -1308,7 +1312,7 @@ async def video_to_sfx(
             "/v1/video-to-sfx", data=form or None, files=files
         )
     else:
-        await _check_video_duration(
+        await _check_media_duration(
             video_url, max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
         )
         form["video_url"] = video_url

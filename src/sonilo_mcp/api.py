@@ -1397,20 +1397,21 @@ async def video_to_sfx(
 
 @mcp.tool(
     description=(
-        "Check a sound-effects generation task and, if finished, download "
-        "its result file(s). Use this to recover a result when text_to_sfx "
-        "or video_to_sfx timed out — their error message contains the "
-        "task_id. Does not poll: a single status check per call. This tool "
-        "itself never charges.\n\n"
+        "Check a sound-effects or audio-ducking generation task and, if "
+        "finished, download its result file(s). Use this to recover a "
+        "result when text_to_sfx, video_to_sfx, or audio_ducking timed out "
+        "— their error message contains the task_id. Does not poll: a "
+        "single status check per call. This tool itself never charges.\n\n"
         "Args:\n"
         "    task_id (str): The task id returned in the timeout message.\n"
         "    output_directory (str, optional): Where to save result files. "
         "Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Returns:\n"
         "    Still processing -> a status message; try again later. "
-        "Succeeded -> the saved file path(s) (audio, plus video for "
-        "video_to_sfx tasks). Failed -> an error including whether the "
-        "charge was refunded."
+        "Succeeded -> the saved file path(s): audio, plus video for "
+        "video_to_sfx tasks; a single .wav or .mp4 for audio_ducking "
+        "tasks. Failed -> an error including whether the charge was "
+        "refunded."
     )
 )
 async def get_sfx_task(

@@ -3030,3 +3030,28 @@ async def test_get_sfx_task_video_task_reuse_returns_both_paths(monkeypatch, out
     assert audio_route.call_count == 1
     assert video_route.call_count == 1
     assert sum("already downloaded" in c.text.lower() for c in second) == 2
+
+
+@respx.mock
+async def test_get_sfx_task_recovers_ducking_task(monkeypatch, output_dir):
+    # Regression: /v1/tasks serves SFX *and* audio-ducking tasks (the
+    # backend's POLLABLE_TASK_TYPES covers both), but get_sfx_task used to
+    # fetch a valid ducking body and then fail with "no audio artifact was
+    # returned". It must download the result instead.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/d-99").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "d-99", "type": "audio_ducking", "status": "succeeded",
+            "output_url": "https://r2.test/ducked.wav",
+            "output_type": "audio",
+        })
+    )
+    respx.get("https://r2.test/ducked.wav").mock(
+        return_value=httpx.Response(200, content=b"ducked-bytes")
+    )
+    from sonilo_mcp.api import get_sfx_task
+    result = await get_sfx_task("d-99")
+    saved = output_dir / "sfx-d-99.wav"
+    assert saved.read_bytes() == b"ducked-bytes"
+    assert str(saved) in result[0].text

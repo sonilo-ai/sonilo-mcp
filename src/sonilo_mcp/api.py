@@ -305,7 +305,11 @@ async def _check_media_duration(
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except (asyncio.TimeoutError, OSError):
+    except (asyncio.TimeoutError, OSError, ValueError):
+        # ValueError: create_subprocess_exec rejects a source containing an
+        # embedded NUL byte (or similar odd chars) before spawning. This
+        # helper is best-effort, so fail open and let the backend decide
+        # rather than crash the whole request with a raw traceback.
         return  # fail open — let the backend decide
     if proc.returncode != 0:
         return
@@ -1068,6 +1072,22 @@ async def _save_task_artifacts(
     # and the get_sfx_task call in the user's hands, which is the only way a
     # paid result stays recoverable from the error message alone.
     if not _has_artifact(audio) and not (is_ducking and _has_artifact(video)):
+        # Distinguish an unrecognized-output_type ducking result from a genuine
+        # missing artifact. When there is a usable output_url but the
+        # output_type is not one _normalize_task_envelope handles, get_sfx_task
+        # would re-run the same normalization and produce this identical error
+        # forever — so instead of the (useless) recovery hint, surface the
+        # output_url and output_type so the user can fetch the paid result
+        # manually. The genuine no-artifact case (no usable output_url) keeps
+        # the original message unchanged.
+        url = body.get("output_url")
+        if isinstance(url, str) and url:
+            slot = body.get("output_type")
+            raise Exception(
+                f"Task succeeded but its output_type {slot!r} is not "
+                "recognized, so the result could not be saved automatically. "
+                f"Download it directly from: {url}. Task id: {task_id}."
+            )
         raise Exception(
             "Task succeeded but no audio artifact was returned. Task id: "
             f'{task_id} — call get_sfx_task("{task_id}") to check for the '

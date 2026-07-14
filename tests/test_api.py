@@ -1186,6 +1186,19 @@ async def test_check_media_duration_fails_open_on_probe_error(monkeypatch):
     await _check_media_duration("/tmp/clip.mp4")  # must not raise
 
 
+async def test_check_media_duration_fails_open_on_nul_byte_source(monkeypatch):
+    # A source containing an embedded NUL byte makes the REAL
+    # create_subprocess_exec raise ValueError("embedded null byte") before it
+    # spawns. This best-effort helper must fail open (stay silent) rather than
+    # let that ValueError crash the whole request.
+    from sonilo_mcp import api
+    from sonilo_mcp.api import _check_media_duration
+    # ffprobe "installed" so we don't short-circuit; use the real subprocess
+    # launcher (not the fake) so the NUL byte actually triggers the ValueError.
+    monkeypatch.setattr(api.shutil, "which", lambda name: "/usr/bin/ffprobe")
+    await _check_media_duration("https://e.com/a\x00.mp4")  # must not raise
+
+
 async def test_check_media_duration_sfx_cap_rejects_200s(monkeypatch):
     from sonilo_mcp.api import _check_media_duration, _SFX_MAX_VIDEO_DURATION_SECONDS
     _patch_ffprobe(monkeypatch, duration=200.0)
@@ -2007,9 +2020,12 @@ async def test_save_task_artifacts_unknown_output_type_raises_recoverable(
     with pytest.raises(Exception) as exc:
         await _save_task_artifacts(body, tmp_path, "interview-ducked", "d-7")
     msg = str(exc.value)
-    assert "no audio artifact" in msg
+    # get_sfx_task would re-run the same normalization and loop forever on this
+    # body, so the message must instead surface the output_url + output_type so
+    # the paid result can be fetched manually — while still carrying the task_id.
+    assert "https://r2.test/ducked.bin" in msg
+    assert "waveform" in msg
     assert "d-7" in msg
-    assert "get_sfx_task" in msg
     assert download.call_count == 0
     assert list(tmp_path.iterdir()) == []
 
@@ -3483,4 +3499,139 @@ async def test_audio_ducking_size_cap_enforced_on_actual_bytes(
             voice_path=str(voice), music_url="https://cdn.test/bed.mp3"
         )
     # Must NOT charge — the oversized bytes must never be uploaded.
+    assert submit.call_count == 0
+
+
+@respx.mock
+async def test_audio_ducking_rejects_too_long_voice_url_before_post(
+    monkeypatch, output_dir, tmp_path
+):
+    # URL-input mirror of the file-input over-long guard: an over-long
+    # voice_url must be caught by the ffprobe pre-check BEFORE the POST that
+    # charges. Without this, a future refactor could drop the URL-branch check
+    # and silently bill the user for an over-long URL input.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    submit = respx.post("https://api.test.local/v1/audio-ducking").mock(
+        return_value=httpx.Response(202, json={"task_id": "nope"})
+    )
+    # Only the voice URL is over-long (music well within the cap), so the
+    # rejection is unambiguously the voice-URL check.
+    _patch_ffprobe_per_source(monkeypatch, {"podcast": 420.0}, default=30.0)
+    from sonilo_mcp.api import _reset_services_cache, audio_ducking
+    _reset_services_cache()
+    with pytest.raises(Exception, match="exceeds the maximum"):
+        await audio_ducking(
+            voice_url="https://cdn.test/podcast.wav",
+            music_url="https://cdn.test/bed.mp3",
+        )
+    assert submit.call_count == 0
+
+
+@respx.mock
+async def test_audio_ducking_rejects_too_long_music_url_before_post(
+    monkeypatch, output_dir, tmp_path
+):
+    # Same as above for the music_url input: its own 360s cap must be enforced
+    # before the charge even when the voice URL is well within the limit.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    submit = respx.post("https://api.test.local/v1/audio-ducking").mock(
+        return_value=httpx.Response(202, json={"task_id": "nope"})
+    )
+    # Only the music URL is over-long — pins the music-URL check independently.
+    _patch_ffprobe_per_source(monkeypatch, {"bed": 420.0}, default=30.0)
+    from sonilo_mcp.api import _reset_services_cache, audio_ducking
+    _reset_services_cache()
+    with pytest.raises(Exception, match="exceeds the maximum"):
+        await audio_ducking(
+            voice_url="https://cdn.test/podcast.wav",
+            music_url="https://cdn.test/bed.mp3",
+        )
+    assert submit.call_count == 0
+
+
+@respx.mock
+async def test_audio_ducking_stat_fail_fast_rejects_oversized_voice(
+    monkeypatch, output_dir, tmp_path
+):
+    # Pins the stat() fail-fast guard INDEPENDENTLY of _read_capped: stat sees
+    # an oversized file, but by the time the bytes are read the file is small,
+    # so only the fail-fast stat check can catch it. If that guard were deleted,
+    # _read_capped would read the (now small) bytes and let the charge through.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    voice = tmp_path / "voice.wav"
+    voice.write_bytes(b"x" * (2 * 1024 * 1024))
+
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={"max_upload_size_mb": 1})
+    )
+    api._reset_services_cache()
+
+    real_check = api._check_media_duration
+
+    async def shrinking_check(source, **kwargs):
+        # The file shrinks to a handful of bytes while the caller awaits the
+        # pre-check — after stat() has already seen it oversized.
+        if "voice.wav" in source:
+            voice.write_bytes(b"y" * 16)
+        return await real_check(source, **kwargs)
+
+    _patch_ffprobe(monkeypatch, duration=30.0)
+    monkeypatch.setattr(api, "_check_media_duration", shrinking_check)
+
+    submit = respx.post("https://api.test.local/v1/audio-ducking").mock(
+        return_value=httpx.Response(202, json={"task_id": "nope"})
+    )
+
+    with pytest.raises(Exception, match="Voice file is too large"):
+        await api.audio_ducking(
+            voice_path=str(voice), music_url="https://cdn.test/bed.mp3"
+        )
+    assert submit.call_count == 0
+
+
+@respx.mock
+async def test_audio_ducking_stat_fail_fast_rejects_oversized_music(
+    monkeypatch, output_dir, tmp_path
+):
+    # Music-side mirror of the stat() fail-fast guard: stat sees the music file
+    # oversized, but it shrinks before its bytes are read — only the fail-fast
+    # stat check can catch it.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    music = tmp_path / "bed.mp3"
+    music.write_bytes(b"x" * (2 * 1024 * 1024))
+
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={"max_upload_size_mb": 1})
+    )
+    api._reset_services_cache()
+
+    real_check = api._check_media_duration
+
+    async def shrinking_check(source, **kwargs):
+        # Shrink ONLY the music file, and only when its own pre-check runs (the
+        # voice pre-check runs first with a different source). This keeps the
+        # music file oversized at the moment its stat() guard runs.
+        if "bed.mp3" in source:
+            music.write_bytes(b"y" * 16)
+        return await real_check(source, **kwargs)
+
+    _patch_ffprobe(monkeypatch, duration=30.0)
+    monkeypatch.setattr(api, "_check_media_duration", shrinking_check)
+
+    submit = respx.post("https://api.test.local/v1/audio-ducking").mock(
+        return_value=httpx.Response(202, json={"task_id": "nope"})
+    )
+
+    with pytest.raises(Exception, match="Music file is too large"):
+        await api.audio_ducking(
+            voice_url="https://cdn.test/podcast.wav", music_path=str(music)
+        )
     assert submit.call_count == 0

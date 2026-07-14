@@ -1894,7 +1894,8 @@ async def test_normalize_task_envelope_audio_output():
         "task_id": "d-1", "status": "succeeded", "type": "audio_ducking",
         "output_url": "https://r2.test/ducked.wav", "output_type": "audio",
     }
-    out = _normalize_task_envelope(body)
+    out, is_ducking = _normalize_task_envelope(body)
+    assert is_ducking is True
     assert out["audio"] == {
         "url": "https://r2.test/ducked.wav", "content_type": "audio/wav"
     }
@@ -1913,7 +1914,9 @@ async def test_normalize_task_envelope_video_output():
         "task_id": "d-2", "status": "succeeded", "type": "audio_ducking",
         "output_url": "https://r2.test/ducked.mp4", "output_type": "video",
     }
-    out = _normalize_task_envelope(body)
+    out, is_ducking = _normalize_task_envelope(body)
+    # The flag is what earns this envelope its no-audio exemption downstream.
+    assert is_ducking is True
     assert out["video"] == {
         "url": "https://r2.test/ducked.mp4", "content_type": "video/mp4"
     }
@@ -1926,7 +1929,9 @@ def test_normalize_task_envelope_passes_sfx_body_through():
         "status": "succeeded",
         "audio": {"url": "https://r2.test/a.m4a", "content_type": "audio/mp4"},
     }
-    assert _normalize_task_envelope(body) == body
+    # is_ducking is False, which is what holds SFX bodies to the audio
+    # requirement in _save_task_artifacts.
+    assert _normalize_task_envelope(body) == (body, False)
 
 
 @respx.mock
@@ -1981,6 +1986,64 @@ async def test_save_task_artifacts_no_artifacts_still_raises(monkeypatch, tmp_pa
     assert "no audio artifact" in msg
     assert "d-5" in msg
     assert "get_sfx_task" in msg
+
+
+@respx.mock
+async def test_save_task_artifacts_sfx_video_without_audio_still_raises(
+    monkeypatch, tmp_path
+):
+    # An SFX-shaped body is NOT a ducking envelope: it must always carry an
+    # audio artifact. A video-only SFX body means the audio half of a paid
+    # result went missing — downloading just the mp4 and reporting success
+    # would silently lose it, so this still raises the charged-and-
+    # recoverable error. (The video-only exemption belongs to ducking alone.)
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    route = respx.get("https://r2.test/orphan.mp4").mock(
+        return_value=httpx.Response(200, content=b"mp4-bytes")
+    )
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "t-orphan", "status": "succeeded",
+        "video": {"url": "https://r2.test/orphan.mp4", "content_type": "video/mp4"},
+    }
+    with pytest.raises(Exception) as exc:
+        await _save_task_artifacts(body, tmp_path, "scene", "t-orphan")
+    msg = str(exc.value)
+    assert "no audio artifact was returned" in msg
+    assert "t-orphan" in msg
+    assert 'get_sfx_task("t-orphan")' in msg
+    # Nothing was downloaded or written: the guard fires before any artifact
+    # work, so the user isn't handed a half-result presented as success.
+    assert route.call_count == 0
+    assert list(tmp_path.iterdir()) == []
+
+
+@respx.mock
+async def test_save_task_artifacts_ducking_video_only_download_failure(
+    monkeypatch, tmp_path
+):
+    # A video-only ducking result whose single artifact fails to download.
+    # There is no audio_dest, so the message must NOT claim an audio file was
+    # saved — it must be the plain charged-and-recoverable wording, carrying
+    # the task_id and the get_sfx_task retry call.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/ducked-fail.mp4").mock(
+        return_value=httpx.Response(500, text="boom")
+    )
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "d-7", "status": "succeeded",
+        "output_url": "https://r2.test/ducked-fail.mp4", "output_type": "video",
+    }
+    with pytest.raises(Exception) as exc:
+        await _save_task_artifacts(body, tmp_path, "interview-ducked", "d-7")
+    msg = str(exc.value)
+    assert "d-7" in msg
+    assert 'get_sfx_task("d-7")' in msg
+    assert "The audio file was already saved" not in msg
+    # The reserved-but-unpopulated file is cleaned up, so a retry lands on the
+    # canonical path rather than an orphaning -1 suffix.
+    assert list(tmp_path.iterdir()) == []
 
 
 @respx.mock

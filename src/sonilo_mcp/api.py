@@ -740,8 +740,11 @@ def _ext_from_content_type(content_type: str | None) -> str:
 _DUCKING_CONTENT_TYPES = {"audio": "audio/wav", "video": "video/mp4"}
 
 
-def _normalize_task_envelope(body: dict) -> dict:
+def _normalize_task_envelope(body: dict) -> tuple[dict, bool]:
     """Rewrite audio-ducking's flat success envelope into the SFX shape.
+
+    Returns `(body, is_ducking)`, where `is_ducking` says whether a ducking
+    envelope was actually recognized and normalized.
 
     SFX tasks return `{"audio": {...}, "video": {...}}`; audio-ducking
     returns `{"output_url": ..., "output_type": "audio" | "video"}` — one
@@ -750,23 +753,26 @@ def _normalize_task_envelope(body: dict) -> dict:
     download, recovery wording) stays single-path.
 
     A video output is the ONLY artifact of that task: the ducked audio is
-    inside the re-muxed mp4, so no audio slot is produced — see
-    _save_task_artifacts, which requires at least one artifact rather than
-    an audio one specifically.
+    inside the re-muxed mp4, so no audio slot is produced. The `is_ducking`
+    flag is what lets _save_task_artifacts allow that video-only case
+    WITHOUT weakening the audio requirement for SFX bodies (where a missing
+    audio slot means half a paid result went missing) — it is reported from
+    here, the one place that knows which envelope it saw, rather than
+    re-sniffed downstream.
 
-    Returns `body` unchanged when there is no usable `output_url` (every
-    SFX body, and any malformed ducking body — which then falls through to
-    _save_task_artifacts' missing-artifact error, task_id and all). Never
-    mutates the caller's dict.
+    Returns `(body, False)` when there is no usable `output_url` — every SFX
+    body, and any malformed ducking body, which is then held to the SFX
+    contract and falls through to _save_task_artifacts' missing-artifact
+    error, task_id and all. Never mutates the caller's dict.
     """
     url = body.get("output_url")
     if not isinstance(url, str) or not url:
-        return body
+        return body, False
     output_type = body.get("output_type")
     slot = "video" if output_type == "video" else "audio"
     normalized = dict(body)
     normalized[slot] = {"url": url, "content_type": _DUCKING_CONTENT_TYPES[slot]}
-    return normalized
+    return normalized, True
 
 
 _ARTIFACT_DEST_MAX_ATTEMPTS = 10_000
@@ -897,10 +903,11 @@ async def _save_task_artifacts(
 
     failed -> raise with the backend's error code/message and whether the
     charge was refunded. succeeded -> download whichever artifacts the task
-    produced — audio and/or video — one TextContent per saved file. At least
-    one artifact is required; an SFX task always has audio (plus video for
-    video-to-sfx), while an audio-ducking task with a video voice input has
-    only the re-muxed mp4 (see _normalize_task_envelope).
+    produced — audio and/or video — one TextContent per saved file. An audio
+    artifact is required: an SFX task always has audio (plus video for
+    video-to-sfx). The sole exemption is an audio-ducking task with a video
+    voice input, whose only artifact is the re-muxed mp4 (see
+    _normalize_task_envelope, which reports whether it saw that envelope).
 
     task_id must be the caller's own known-good id (from _post_task_submit
     or the tool's own task_id argument), NOT derived from body — the
@@ -956,20 +963,25 @@ async def _save_task_artifacts(
             f'get_sfx_task("{task_id}").'
         )
 
-    body = _normalize_task_envelope(body)
+    body, is_ducking = _normalize_task_envelope(body)
 
     def _has_artifact(slot: object) -> bool:
         return isinstance(slot, dict) and bool(slot.get("url"))
 
     audio = body.get("audio")
     video = body.get("video")
-    if not _has_artifact(audio) and not _has_artifact(video):
-        # The backend already succeeded and charged for this task — a
-        # missing/malformed envelope must still carry the task_id and the
-        # get_sfx_task recovery call, or a paid result becomes unrecoverable
-        # from the error message alone. "At least one" rather than "audio":
-        # a ducking task with a video voice input renders exactly one
-        # artifact, the re-muxed mp4, and has no audio slot at all.
+    # An audio artifact is required, with exactly one exemption: a ducking
+    # task whose voice input was a video renders a single artifact, the
+    # re-muxed mp4, and has no audio slot at all. The exemption is keyed off
+    # _normalize_task_envelope having recognized a ducking envelope — NOT off
+    # "some artifact is present". An SFX body is still held to the audio
+    # requirement even when it carries a video: a video-without-audio SFX
+    # result means the audio half of an already-charged generation went
+    # missing, and quietly downloading just the mp4 would report success
+    # while losing it, with no recovery hint. Raising here keeps the task_id
+    # and the get_sfx_task call in the user's hands, which is the only way a
+    # paid result stays recoverable from the error message alone.
+    if not _has_artifact(audio) and not (is_ducking and _has_artifact(video)):
         raise Exception(
             "Task succeeded but no audio artifact was returned. Task id: "
             f'{task_id} — call get_sfx_task("{task_id}") to check for the '

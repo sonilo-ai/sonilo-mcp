@@ -233,6 +233,41 @@ def _resolve_input_file(
     return path
 
 
+def _require_http_url(url: str, label: str) -> None:
+    """Restrict a caller-supplied URL to http(s) before it reaches ffprobe or
+    the backend — keeps file:// (local file disclosure), internal addresses
+    (SSRF from this machine), and "-"-prefixed values (ffprobe flag injection)
+    out.
+
+    `label` names the offending argument (e.g. "video" -> "video_url must be
+    an http:// or https:// URL"). The single copy of this guard: every tool
+    that accepts a URL (video_to_music, video_to_sfx, audio_ducking) calls it.
+    """
+    if urlparse(url).scheme.lower() not in ("http", "https"):
+        raise Exception(f"{label}_url must be an http:// or https:// URL")
+
+
+def _read_capped(path: Path, max_mb: int, label: str) -> bytes:
+    """Read a file for upload, enforcing the account's size cap on the bytes
+    actually read.
+
+    An earlier stat() is stale by the time we get here (an await on ffprobe
+    sat in between, during which the file could have been replaced or grown —
+    a still-writing export, a sync tool). Reading at most max_bytes + 1 both
+    closes that race and bounds memory use.
+
+    `label` names the input in the error message (e.g. "Video", "Voice",
+    "Music"). The single copy of the read-time cap: every tool that uploads a
+    local file calls it.
+    """
+    max_bytes = max_mb * 1024 * 1024
+    with open(path, "rb") as fh:
+        content = fh.read(max_bytes + 1)
+    if len(content) > max_bytes:
+        raise Exception(f"{label} file is too large (> {max_mb} MB cap)")
+    return content
+
+
 # The backend rejects videos longer than this, so we pre-check locally to fail
 # fast and skip a wasted upload. Keep in sync with the backend's limit.
 _MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — music endpoints
@@ -280,7 +315,7 @@ async def _check_media_duration(
         return
     if duration > max_seconds:
         raise Exception(
-            f"Video duration {duration:.1f}s exceeds the maximum of "
+            f"Media duration {duration:.1f}s exceeds the maximum of "
             f"{max_seconds}s"
         )
 
@@ -377,8 +412,10 @@ def _is_task_not_found(e: BaseException) -> bool:
     """Whether `e` means the task_id itself is gone/invalid — the only case
     where recovery advice should be omitted.
 
-    Only a 404 means that: a bad/typo'd id, or a non-SFX (e.g. music) task
-    id — /v1/tasks is SFX-only and 404s those. Every OTHER error (401, 402,
+    Only a 404 means that: a bad/typo'd id, or an id for a task type
+    /v1/tasks does not serve. It serves SFX and audio-ducking tasks; a
+    streaming (e.g. music) generation has no task at all, so its id 404s
+    here. Every OTHER error (401, 402,
     413, 422, 429, 5xx, or a network-level failure with no status at all,
     e.g. httpx.RequestError wrapped as a bare Exception by _http_get_json)
     still refers to a task that EXISTS and was already CHARGED — the cause
@@ -761,9 +798,17 @@ def _ext_from_content_type(content_type: str | None) -> str:
 
 
 # Ducking renders wav, and re-muxes into mp4 when the voice input was a
-# video. Its envelope carries no content_type, so the type is fixed here
-# from output_type — these strings feed _ext_from_content_type, so
-# "audio/wav" must stay a key of _AUDIO_CONTENT_TYPE_EXTS.
+# video. Its envelope carries no content_type, so the type is synthesized
+# here from output_type. Only the "audio" value is ever read back:
+# _save_task_artifacts derives the audio extension from it via
+# _ext_from_content_type, so "audio/wav" must stay a key of
+# _AUDIO_CONTENT_TYPE_EXTS. The video branch hard-codes ".mp4" and never
+# looks at content_type — the "video/mp4" entry is carried only so the
+# normalized slot is shaped like an SFX one.
+#
+# This dict is also the authoritative set of output_type values: an
+# output_type outside these keys is NOT a ducking envelope (see
+# _normalize_task_envelope).
 _DUCKING_CONTENT_TYPES = {"audio": "audio/wav", "video": "video/mp4"}
 
 
@@ -787,19 +832,36 @@ def _normalize_task_envelope(body: dict) -> tuple[dict, bool]:
     here, the one place that knows which envelope it saw, rather than
     re-sniffed downstream.
 
-    Returns `(body, False)` when there is no usable `output_url` — every SFX
+    Returns `(body, False)` when there is no usable `output_url`, or when
+    `output_type` is anything other than "audio" or "video" — every SFX
     body, and any malformed ducking body, which is then held to the SFX
     contract and falls through to _save_task_artifacts' missing-artifact
     error, task_id and all. Never mutates the caller's dict.
+
+    output_type is matched STRICTLY (no defaulting to "audio"): a missing or
+    unrecognized type alongside a valid output_url would otherwise be
+    downloaded and written with a fabricated .wav extension and reported as a
+    success — a paid result silently mislabeled. Refusing it here routes the
+    body to the charged-and-recoverable error path instead, which hands the
+    caller the task_id and the get_sfx_task hint; the artifact is still on
+    the backend, so nothing is lost.
     """
     url = body.get("output_url")
     if not isinstance(url, str) or not url:
         return body, False
-    output_type = body.get("output_type")
-    slot = "video" if output_type == "video" else "audio"
+    slot = body.get("output_type")
+    # isinstance first: a non-string (an unhashable list/dict from a backend
+    # bug) would make the membership test raise instead of falling through.
+    if not isinstance(slot, str) or slot not in _DUCKING_CONTENT_TYPES:
+        return body, False
     normalized = dict(body)
     normalized[slot] = {"url": url, "content_type": _DUCKING_CONTENT_TYPES[slot]}
     return normalized, True
+
+
+def _has_artifact(slot: object) -> bool:
+    """Whether a task envelope's audio/video slot actually carries a URL."""
+    return isinstance(slot, dict) and bool(slot.get("url"))
 
 
 _ARTIFACT_DEST_MAX_ATTEMPTS = 10_000
@@ -991,9 +1053,6 @@ async def _save_task_artifacts(
         )
 
     body, is_ducking = _normalize_task_envelope(body)
-
-    def _has_artifact(slot: object) -> bool:
-        return isinstance(slot, dict) and bool(slot.get("url"))
 
     audio = body.get("audio")
     video = body.get("video")
@@ -1206,13 +1265,8 @@ async def video_to_music(
 
     if video_url:
         # Restrict to http(s) before the URL ever reaches the local ffprobe
-        # pre-check or the backend. Without this, a caller (e.g. via prompt
-        # injection) could pass file:// to probe local files, an internal
-        # address to trigger SSRF from this machine, or a "-"-prefixed value
-        # to inject ffprobe flags.
-        scheme = urlparse(video_url).scheme.lower()
-        if scheme not in ("http", "https"):
-            raise Exception("video_url must be an http:// or https:// URL")
+        # pre-check or the backend (see _require_http_url).
+        _require_http_url(video_url, "video")
 
     out_path = _make_output_path(output_directory)
     cfg = _get_config()
@@ -1226,24 +1280,14 @@ async def video_to_music(
         if size_mb > max_mb:
             # Cheap fail-fast: avoids a wasted ffprobe run for an
             # obviously-oversized file. NOT the authoritative check — see
-            # the read-time check below.
+            # _read_capped, which enforces the cap on the bytes actually read.
             raise Exception(
                 f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
             )
         await _check_media_duration(str(resolved))
         data = {"prompt": prompt} if prompt else None
         mime, _ = mimetypes.guess_type(resolved.name)
-        # Authoritative check: the stat() above is now stale — an await on
-        # ffprobe sat between it and this read, during which the file could
-        # have been replaced or grown (a video export still writing, a sync
-        # tool, a concurrent process). Enforce the cap on the bytes actually
-        # read for upload, not on the earlier stat(). Reading at most
-        # max_bytes + 1 both closes that race and bounds memory use.
-        max_bytes = max_mb * 1024 * 1024
-        with open(resolved, "rb") as fh:
-            content = fh.read(max_bytes + 1)
-        if len(content) > max_bytes:
-            raise Exception(f"Video file is too large (> {max_mb} MB cap)")
+        content = _read_capped(resolved, max_mb, "Video")
         files = {"video": (resolved.name, content, mime or "application/octet-stream")}
         return await _post_streaming_generation(
             "/v1/video-to-music",
@@ -1358,9 +1402,7 @@ async def video_to_sfx(
     if video_url:
         # Same scheme guard as video_to_music: keeps file:// and flag-like
         # values away from ffprobe and the backend.
-        scheme = urlparse(video_url).scheme.lower()
-        if scheme not in ("http", "https"):
-            raise Exception("video_url must be an http:// or https:// URL")
+        _require_http_url(video_url, "video")
 
     out_path = _make_output_path(output_directory)
     cfg = _get_config()
@@ -1384,7 +1426,7 @@ async def video_to_sfx(
         if size_mb > max_mb:
             # Cheap fail-fast: avoids a wasted ffprobe run for an
             # obviously-oversized file. NOT the authoritative check — see
-            # the read-time check below.
+            # _read_capped, which enforces the cap on the bytes actually read.
             raise Exception(
                 f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
             )
@@ -1392,16 +1434,7 @@ async def video_to_sfx(
             str(resolved), max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
         )
         mime, _ = mimetypes.guess_type(resolved.name)
-        # Authoritative check: the stat() above is now stale — an await on
-        # ffprobe sat between it and this read, during which the file could
-        # have been replaced or grown. Enforce the cap on the bytes actually
-        # read for upload, not on the earlier stat(). Reading at most
-        # max_bytes + 1 both closes that race and bounds memory use.
-        max_bytes = max_mb * 1024 * 1024
-        with open(resolved, "rb") as fh:
-            content = fh.read(max_bytes + 1)
-        if len(content) > max_bytes:
-            raise Exception(f"Video file is too large (> {max_mb} MB cap)")
+        content = _read_capped(resolved, max_mb, "Video")
         files = {
             "video": (
                 resolved.name, content, mime or "application/octet-stream"
@@ -1449,10 +1482,11 @@ async def get_sfx_task(
         body = await _http_get_json(f"/v1/tasks/{task_id}")
     except Exception as e:
         if _is_task_not_found(e):
-            # A 404 for a bad/typo'd id, or a music task's id — /v1/tasks
-            # is SFX-only and 404s those. Retrying can never help, so raise
-            # the original error as-is with no "call get_sfx_task again"
-            # advice attached.
+            # A 404 for a bad/typo'd id, or for an id /v1/tasks does not
+            # serve — it serves SFX and audio-ducking tasks, so a streaming
+            # (e.g. music) generation's id 404s here. Retrying can never
+            # help, so raise the original error as-is with no "call
+            # get_sfx_task again" advice attached.
             raise
         if _is_transient_error(e):
             # Structurally identical to _poll_task's GET — a transient
@@ -1506,33 +1540,6 @@ def _require_exactly_one(path: str | None, url: str | None, label: str) -> None:
         )
     if not path and not url:
         raise Exception(f"Provide either {label}_path or {label}_url")
-
-
-def _require_http_url(url: str, label: str) -> None:
-    """Restrict a caller-supplied URL to http(s) before it reaches ffprobe or
-    the backend — keeps file:// (local file disclosure), internal addresses
-    (SSRF from this machine), and "-"-prefixed values (ffprobe flag injection)
-    out. Same guard as video_to_music.
-    """
-    if urlparse(url).scheme.lower() not in ("http", "https"):
-        raise Exception(f"{label}_url must be an http:// or https:// URL")
-
-
-def _read_capped(path: Path, max_mb: int, label: str) -> bytes:
-    """Read a file for upload, enforcing the account's size cap on the bytes
-    actually read.
-
-    An earlier stat() is stale by the time we get here (an await on ffprobe
-    sat in between, during which the file could have been replaced or grown —
-    a still-writing export, a sync tool). Reading at most max_bytes + 1 both
-    closes that race and bounds memory use.
-    """
-    max_bytes = max_mb * 1024 * 1024
-    with open(path, "rb") as fh:
-        content = fh.read(max_bytes + 1)
-    if len(content) > max_bytes:
-        raise Exception(f"{label} file is too large (> {max_mb} MB cap)")
-    return content
 
 
 @mcp.tool(

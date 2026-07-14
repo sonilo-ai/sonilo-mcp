@@ -59,6 +59,37 @@ def test_slugify_caps_length():
     assert _slugify("Happy Song Title") == "happy-song-title"
 
 
+def test_ducking_base_name_from_path():
+    from sonilo_mcp.api import _ducking_base_name
+    assert _ducking_base_name("/tmp/Interview Take 2.mp4", None, "t-abcdefgh") == (
+        "interview-take-2-ducked"
+    )
+
+
+def test_ducking_base_name_from_url_strips_query():
+    from sonilo_mcp.api import _ducking_base_name
+    name = _ducking_base_name(
+        None, "https://cdn.test/clips/voice.wav?sig=abc#frag", "t-abcdefgh"
+    )
+    assert name == "voice-ducked"
+
+
+def test_ducking_base_name_falls_back_to_task_id():
+    # A URL with no usable filename (bare host, trailing slash) leaves
+    # nothing to name the file after. "t-abcdefgh"[:8] == "t-abcdef".
+    from sonilo_mcp.api import _ducking_base_name
+    assert _ducking_base_name(None, "https://cdn.test/", "t-abcdefgh") == (
+        "ducked-t-abcdef"
+    )
+
+
+def test_ducking_base_name_truncates_long_stem():
+    from sonilo_mcp.api import _ducking_base_name
+    name = _ducking_base_name("/tmp/" + "a" * 200 + ".wav", None, "t-abcdefgh")
+    # _slugify caps the stem at 80 chars; the suffix is added after.
+    assert name == "a" * 80 + "-ducked"
+
+
 def test_is_file_writeable_existing(tmp_path):
     from sonilo_mcp.api import _is_file_writeable
     f = tmp_path / "x.txt"

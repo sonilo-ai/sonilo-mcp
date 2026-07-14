@@ -168,6 +168,32 @@ def _slugify(text: str) -> str:
     return safe or "sonilo"
 
 
+def _ducking_base_name(
+    voice_path: str | None, voice_url: str | None, task_id: str
+) -> str:
+    """Name a ducking result after its voice input: interview.mp4 ->
+    interview-ducked(.mp4).
+
+    The voice track is what the user recognizes — the music bed is
+    interchangeable — so it is the half worth naming the output after. For
+    a URL, the last path segment is used (query and fragment are dropped by
+    urlparse). When neither input yields a usable stem, fall back to
+    ducked-{task_id[:8]}, mirroring get_sfx_task's sfx-{task_id[:8]}.
+
+    The extension is NOT decided here: it comes from the task envelope
+    (.wav, or .mp4 when the voice input was a video) — see
+    _normalize_task_envelope.
+    """
+    raw = ""
+    if voice_path:
+        raw = Path(os.path.expanduser(voice_path)).stem
+    elif voice_url:
+        raw = Path(urlparse(voice_url).path).stem
+    if not raw.strip():
+        return f"ducked-{task_id[:8]}"
+    return f"{_slugify(raw)}-ducked"
+
+
 _AUDIO_EXTS = frozenset({".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac"})
 _VIDEO_EXTS = frozenset({".mp4", ".mov", ".avi", ".wmv", ".webm", ".mkv"})
 

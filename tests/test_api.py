@@ -1885,6 +1885,127 @@ async def test_save_task_artifacts_concurrent_calls_get_distinct_files(
 
 
 @respx.mock
+async def test_normalize_task_envelope_audio_output():
+    # Ducking's flat envelope for an audio voice input becomes the SFX
+    # audio shape, with a .wav-implying content_type (ducking always
+    # renders wav; the envelope carries no content_type of its own).
+    from sonilo_mcp.api import _normalize_task_envelope
+    body = {
+        "task_id": "d-1", "status": "succeeded", "type": "audio_ducking",
+        "output_url": "https://r2.test/ducked.wav", "output_type": "audio",
+    }
+    out = _normalize_task_envelope(body)
+    assert out["audio"] == {
+        "url": "https://r2.test/ducked.wav", "content_type": "audio/wav"
+    }
+    assert "video" not in out
+    # The input body must not be mutated in place.
+    assert "audio" not in body
+
+
+@respx.mock
+async def test_normalize_task_envelope_video_output():
+    # A video voice input yields ONE artifact: the re-muxed mp4. It maps to
+    # the video slot, and there is deliberately no audio slot — the ducked
+    # audio is inside the mp4.
+    from sonilo_mcp.api import _normalize_task_envelope
+    body = {
+        "task_id": "d-2", "status": "succeeded", "type": "audio_ducking",
+        "output_url": "https://r2.test/ducked.mp4", "output_type": "video",
+    }
+    out = _normalize_task_envelope(body)
+    assert out["video"] == {
+        "url": "https://r2.test/ducked.mp4", "content_type": "video/mp4"
+    }
+    assert "audio" not in out
+
+
+def test_normalize_task_envelope_passes_sfx_body_through():
+    from sonilo_mcp.api import _normalize_task_envelope
+    body = {
+        "status": "succeeded",
+        "audio": {"url": "https://r2.test/a.m4a", "content_type": "audio/mp4"},
+    }
+    assert _normalize_task_envelope(body) == body
+
+
+@respx.mock
+async def test_save_task_artifacts_ducking_audio_envelope(monkeypatch, tmp_path):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/ducked.wav").mock(
+        return_value=httpx.Response(200, content=b"ducked-wav-bytes")
+    )
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "d-3", "status": "succeeded",
+        "output_url": "https://r2.test/ducked.wav", "output_type": "audio",
+    }
+    result = await _save_task_artifacts(body, tmp_path, "interview-ducked", "d-3")
+    assert len(result) == 1
+    expected = tmp_path / "interview-ducked.wav"
+    assert expected.read_bytes() == b"ducked-wav-bytes"
+    assert str(expected) in result[0].text
+
+
+@respx.mock
+async def test_save_task_artifacts_ducking_video_envelope(monkeypatch, tmp_path):
+    # The video-only case: no audio artifact exists, and that is CORRECT —
+    # it must not raise "no audio artifact was returned".
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/ducked.mp4").mock(
+        return_value=httpx.Response(200, content=b"ducked-mp4-bytes")
+    )
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "d-4", "status": "succeeded",
+        "output_url": "https://r2.test/ducked.mp4", "output_type": "video",
+    }
+    result = await _save_task_artifacts(body, tmp_path, "interview-ducked", "d-4")
+    assert len(result) == 1
+    expected = tmp_path / "interview-ducked.mp4"
+    assert expected.read_bytes() == b"ducked-mp4-bytes"
+    assert str(expected) in result[0].text
+
+
+@respx.mock
+async def test_save_task_artifacts_no_artifacts_still_raises(monkeypatch, tmp_path):
+    # A succeeded body with NEITHER artifact is still a contract violation,
+    # and the message must keep the task_id + recovery call: the task was
+    # already charged.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {"task_id": "d-5", "status": "succeeded"}
+    with pytest.raises(Exception) as exc:
+        await _save_task_artifacts(body, tmp_path, "x", "d-5")
+    msg = str(exc.value)
+    assert "no audio artifact" in msg
+    assert "d-5" in msg
+    assert "get_sfx_task" in msg
+
+
+@respx.mock
+async def test_save_task_artifacts_ducking_reuse_existing(monkeypatch, tmp_path):
+    # Ducking envelopes carry no file_size, so reuse falls back to the
+    # documented "non-empty means already downloaded" branch.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    route = respx.get("https://r2.test/ducked.wav").mock(
+        return_value=httpx.Response(200, content=b"fresh")
+    )
+    (tmp_path / "interview-ducked.wav").write_bytes(b"already-here")
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "d-6", "status": "succeeded",
+        "output_url": "https://r2.test/ducked.wav", "output_type": "audio",
+    }
+    result = await _save_task_artifacts(
+        body, tmp_path, "interview-ducked", "d-6", reuse_existing=True
+    )
+    assert route.call_count == 0
+    assert (tmp_path / "interview-ducked.wav").read_bytes() == b"already-here"
+    assert "Already downloaded" in result[0].text
+
+
+@respx.mock
 async def test_save_task_artifacts_audio_only(monkeypatch, tmp_path):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     respx.get("https://r2.test/a.m4a").mock(

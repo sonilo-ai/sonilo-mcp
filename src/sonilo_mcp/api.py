@@ -733,6 +733,42 @@ def _ext_from_content_type(content_type: str | None) -> str:
     return _AUDIO_CONTENT_TYPE_EXTS.get(content_type.lower(), ".m4a")
 
 
+# Ducking renders wav, and re-muxes into mp4 when the voice input was a
+# video. Its envelope carries no content_type, so the type is fixed here
+# from output_type — these strings feed _ext_from_content_type, so
+# "audio/wav" must stay a key of _AUDIO_CONTENT_TYPE_EXTS.
+_DUCKING_CONTENT_TYPES = {"audio": "audio/wav", "video": "video/mp4"}
+
+
+def _normalize_task_envelope(body: dict) -> dict:
+    """Rewrite audio-ducking's flat success envelope into the SFX shape.
+
+    SFX tasks return `{"audio": {...}, "video": {...}}`; audio-ducking
+    returns `{"output_url": ..., "output_type": "audio" | "video"}` — one
+    artifact, never both. Normalizing here means _save_task_artifacts and
+    everything under it (extension, reuse check, atomic name reservation,
+    download, recovery wording) stays single-path.
+
+    A video output is the ONLY artifact of that task: the ducked audio is
+    inside the re-muxed mp4, so no audio slot is produced — see
+    _save_task_artifacts, which requires at least one artifact rather than
+    an audio one specifically.
+
+    Returns `body` unchanged when there is no usable `output_url` (every
+    SFX body, and any malformed ducking body — which then falls through to
+    _save_task_artifacts' missing-artifact error, task_id and all). Never
+    mutates the caller's dict.
+    """
+    url = body.get("output_url")
+    if not isinstance(url, str) or not url:
+        return body
+    output_type = body.get("output_type")
+    slot = "video" if output_type == "video" else "audio"
+    normalized = dict(body)
+    normalized[slot] = {"url": url, "content_type": _DUCKING_CONTENT_TYPES[slot]}
+    return normalized
+
+
 _ARTIFACT_DEST_MAX_ATTEMPTS = 10_000
 
 
@@ -860,8 +896,11 @@ async def _save_task_artifacts(
     """Turn a terminal /v1/tasks/{id} body into saved local files.
 
     failed -> raise with the backend's error code/message and whether the
-    charge was refunded. succeeded -> download audio (always present) and
-    video (video-to-sfx only), one TextContent per saved file.
+    charge was refunded. succeeded -> download whichever artifacts the task
+    produced — audio and/or video — one TextContent per saved file. At least
+    one artifact is required; an SFX task always has audio (plus video for
+    video-to-sfx), while an audio-ducking task with a video voice input has
+    only the re-muxed mp4 (see _normalize_task_envelope).
 
     task_id must be the caller's own known-good id (from _post_task_submit
     or the tool's own task_id argument), NOT derived from body — the
@@ -917,12 +956,20 @@ async def _save_task_artifacts(
             f'get_sfx_task("{task_id}").'
         )
 
+    body = _normalize_task_envelope(body)
+
+    def _has_artifact(slot: object) -> bool:
+        return isinstance(slot, dict) and bool(slot.get("url"))
+
     audio = body.get("audio")
-    if not isinstance(audio, dict) or not audio.get("url"):
+    video = body.get("video")
+    if not _has_artifact(audio) and not _has_artifact(video):
         # The backend already succeeded and charged for this task — a
-        # missing/malformed audio envelope must still carry the task_id and
-        # the get_sfx_task recovery call, or a paid result becomes
-        # unrecoverable from the error message alone.
+        # missing/malformed envelope must still carry the task_id and the
+        # get_sfx_task recovery call, or a paid result becomes unrecoverable
+        # from the error message alone. "At least one" rather than "audio":
+        # a ducking task with a video voice input renders exactly one
+        # artifact, the re-muxed mp4, and has no audio slot at all.
         raise Exception(
             "Task succeeded but no audio artifact was returned. Task id: "
             f'{task_id} — call get_sfx_task("{task_id}") to check for the '
@@ -930,44 +977,52 @@ async def _save_task_artifacts(
         )
 
     saved: list[TextContent] = []
-    try:
-        # Everything below — deriving the extension, checking for a
-        # reusable existing file, computing the destination path, and the
-        # actual download — must stay inside this wrap. The backend already
-        # succeeded and charged for this task by the time we get here, so
-        # ANY failure here must still carry the task_id and recovery hint.
-        # _download_artifact (and any other failure here, e.g. an OSError
-        # from _artifact_dest) states only the bare fact of the failure —
-        # this is the one layer that owns the single, complete recovery
-        # instruction, so it isn't repeated.
-        audio_ext = _ext_from_content_type(audio.get("content_type"))
-        existing = (
-            _existing_canonical_dest(
-                output_path, base_name, audio_ext, audio.get("file_size")
+    # Stays None for a video-only ducking result, where no audio artifact
+    # exists — the video block's failure message keys off this so it never
+    # claims an audio file was saved when none was.
+    audio_dest: Path | None = None
+    if _has_artifact(audio):
+        try:
+            # Everything below — deriving the extension, checking for a
+            # reusable existing file, computing the destination path, and the
+            # actual download — must stay inside this wrap. The backend already
+            # succeeded and charged for this task by the time we get here, so
+            # ANY failure here must still carry the task_id and recovery hint.
+            # _download_artifact (and any other failure here, e.g. an OSError
+            # from _artifact_dest) states only the bare fact of the failure —
+            # this is the one layer that owns the single, complete recovery
+            # instruction, so it isn't repeated.
+            audio_ext = _ext_from_content_type(audio.get("content_type"))
+            existing = (
+                _existing_canonical_dest(
+                    output_path, base_name, audio_ext, audio.get("file_size")
+                )
+                if reuse_existing
+                else None
             )
-            if reuse_existing
-            else None
-        )
-        if existing is None:
-            dest = _artifact_dest(output_path, base_name, audio_ext)
-            await _download_artifact(audio["url"], dest)
+            if existing is None:
+                dest = _artifact_dest(output_path, base_name, audio_ext)
+                await _download_artifact(audio["url"], dest)
+            else:
+                dest = existing
+        except Exception as e:
+            raise Exception(
+                f"{_end_sentence(e)} The result is still stored on the backend "
+                f'— call get_sfx_task("{task_id}") to retry.'
+            ) from e
+        if existing is not None:
+            saved.append(
+                TextContent(
+                    type="text", text=f"Already downloaded. File saved as: {dest}"
+                )
+            )
         else:
-            dest = existing
-    except Exception as e:
-        raise Exception(
-            f"{_end_sentence(e)} The result is still stored on the backend "
-            f'— call get_sfx_task("{task_id}") to retry.'
-        ) from e
-    if existing is not None:
-        saved.append(
-            TextContent(type="text", text=f"Already downloaded. File saved as: {dest}")
-        )
-    else:
-        saved.append(TextContent(type="text", text=f"Success. File saved as: {dest}"))
-    audio_dest = dest
+            saved.append(
+                TextContent(type="text", text=f"Success. File saved as: {dest}")
+            )
+        audio_dest = dest
 
-    video = body.get("video")
-    if isinstance(video, dict) and video.get("url"):
+    if _has_artifact(video):
         try:
             existing_video = (
                 _existing_canonical_dest(
@@ -982,10 +1037,15 @@ async def _save_task_artifacts(
             else:
                 dest = existing_video
         except Exception as e:
+            if audio_dest is not None:
+                raise Exception(
+                    f"{_end_sentence(e)} The audio file was already saved as: "
+                    f"{audio_dest}. The video is still stored on the backend — "
+                    f'call get_sfx_task("{task_id}") to retry the download.'
+                ) from e
             raise Exception(
-                f"{_end_sentence(e)} The audio file was already saved as: "
-                f"{audio_dest}. The video is still stored on the backend — "
-                f'call get_sfx_task("{task_id}") to retry the download.'
+                f"{_end_sentence(e)} The result is still stored on the backend "
+                f'— call get_sfx_task("{task_id}") to retry.'
             ) from e
         if existing_video is not None:
             saved.append(

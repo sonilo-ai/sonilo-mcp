@@ -1203,6 +1203,29 @@ async def _save_task_artifacts(
     return saved
 
 
+def _is_music_task_envelope(body: dict) -> bool:
+    """Whether a terminal /v1/tasks/{id} body is an async video-to-music
+    envelope (list-shaped `audio`, optional single `vocals` and list `mux`)
+    rather than the SFX/ducking single-dict-`audio` shape.
+
+    get_sfx_task's recovery path checks this to route between
+    _save_task_artifacts (SFX/ducking) and _save_music_task_artifacts
+    (async video-to-music). Prefers the backend's own `type` field —
+    ducking bodies already carry `type: "audio_ducking"`, so video-to-music
+    carrying `type: "video_to_music"` follows the same convention — but
+    falls back to shape-sniffing (`audio` as a list, or a `vocals`/`mux`
+    key present) for a body that omits `type`, so recovery keeps working
+    even then. A failed task's body normally has none of these markers;
+    that's harmless here, since failure/refund handling
+    (_raise_if_task_not_succeeded) is identical on both routes.
+    """
+    if body.get("type") == "video_to_music":
+        return True
+    if isinstance(body.get("audio"), list):
+        return True
+    return "vocals" in body or "mux" in body
+
+
 # ---------- video-to-music (isolate_vocals) task pipeline ----------
 #
 # Async video-to-music (mode=async, isolate_vocals=true) shares
@@ -1645,11 +1668,13 @@ async def video_to_sfx(
 
 @mcp.tool(
     description=(
-        "Check a sound-effects or audio-ducking generation task and, if "
-        "finished, download its result file(s). Use this to recover a "
-        "result when text_to_sfx, video_to_sfx, or audio_ducking timed out "
-        "— their error message contains the task_id. Does not poll: a "
-        "single status check per call. This tool itself never charges.\n\n"
+        "Check a sound-effects, audio-ducking, or async video-to-music "
+        "(isolate_vocals) generation task and, if finished, download its "
+        "result file(s). Use this to recover a result when text_to_sfx, "
+        "video_to_sfx, audio_ducking, or video_to_music(isolate_vocals=true) "
+        "timed out — their error message contains the task_id. Does not "
+        "poll: a single status check per call. This tool itself never "
+        "charges.\n\n"
         "Args:\n"
         "    task_id (str): The task id returned in the timeout message.\n"
         "    output_directory (str, optional): Where to save result files. "
@@ -1658,8 +1683,10 @@ async def video_to_sfx(
         "    Still processing -> a status message; try again later. "
         "Succeeded -> the saved file path(s): audio, plus video for "
         "video_to_sfx tasks; a single .wav or .mp4 for audio_ducking "
-        "tasks. Failed -> an error including whether the charge was "
-        "refunded."
+        "tasks; for a video_to_music(isolate_vocals=true) task, the audio "
+        "stream(s) plus the isolated vocals stem plus the mux "
+        "(vocals+music mixed — the ready-to-use combined result). "
+        "Failed -> an error including whether the charge was refunded."
     )
 )
 async def get_sfx_task(
@@ -1707,6 +1734,19 @@ async def get_sfx_task(
     out_path = _make_output_path(output_directory)
     # No prompt available on recovery — name by task id; extension comes
     # from the envelope's content_type.
+    if _is_music_task_envelope(body):
+        # Async (isolate_vocals) video-to-music: list-shaped `audio` plus
+        # optional `vocals`/`mux` — needs the music-aware save layer, not
+        # _save_task_artifacts's single-dict-audio assumption. No
+        # reuse_existing here: _save_music_task_artifacts doesn't support it
+        # (see its docstring — video-to-music has no dedicated recovery
+        # tool of its own to dedupe repeat calls for), so a second
+        # get_sfx_task call on an already-recovered music task lands in
+        # freshly -1/-2-suffixed files rather than being detected as a
+        # duplicate.
+        return await _save_music_task_artifacts(
+            body, out_path, f"music-{task_id[:8]}", task_id
+        )
     return await _save_task_artifacts(
         body, out_path, f"sfx-{task_id[:8]}", task_id, reuse_existing=True
     )

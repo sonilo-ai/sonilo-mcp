@@ -3471,6 +3471,96 @@ async def test_get_sfx_task_recovers_ducking_task(monkeypatch, output_dir):
     assert str(saved) in result[0].text
 
 
+@respx.mock
+async def test_get_sfx_task_recovers_isolate_vocals_music_task(monkeypatch, output_dir):
+    # /v1/tasks also serves async (isolate_vocals) video-to-music tasks now.
+    # Their envelope shapes `audio` as a LIST plus optional `vocals`/`mux` —
+    # get_sfx_task must detect that shape and route to
+    # _save_music_task_artifacts instead of the SFX/ducking single-dict
+    # _save_task_artifacts path (which would otherwise wrongly report "no
+    # audio artifact was returned").
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/m-vocals-99").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "m-vocals-99", "type": "video_to_music",
+            "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+            "vocals": {
+                "url": "https://r2.test/vocals.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            },
+            "mux": [{
+                "stream_index": 0, "url": "https://r2.test/mux.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a.m4a").mock(return_value=httpx.Response(200, content=b"a"))
+    respx.get("https://r2.test/vocals.m4a").mock(return_value=httpx.Response(200, content=b"v"))
+    respx.get("https://r2.test/mux.m4a").mock(return_value=httpx.Response(200, content=b"m"))
+    from sonilo_mcp.api import get_sfx_task
+    result = await get_sfx_task("m-vocals-99")
+    assert (output_dir / "music-m-vocals.m4a").read_bytes() == b"a"
+    assert (output_dir / "music-m-vocals-vocals.m4a").read_bytes() == b"v"
+    assert (output_dir / "music-m-vocals-mux.m4a").read_bytes() == b"m"
+    assert len(result) == 3
+    texts = [t.text for t in result]
+    assert any("music audio" in t for t in texts)
+    assert any("vocals" in t.lower() for t in texts)
+    assert any("ready to use" in t.lower() for t in texts)
+
+
+@respx.mock
+async def test_get_sfx_task_recovers_music_task_without_type_field(
+    monkeypatch, output_dir
+):
+    # Detection must not rely solely on `type` — fall back to shape-sniffing
+    # (a list-shaped `audio`) so recovery still works if the backend ever
+    # omits `type`.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/m-notype-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "m-notype-1", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a2.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a2.m4a").mock(return_value=httpx.Response(200, content=b"aa"))
+    from sonilo_mcp.api import get_sfx_task
+    result = await get_sfx_task("m-notype-1")
+    assert (output_dir / "music-m-notype.m4a").read_bytes() == b"aa"
+    assert len(result) == 1
+
+
+@respx.mock
+async def test_get_sfx_task_music_task_failed_still_reports_refund(
+    monkeypatch, output_dir
+):
+    # A failed music task must raise the same shared failure/refund message
+    # as SFX/ducking, task_id included — envelope detection must not change
+    # failure handling.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/m-failed-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "m-failed-1", "type": "video_to_music",
+            "status": "failed",
+            "error": {"code": "GENERATION_FAILED", "message": "boom"},
+            "refunded": False,
+        })
+    )
+    from sonilo_mcp.api import get_sfx_task
+    with pytest.raises(Exception, match="boom"):
+        await get_sfx_task("m-failed-1")
+
+
 # ---------- audio_ducking ----------
 
 async def test_audio_ducking_requires_exactly_one_voice_input(output_dir):

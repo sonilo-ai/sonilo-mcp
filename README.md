@@ -143,7 +143,7 @@ files. To opt out — e.g. to read a video from elsewhere on disk — set
 | `text_to_sfx(prompt, duration, audio_format?, output_directory?)` | Generate a sound effect from text. Duration 1–180s; formats wav/mp3/aac/flac (default aac). | ✅ |
 | `video_to_sfx(video_path? \| video_url?, prompt?, segments?, audio_format?, output_directory?)` | Generate SFX for a video; saves the generated SFX audio. Max video duration **180s (3 min)**. | ✅ |
 | `audio_ducking(voice_path? \| voice_url?, music_path? \| music_url?, output_directory?)` | Duck a music bed under a voice track. The voice input may be a video — the ducked mix is muxed back into a new `.mp4`. Each input max **360s (6 min)**; subject to the account's upload-size cap. | ✅ |
-| `get_sfx_task(task_id, output_directory?)` | Check an SFX or audio-ducking task and download its result — recovery for timed-out `text_to_sfx`, `video_to_sfx`, and `audio_ducking` calls. | ❌ |
+| `get_sfx_task(task_id, output_directory?)` | Check an SFX, audio-ducking, or async video-to-music task and download its result — recovery for timed-out `text_to_sfx`, `video_to_sfx`, `audio_ducking`, and `video_to_music(isolate_vocals=true)` calls. | ❌ |
 | `get_account_services()` | List available services and limits. | ❌ |
 | `get_usage(days=30)` | Show usage summary + per-day breakdown. | ❌ |
 | `play_audio(input_file_path)` | Play a local audio file. | ❌ |
@@ -154,7 +154,7 @@ Tools marked ✅ make API calls that incur charges on your Sonilo account.
 
 ### Sound effects and ducking run as tasks
 
-The music tools stream their result and finish in one call — with one exception: `video_to_music(isolate_vocals=true)` submits a *task* and polls it internally instead, the same way the SFX tools do (see below), because separating vocals is only available in the backend's async mode. You still get the saved file paths back from a single call; you just don't see the task. The SFX tools submit a *task*, then poll it until it completes — `text_to_sfx` and `video_to_sfx` do this for you and return the saved file paths, so you normally never see the task. `audio_ducking` uses the same submit-then-poll flow and the same `get_sfx_task` recovery path.
+The music tools stream their result and finish in one call — with one exception: `video_to_music(isolate_vocals=true)` submits a *task* and polls it internally instead, because separating vocals is only available in the backend's async mode. You still get the saved file paths back from a single call; you just don't see the task, and — like the SFX tools — it uses the same `get_sfx_task` recovery path if the call times out. The SFX tools submit a *task*, then poll it until it completes — `text_to_sfx` and `video_to_sfx` do this for you and return the saved file paths, so you normally never see the task. `audio_ducking` uses the same submit-then-poll flow and the same `get_sfx_task` recovery path.
 
 If a call times out, the generation keeps running (and is already charged). The error message carries the task id, and `get_sfx_task("<id>")` retrieves the result once it's ready. The task id is also printed to stderr the moment a task is submitted, so it survives even a cancelled call. `get_sfx_task` is safe to call repeatedly: if the file is already on disk it reports that instead of downloading a second copy.
 
@@ -166,7 +166,7 @@ If a call times out, the generation keeps running (and is already charged). The 
 
 **Sound effects** are saved in the requested `audio_format` — `wav`, `mp3`, `flac`, or `aac` (the default, written as `.m4a`); `video_to_sfx` saves audio only, not the source video.
 
-File names come from the prompt (slugified, truncated to 80 characters). When there is no prompt to name a file after — `video_to_sfx` without one, or any file recovered via `get_sfx_task` — the name is `sfx-<first 8 chars of the task id>` instead. Existing files are never overwritten: a `-1`, `-2`, … suffix is added instead.
+File names come from the prompt (slugified, truncated to 80 characters). When there is no prompt to name a file after — `video_to_sfx` without one, or an SFX/ducking file recovered via `get_sfx_task` — the name is `sfx-<first 8 chars of the task id>` instead. A `video_to_music(isolate_vocals=true)` task recovered via `get_sfx_task` is named `music-<first 8 chars of the task id>` instead (`get_sfx_task` detects the music envelope shape and saves audio/vocals/mux the same way as a direct `video_to_music` call). Existing files are never overwritten: a `-1`, `-2`, … suffix is added instead.
 
 **Ducking** results are saved as a single file: a `.wav`, or a `.mp4` when the voice input was a video (the ducked mix is muxed back into it). The file name is the voice input's name plus `-ducked` (e.g. `interview.mp4` → `interview-ducked.mp4`), falling back to `ducked-<first 8 chars of the task id>` when there is no usable name. A ducking result recovered via `get_sfx_task` is named `sfx-<first 8 chars of the task id>` instead, since that tool has no voice file name to work from.
 
@@ -178,5 +178,5 @@ File names come from the prompt (slugified, truncated to 80 characters). When th
 | `Insufficient minutes` / `Credit limit exceeded` | Top up at <https://platform.sonilo.com/dashboard/billing>. |
 | `Rate limit exceeded` | Check `get_account_services` for your rpm/concurrency limits. |
 | `Generation timed out` (music, `text_to_music`/`video_to_music` without `isolate_vocals`) | Raise `TIME_OUT_SECONDS`. Check `get_usage` to confirm whether the backend completed and charged. |
-| `Timed out … waiting for task <id>` (SFX, ducking) | The generation is still running. Call `get_sfx_task("<id>")` to retrieve the result — nothing is lost. `video_to_music(isolate_vocals=true)` also polls a task and can time out the same way, but `get_sfx_task` does not understand its result shape — the task keeps running and is charged either way; use the task id to check `get_usage`. |
+| `Timed out … waiting for task <id>` (SFX, ducking, or `video_to_music(isolate_vocals=true)`) | The generation is still running. Call `get_sfx_task("<id>")` to retrieve the result — nothing is lost, including for a timed-out `isolate_vocals` music task (`get_sfx_task` recognizes its result shape and saves audio/vocals/mux the same way `video_to_music` itself would). |
 | `Task not found` | The task id doesn't exist, or belongs to a purely streaming generation (`text_to_music`, or `video_to_music` without `isolate_vocals`), which isn't pollable. Check the id. |

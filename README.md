@@ -6,7 +6,7 @@ An MCP (Model Context Protocol) server that exposes [Sonilo](https://sonilo.com)
 
 The flagship tool is **`video_to_music`**: hand it your finished video and it composes an original soundtrack matched to the cut — the music follows the pacing, emotion, and edits because the model saw them. Length matches the video automatically. Every track is licensed and safe for commercial use (terms apply). `text_to_music` is also available for fixed-length tracks with no video to match.
 
-For sound design, **`video_to_sfx`** watches your video and generates matching sound effects, returning both the SFX audio and the finished video with the effects mixed in. `text_to_sfx` generates a standalone effect from a description.
+For sound design, **`video_to_sfx`** watches your video and generates matching sound effects, returned as a standalone audio file. `text_to_sfx` generates a standalone effect from a description.
 
 **▶ [Example result](https://github.com/cindyxu1030/sonilo-video-to-music-cookbook/blob/main/assets/demo-trailer.mp4)** — an AI-generated trailer with its soundtrack composed by `video_to_music` from the assembled cut. For recipes covering any AI-video pipeline (stitch → grade → add music → mux), see the [Sonilo video-to-music cookbook](https://github.com/cindyxu1030/sonilo-video-to-music-cookbook).
 
@@ -22,7 +22,7 @@ Get your API key from the [Sonilo dashboard](https://platform.sonilo.com/dashboa
 
 - **Video-to-music** — give it a video and Sonilo composes a full-length score matched to its pacing, motion, and emotion. Transitions and beat drops align to your cut points, and the track matches the video's duration exactly — no prompts or manual syncing required.
 - **Text-to-music** — generate tracks from a text description (genre, mood, tempo, instrumentation) at an exact duration (1–360s).
-- **Video-to-SFX** — Sonilo watches the video and generates sound effects for what it sees. You get both the SFX audio and the finished video with the effects mixed in. Optional `segments` let you script effects to specific time ranges (`[{start, end, prompt}]`).
+- **Video-to-SFX** — Sonilo watches the video and generates sound effects for what it sees. You get the SFX as a standalone audio file. Optional `segments` let you script effects to specific time ranges (`[{start, end, prompt}]`).
 - **Text-to-SFX** — generate a standalone sound effect from a description (1–180s), in `wav`, `mp3`, `aac`, or `flac`.
 - **Fully licensed, commercial-safe** — music licensed via Shutterstock; every generated track is cleared for commercial use on social, brand content, and advertising, with no Content ID worries.
 - **Pay as you go** — billed only for the seconds of music you generate; new accounts get free credits on signup.
@@ -141,7 +141,7 @@ files. To opt out — e.g. to read a video from elsewhere on disk — set
 | `text_to_music(prompt, duration, output_directory?)` | Generate music from a text prompt. | ✅ |
 | `video_to_music(video_path? \| video_url?, prompt?, output_directory?)` | Generate music matched to a video. Max duration **360s (6 min)**; subject to the account's upload-size cap (typically 300 MB). | ✅ |
 | `text_to_sfx(prompt, duration, audio_format?, output_directory?)` | Generate a sound effect from text. Duration 1–180s; formats wav/mp3/aac/flac (default aac). | ✅ |
-| `video_to_sfx(video_path? \| video_url?, prompt?, segments?, audio_format?, output_directory?)` | Generate SFX for a video; saves the SFX audio **and** the finished video with effects mixed in. Max video duration **180s (3 min)**. | ✅ |
+| `video_to_sfx(video_path? \| video_url?, prompt?, segments?, audio_format?, output_directory?)` | Generate SFX for a video; saves the generated SFX audio. Max video duration **180s (3 min)**. | ✅ |
 | `audio_ducking(voice_path? \| voice_url?, music_path? \| music_url?, output_directory?)` | Duck a music bed under a voice track. The voice input may be a video — the ducked mix is muxed back into a new `.mp4`. Each input max **360s (6 min)**; subject to the account's upload-size cap. | ✅ |
 | `get_sfx_task(task_id, output_directory?)` | Check an SFX or audio-ducking task and download its result — recovery for timed-out `text_to_sfx`, `video_to_sfx`, and `audio_ducking` calls. | ❌ |
 | `get_account_services()` | List available services and limits. | ❌ |
@@ -162,7 +162,7 @@ If a call times out, the generation keeps running (and is already charged). The 
 
 **Music** is saved as `.m4a` (AAC in MP4 container). File names use the title returned by the backend (slugified), or a `sonilo-<timestamp>.m4a` fallback. When multiple parallel streams are returned, a `-<index>` suffix is appended.
 
-**Sound effects** are saved in the requested `audio_format` — `wav`, `mp3`, `flac`, or `aac` (the default, written as `.m4a`). `video_to_sfx` additionally saves the finished video as `.mp4` alongside the audio.
+**Sound effects** are saved in the requested `audio_format` — `wav`, `mp3`, `flac`, or `aac` (the default, written as `.m4a`); `video_to_sfx` saves audio only, not the source video.
 
 File names come from the prompt (slugified, truncated to 80 characters). When there is no prompt to name a file after — `video_to_sfx` without one, or any file recovered via `get_sfx_task` — the name is `sfx-<first 8 chars of the task id>` instead. Existing files are never overwritten: a `-1`, `-2`, … suffix is added instead.
 

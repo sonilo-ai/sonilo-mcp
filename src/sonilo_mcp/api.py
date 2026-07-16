@@ -196,6 +196,9 @@ def _ducking_base_name(
 
 _AUDIO_EXTS = frozenset({".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac"})
 _VIDEO_EXTS = frozenset({".mp4", ".mov", ".avi", ".wmv", ".webm", ".mkv"})
+# video-to-sfx (fal video-to-audio) accepts a narrower set than the locally
+# ffprobe-readable formats above — mp4, mov, webm, m4v, and animated gif.
+_SFX_VIDEO_EXTS = frozenset({".mp4", ".mov", ".webm", ".m4v", ".gif"})
 
 
 def _resolve_input_file(
@@ -1383,9 +1386,10 @@ async def text_to_sfx(
         "incur charges. Only use when explicitly requested by the user.\n\n"
         "Args:\n"
         "    video_path (str, optional): Absolute local path, or relative "
-        "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.avi/.wmv/.webm/.mkv. "
-        "Subject to the account's max upload size (typically 300 MB). "
-        "Maximum video duration is 180 seconds (3 minutes).\n"
+        "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.webm/.m4v/.gif "
+        "(gif must be animated). Subject to the account's max upload size "
+        "(typically 300 MB). Maximum video duration is 180 seconds "
+        "(3 minutes).\n"
         "    video_url (str, optional): HTTPS URL to a video file.\n"
         "    prompt (str, optional): Overall description of the desired "
         "sound effects (max 2000 chars).\n"
@@ -1439,7 +1443,7 @@ async def video_to_sfx(
 
     if video_path:
         resolved = _resolve_input_file(
-            video_path, cfg["base_path"], _VIDEO_EXTS, "video"
+            video_path, cfg["base_path"], _SFX_VIDEO_EXTS, "video"
         )
         max_mb = await _get_max_upload_size_mb()
         size_mb = resolved.stat().st_size / (1024 * 1024)

@@ -2711,6 +2711,26 @@ async def test_video_to_sfx_both_inputs_rejected(monkeypatch, output_dir):
         await video_to_sfx()
 
 
+def test_sfx_video_exts_are_the_fal_accepted_set():
+    # video-to-sfx (fal video-to-audio) accepts exactly this set — narrower than
+    # the shared _VIDEO_EXTS used by video-to-music / audio-ducking.
+    from sonilo_mcp.api import _SFX_VIDEO_EXTS
+
+    assert _SFX_VIDEO_EXTS == {".mp4", ".mov", ".webm", ".m4v", ".gif"}
+
+
+async def test_video_to_sfx_rejects_avi_extension(monkeypatch, tmp_path):
+    # .avi is in the shared _VIDEO_EXTS but NOT accepted by video-to-audio, so
+    # video_to_sfx must reject it locally (fail fast, before any upload).
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp.api import video_to_sfx
+
+    clip = tmp_path / "clip.avi"
+    clip.write_bytes(b"x")
+    with pytest.raises(Exception, match="not a recognized video format"):
+        await video_to_sfx(video_path=str(clip))
+
+
 @pytest.mark.parametrize("bad_url", ["file:///etc/passwd", "ftp://x/y.mp4"])
 async def test_video_to_sfx_rejects_non_http_url(monkeypatch, output_dir, bad_url):
     monkeypatch.setenv("SONILO_API_KEY", "k")

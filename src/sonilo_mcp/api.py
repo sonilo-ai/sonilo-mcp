@@ -420,9 +420,10 @@ def _is_task_not_found(e: BaseException) -> bool:
     where recovery advice should be omitted.
 
     Only a 404 means that: a bad/typo'd id, or an id for a task type
-    /v1/tasks does not serve. It serves SFX and audio-ducking tasks; a
-    streaming (e.g. music) generation has no task at all, so its id 404s
-    here. Every OTHER error (401, 402,
+    /v1/tasks does not serve. It serves SFX, audio-ducking, and — since
+    isolate_vocals — async video-to-music tasks; a purely streaming
+    generation (text_to_music, or video_to_music without isolate_vocals) has
+    no task at all, so its id 404s here. Every OTHER error (401, 402,
     413, 422, 429, 5xx, or a network-level failure with no status at all,
     e.g. httpx.RequestError wrapped as a bare Exception by _http_get_json)
     still refers to a task that EXISTS and was already CHARGED — the cause
@@ -988,40 +989,18 @@ def _existing_canonical_dest(
     return None
 
 
-async def _save_task_artifacts(
-    body: dict,
-    output_path: Path,
-    base_name: str,
-    task_id: str,
-    reuse_existing: bool = False,
-) -> list[TextContent]:
-    """Turn a terminal /v1/tasks/{id} body into saved local files.
+def _raise_if_task_not_succeeded(body: dict, task_id: str) -> None:
+    """Raise if a terminal task body's status isn't "succeeded".
+
+    Shared by every save-artifacts layer — SFX/ducking's
+    _save_task_artifacts and video-to-music's _save_music_task_artifacts —
+    since failure/unexpected-status handling only reads `status`, `error`,
+    and `refunded`, none of which depend on the envelope's audio/video shape.
 
     failed -> raise with the backend's error code/message and whether the
-    charge was refunded. succeeded -> download whichever artifacts the task
-    produced — audio and/or video — one TextContent per saved file. An audio
-    artifact is required: an SFX task always has audio (video-to-sfx returns
-    audio only). The sole exemption is an audio-ducking task with a video
-    voice input, whose only artifact is the re-muxed mp4 (see
-    _normalize_task_envelope, which reports whether it saw that envelope).
-
-    task_id must be the caller's own known-good id (from _post_task_submit
-    or the tool's own task_id argument), NOT derived from body — the
-    backend's terminal body is not a trustworthy source for the recovery
-    id, and a missing/incorrect id here would make a paid result
-    unrecoverable.
-
-    reuse_existing: when True (get_sfx_task's recovery path only — never
-    text_to_sfx/video_to_sfx), an artifact whose canonical unsuffixed path
-    already exists and is non-empty is treated as already downloaded rather
-    than re-fetched into a new -1/-2 suffixed file. get_sfx_task is the
-    documented recovery tool and its own messages actively invite repeat
-    calls ("still processing, try again later"), so without this, every
-    extra call after success would silently pile up duplicate downloads of
-    the same paid result. text_to_sfx/video_to_sfx must NOT set this: two
-    calls with the same prompt are two different generations and must
-    always land in two distinct files (see _artifact_dest's atomic
-    reservation), so they keep the default of False.
+    charge was refunded. Anything else non-terminal (a caller bug — _poll_task
+    only returns terminal bodies) -> raise generically. Does nothing when
+    status is "succeeded".
     """
     task_status = body.get("status")
     if task_status == "failed":
@@ -1058,6 +1037,49 @@ async def _save_task_artifacts(
             "This may be transient — check again with "
             f'get_sfx_task("{task_id}").'
         )
+
+
+async def _save_task_artifacts(
+    body: dict,
+    output_path: Path,
+    base_name: str,
+    task_id: str,
+    reuse_existing: bool = False,
+) -> list[TextContent]:
+    """Turn a terminal /v1/tasks/{id} body into saved local files.
+
+    failed -> raise with the backend's error code/message and whether the
+    charge was refunded. succeeded -> download whichever artifacts the task
+    produced — audio and/or video — one TextContent per saved file. An audio
+    artifact is required: an SFX task always has audio (video-to-sfx returns
+    audio only). The sole exemption is an audio-ducking task with a video
+    voice input, whose only artifact is the re-muxed mp4 (see
+    _normalize_task_envelope, which reports whether it saw that envelope).
+
+    task_id must be the caller's own known-good id (from _post_task_submit
+    or the tool's own task_id argument), NOT derived from body — the
+    backend's terminal body is not a trustworthy source for the recovery
+    id, and a missing/incorrect id here would make a paid result
+    unrecoverable.
+
+    reuse_existing: when True (get_sfx_task's recovery path only — never
+    text_to_sfx/video_to_sfx), an artifact whose canonical unsuffixed path
+    already exists and is non-empty is treated as already downloaded rather
+    than re-fetched into a new -1/-2 suffixed file. get_sfx_task is the
+    documented recovery tool and its own messages actively invite repeat
+    calls ("still processing, try again later"), so without this, every
+    extra call after success would silently pile up duplicate downloads of
+    the same paid result. text_to_sfx/video_to_sfx must NOT set this: two
+    calls with the same prompt are two different generations and must
+    always land in two distinct files (see _artifact_dest's atomic
+    reservation), so they keep the default of False.
+
+    This is NOT used for async (isolate_vocals) video-to-music tasks — their
+    envelope shapes `audio` as a LIST (one entry per stream_index) plus
+    optional single `vocals` and list `mux` slots, which _has_artifact/
+    _normalize_task_envelope don't model. See _save_music_task_artifacts.
+    """
+    _raise_if_task_not_succeeded(body, task_id)
 
     body, is_ducking = _normalize_task_envelope(body)
 
@@ -1181,6 +1203,116 @@ async def _save_task_artifacts(
     return saved
 
 
+# ---------- video-to-music (isolate_vocals) task pipeline ----------
+#
+# Async video-to-music (mode=async, isolate_vocals=true) shares
+# _post_task_submit/_poll_task with SFX/ducking, but its succeeded envelope
+# is a different shape: `audio` is ALWAYS a list (one entry per
+# stream_index, never a single dict), and — only with isolate_vocals — a
+# single `vocals` object and a `mux` list are also present. That shape
+# breaks _has_artifact/_normalize_task_envelope's single-dict assumptions
+# (a list `audio` is not a dict, so _has_artifact(audio) is always False),
+# so the save layer below is new rather than forcing _save_task_artifacts to
+# handle a second envelope shape.
+
+
+async def _save_music_task_artifacts(
+    body: dict,
+    output_path: Path,
+    base_name: str,
+    task_id: str,
+) -> list[TextContent]:
+    """Turn a terminal /v1/tasks/{id} body from an async (isolate_vocals)
+    video-to-music task into saved local files.
+
+    failed/unexpected status -> see _raise_if_task_not_succeeded (shared
+    with _save_task_artifacts; this part is envelope-agnostic).
+
+    succeeded -> download every entry in the `audio` list, then the single
+    `vocals` object if present, then every entry in the `mux` list if
+    present — one TextContent per saved file, each labeled so the caller can
+    tell audio/vocals/mux apart. The mux files (vocals+music already mixed)
+    are called out as the ready-to-use combined result.
+
+    Naming follows the existing streaming convention: `{base}.m4a` for a
+    single audio stream, `{base}-{idx}.m4a` when there is more than one.
+    `vocals` is saved as `{base}-vocals.{ext}`; `mux` follows the same
+    single/multi-stream pattern as audio: `{base}-mux.{ext}` or
+    `{base}-mux-{idx}.{ext}`.
+
+    task_id must be the caller's own known-good id (from _post_task_submit),
+    same rule as _save_task_artifacts — the terminal body is not a
+    trustworthy source for the recovery id.
+
+    Unlike _save_task_artifacts, this has no reuse_existing mode: video-to-
+    music (isolate_vocals or not) has no dedicated recovery tool (scope is
+    the video_to_music tool only), so there is no repeat-call path to
+    dedupe downloads for.
+    """
+    _raise_if_task_not_succeeded(body, task_id)
+
+    audio = body.get("audio")
+    valid_audio = (
+        [a for a in audio if _has_artifact(a)] if isinstance(audio, list) else []
+    )
+    if not valid_audio:
+        raise Exception(
+            "Task succeeded but no audio artifact was returned. Task id: "
+            f"{task_id}."
+        )
+
+    saved: list[TextContent] = []
+    saved_paths: list[Path] = []
+
+    async def _save_one(entry: dict, dest_base: str, label: str) -> None:
+        # Everything here can fail after the task already succeeded and was
+        # charged, so any failure must keep the task_id (and, if some files
+        # already made it to disk, list them) rather than silently drop
+        # them — mirrors _save_task_artifacts' per-artifact wrapping.
+        try:
+            ext = _ext_from_content_type(entry.get("content_type"))
+            dest = _artifact_dest(output_path, dest_base, ext)
+            await _download_artifact(entry["url"], dest)
+        except Exception as e:
+            already = (
+                " Already saved: " + ", ".join(str(p) for p in saved_paths) + "."
+                if saved_paths
+                else ""
+            )
+            raise Exception(
+                f"{_end_sentence(e)} The rest of this result is still "
+                f"stored on the backend — task id: {task_id}.{already}"
+            ) from e
+        saved_paths.append(dest)
+        saved.append(TextContent(
+            type="text", text=f"Success ({label}). File saved as: {dest}",
+        ))
+
+    multi_audio = len(valid_audio) > 1
+    for entry in sorted(valid_audio, key=lambda a: a.get("stream_index") or 0):
+        idx = entry.get("stream_index") or 0
+        suffix = f"-{idx}" if multi_audio else ""
+        await _save_one(entry, f"{base_name}{suffix}", "music audio")
+
+    vocals = body.get("vocals")
+    if _has_artifact(vocals):
+        await _save_one(vocals, f"{base_name}-vocals", "isolated vocals")
+
+    mux = body.get("mux")
+    valid_mux = [m for m in mux if _has_artifact(m)] if isinstance(mux, list) else []
+    multi_mux = len(valid_mux) > 1
+    for entry in sorted(valid_mux, key=lambda m: m.get("stream_index") or 0):
+        idx = entry.get("stream_index") or 0
+        suffix = f"-{idx}" if multi_mux else ""
+        await _save_one(
+            entry,
+            f"{base_name}-mux{suffix}",
+            "mux — vocals + music mixed, ready to use",
+        )
+
+    return saved
+
+
 # ---------- Tools: generation ----------
 
 @mcp.tool(
@@ -1268,17 +1400,30 @@ async def _get_max_upload_size_mb() -> int:
         "Maximum video duration is 360 seconds (6 minutes).\n"
         "    video_url (str, optional): HTTPS URL to a video file.\n"
         "    prompt (str, optional): Style hint for the generated music.\n"
+        "    isolate_vocals (bool, optional): Also separate an isolated "
+        "vocal stem and a ready-to-use mux (vocals+music, already mixed) "
+        "from the generated track. Defaults to False. When True this "
+        "internally uses the backend's async generation mode (submit + "
+        "poll) instead of streaming — the call takes longer but the tool "
+        "still waits for completion. Subject to the same 360-second video "
+        "duration cap as the plain case.\n"
         "    output_directory (str, optional): Where to save the resulting "
         "audio file(s). Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Exactly one of video_path and video_url must be provided.\n\n"
         "Returns:\n"
-        "    One TextContent per generated audio stream."
+        "    isolate_vocals=False (default): one TextContent per generated "
+        "audio stream, unchanged from before.\n"
+        "    isolate_vocals=True: one TextContent per generated audio "
+        "stream, plus one for the isolated vocals file, plus one per mux "
+        "stream (vocals+music mixed — this is the ready-to-use combined "
+        "result). Each TextContent's label says which kind of file it is."
     )
 )
 async def video_to_music(
     video_path: str | None = None,
     video_url: str | None = None,
     prompt: str | None = None,
+    isolate_vocals: bool = False,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     if (video_path and video_url) or (not video_path and not video_url):
@@ -1308,14 +1453,26 @@ async def video_to_music(
                 f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
             )
         await _check_media_duration(str(resolved))
-        data = {"prompt": prompt} if prompt else None
+        data: dict = {"prompt": prompt} if prompt else {}
+        if isolate_vocals:
+            # isolate_vocals requires mode=async on the backend (else a
+            # 400) — always send both together, no user-facing mode param.
+            data["mode"] = "async"
+            data["isolate_vocals"] = "true"
         mime, _ = mimetypes.guess_type(resolved.name)
         content = _read_capped(resolved, max_mb, "Video")
         files = {"video": (resolved.name, content, mime or "application/octet-stream")}
+        if isolate_vocals:
+            task_id = await _post_task_submit(
+                "/v1/video-to-music", data=data, files=files
+            )
+            body = await _poll_task(task_id, cfg["timeout"])
+            base = _slugify(prompt) if prompt else f"music-{task_id[:8]}"
+            return await _save_music_task_artifacts(body, out_path, base, task_id)
         return await _post_streaming_generation(
             "/v1/video-to-music",
             out_path,
-            data=data,
+            data=data or None,
             files=files,
         )
 
@@ -1324,6 +1481,13 @@ async def video_to_music(
     form: dict = {"video_url": video_url}
     if prompt:
         form["prompt"] = prompt
+    if isolate_vocals:
+        form["mode"] = "async"
+        form["isolate_vocals"] = "true"
+        task_id = await _post_task_submit("/v1/video-to-music", data=form)
+        body = await _poll_task(task_id, cfg["timeout"])
+        base = _slugify(prompt) if prompt else f"music-{task_id[:8]}"
+        return await _save_music_task_artifacts(body, out_path, base, task_id)
     # Use `data` for form fields without files; httpx will use
     # application/x-www-form-urlencoded. The backend `video_to_music`
     # endpoint accepts both multipart and urlencoded for the URL mode.

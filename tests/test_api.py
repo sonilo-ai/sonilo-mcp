@@ -1250,6 +1250,304 @@ async def test_video_to_music_path_too_long(monkeypatch, output_dir, tmp_path):
     assert upload_route.call_count == 0
 
 
+@respx.mock
+async def test_video_to_music_isolate_vocals_url_mode_submits_async_fields(
+    monkeypatch, output_dir
+):
+    # isolate_vocals=True must route through the task submit+poll path (mode
+    # async), sending both mode and isolate_vocals as form fields, instead of
+    # the plain streaming POST.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-vocals-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-vocals-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-vocals-1", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "sample_rate": 44100,
+                "channels": 2, "file_size": 5,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"audio")
+    )
+    result = await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4",
+        prompt="Chill Beat",
+        isolate_vocals=True,
+    )
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["mode"] == ["async"]
+    assert sent["isolate_vocals"] == ["true"]
+    assert sent["video_url"] == ["https://cdn.example.com/v.mp4"]
+    assert sent["prompt"] == ["Chill Beat"]
+    assert len(result) == 1
+    assert (output_dir / "chill-beat.m4a").read_bytes() == b"audio"
+
+
+@respx.mock
+async def test_video_to_music_isolate_vocals_false_no_extra_fields(
+    monkeypatch, output_dir
+):
+    # Default isolate_vocals=False must keep streaming behavior UNCHANGED —
+    # no mode/isolate_vocals fields sent, no task_id round trip.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    ndjson = _ndjson_bytes([
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(b"x").decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import video_to_music
+    await video_to_music(video_url="https://cdn.example.com/v.mp4")
+    from urllib.parse import parse_qs
+    sent = parse_qs(route.calls.last.request.content.decode())
+    assert "mode" not in sent
+    assert "isolate_vocals" not in sent
+
+
+@respx.mock
+async def test_video_to_music_isolate_vocals_path_mode_multipart(
+    monkeypatch, output_dir, tmp_path
+):
+    # Local-file (multipart) submission must also carry mode/isolate_vocals
+    # as form fields alongside the uploaded video.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={"max_upload_size_mb": 300})
+    )
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"FAKE-MP4")
+    submit = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-vocals-2", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-vocals-2").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-vocals-2", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"a")
+    )
+    api._reset_services_cache()
+    result = await api.video_to_music(video_path=str(video), isolate_vocals=True)
+    sent = submit.calls.last.request
+    assert sent.headers["content-type"].startswith("multipart/form-data")
+    assert b"FAKE-MP4" in sent.content
+    assert b'name="mode"' in sent.content and b"async" in sent.content
+    assert b'name="isolate_vocals"' in sent.content
+    assert len(result) == 1
+    assert (output_dir / "music-t-vocals.m4a").exists()
+
+
+@respx.mock
+async def test_video_to_music_isolate_vocals_saves_audio_vocals_and_mux(
+    monkeypatch, output_dir
+):
+    # Full succeeded envelope with multi-stream audio, a single vocals stem,
+    # and multi-stream mux — must save all of them under the documented
+    # naming convention and label each in the returned TextContent.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-vocals-3", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-vocals-3").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-vocals-3", "type": "video_to_music",
+            "status": "succeeded",
+            "audio": [
+                {"stream_index": 0, "url": "https://r2.test/a0.m4a",
+                 "content_type": "audio/mp4", "file_size": 2},
+                {"stream_index": 1, "url": "https://r2.test/a1.m4a",
+                 "content_type": "audio/mp4", "file_size": 2},
+            ],
+            "vocals": {
+                "url": "https://r2.test/vocals.m4a",
+                "content_type": "audio/mp4", "file_size": 3,
+            },
+            "mux": [
+                {"stream_index": 0, "url": "https://r2.test/mux0.m4a",
+                 "content_type": "audio/mp4", "file_size": 4},
+                {"stream_index": 1, "url": "https://r2.test/mux1.m4a",
+                 "content_type": "audio/mp4", "file_size": 4},
+            ],
+            "title": {"title": "Beat Drop", "summary": "s", "display_tags": []},
+            "duration_seconds": 92.5,
+        })
+    )
+    respx.get("https://r2.test/a0.m4a").mock(return_value=httpx.Response(200, content=b"a0"))
+    respx.get("https://r2.test/a1.m4a").mock(return_value=httpx.Response(200, content=b"a1"))
+    respx.get("https://r2.test/vocals.m4a").mock(return_value=httpx.Response(200, content=b"voc"))
+    respx.get("https://r2.test/mux0.m4a").mock(return_value=httpx.Response(200, content=b"mx0"))
+    respx.get("https://r2.test/mux1.m4a").mock(return_value=httpx.Response(200, content=b"mx1"))
+
+    result = await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4",
+        prompt="Beat Drop",
+        isolate_vocals=True,
+    )
+
+    assert (output_dir / "beat-drop-0.m4a").read_bytes() == b"a0"
+    assert (output_dir / "beat-drop-1.m4a").read_bytes() == b"a1"
+    assert (output_dir / "beat-drop-vocals.m4a").read_bytes() == b"voc"
+    assert (output_dir / "beat-drop-mux-0.m4a").read_bytes() == b"mx0"
+    assert (output_dir / "beat-drop-mux-1.m4a").read_bytes() == b"mx1"
+
+    assert len(result) == 5
+    texts = [t.text for t in result]
+    assert any("music audio" in t and "beat-drop-0.m4a" in t for t in texts)
+    assert any("music audio" in t and "beat-drop-1.m4a" in t for t in texts)
+    assert any("vocals" in t.lower() and "beat-drop-vocals.m4a" in t for t in texts)
+    mux_texts = [t for t in texts if "beat-drop-mux-0.m4a" in t or "beat-drop-mux-1.m4a" in t]
+    assert len(mux_texts) == 2
+    assert all("mux" in t.lower() and "ready to use" in t.lower() for t in mux_texts)
+
+
+@respx.mock
+async def test_video_to_music_isolate_vocals_single_stream_no_suffix(
+    monkeypatch, output_dir
+):
+    # A single audio stream / single mux stream must use the unsuffixed
+    # {base}.m4a / {base}-mux.m4a naming (matches the streaming convention's
+    # num_streams == 1 case).
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-vocals-4", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-vocals-4").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-vocals-4", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+            "vocals": {
+                "url": "https://r2.test/vocals.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            },
+            "mux": [{
+                "stream_index": 0, "url": "https://r2.test/mux.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a.m4a").mock(return_value=httpx.Response(200, content=b"a"))
+    respx.get("https://r2.test/vocals.m4a").mock(return_value=httpx.Response(200, content=b"v"))
+    respx.get("https://r2.test/mux.m4a").mock(return_value=httpx.Response(200, content=b"m"))
+
+    await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", isolate_vocals=True
+    )
+    assert (output_dir / "music-t-vocals.m4a").read_bytes() == b"a"
+    assert (output_dir / "music-t-vocals-vocals.m4a").read_bytes() == b"v"
+    assert (output_dir / "music-t-vocals-mux.m4a").read_bytes() == b"m"
+
+
+@respx.mock
+async def test_video_to_music_isolate_vocals_task_failed(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-vocals-5", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-vocals-5").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-vocals-5", "status": "failed",
+            "error": {"code": "GENERATION_FAILED", "message": "boom"},
+            "refunded": True,
+        })
+    )
+    with pytest.raises(Exception, match="boom"):
+        await api.video_to_music(
+            video_url="https://cdn.example.com/v.mp4", isolate_vocals=True
+        )
+
+
+@respx.mock
+async def test_video_to_music_isolate_vocals_no_audio_raises(monkeypatch, output_dir):
+    # Contract says `audio` is ALWAYS a list for async v2m — an empty/missing
+    # list is a backend contract violation and must raise clearly rather
+    # than silently report zero files saved.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-vocals-6", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-vocals-6").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-vocals-6", "status": "succeeded", "audio": [],
+        })
+    )
+    with pytest.raises(Exception, match="no audio artifact"):
+        await api.video_to_music(
+            video_url="https://cdn.example.com/v.mp4", isolate_vocals=True
+        )
+
+
 async def test_play_audio_rejects_nonexistent(monkeypatch):
     monkeypatch.setenv("SONILO_MCP_BASE_PATH", "/tmp")
     from sonilo_mcp.api import play_audio

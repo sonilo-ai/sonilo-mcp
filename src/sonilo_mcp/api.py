@@ -997,8 +997,8 @@ async def _save_task_artifacts(
     failed -> raise with the backend's error code/message and whether the
     charge was refunded. succeeded -> download whichever artifacts the task
     produced — audio and/or video — one TextContent per saved file. An audio
-    artifact is required: an SFX task always has audio (plus video for
-    video-to-sfx). The sole exemption is an audio-ducking task with a video
+    artifact is required: an SFX task always has audio (video-to-sfx returns
+    audio only). The sole exemption is an audio-ducking task with a video
     voice input, whose only artifact is the re-muxed mp4 (see
     _normalize_task_envelope, which reports whether it saw that envelope).
 
@@ -1374,8 +1374,8 @@ async def text_to_sfx(
 @mcp.tool(
     description=(
         "Generate sound effects for a video: Sonilo analyzes the video and "
-        "creates matching SFX. Returns BOTH the sound-effects audio file "
-        "and the finished video with the effects mixed in. Provide either a "
+        "creates matching SFX. Returns the generated sound-effects audio "
+        "file. Provide either a "
         "local video file path or a publicly accessible video URL. "
         "Generation is asynchronous on the backend; this tool waits for "
         "completion and returns the saved file paths.\n\n"
@@ -1401,8 +1401,8 @@ async def text_to_sfx(
         "files. Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Exactly one of video_path and video_url must be provided.\n\n"
         "Returns:\n"
-        "    Two TextContents: the saved audio file path and the saved "
-        ".mp4 video path. If the call times out, the error message "
+        "    One TextContent: the saved audio file path. If the call times "
+        "out, the error message "
         "includes the task_id — recover with get_sfx_task."
     )
 )

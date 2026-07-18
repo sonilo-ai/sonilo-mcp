@@ -3177,6 +3177,184 @@ async def test_video_to_sfx_size_cap_enforced_on_actual_bytes(
     assert submit_route.call_count == 0
 
 
+# ---------- video-to-video ----------
+
+@respx.mock
+async def test_video_to_video_music_url_mode_submits_and_saves(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-video-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "vv-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/vv-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "vv-1", "type": "video_to_video_music", "status": "succeeded",
+            "video": {
+                "url": "https://r2.test/o.mp4", "content_type": "video/mp4",
+                "file_size": 3,
+            },
+            "duration_seconds": 5.0,
+        })
+    )
+    respx.get("https://r2.test/o.mp4").mock(
+        return_value=httpx.Response(200, content=b"video-bytes")
+    )
+    result = await api.video_to_video_music(
+        video_url="https://example.com/clip.mp4",
+        prompt="Cinematic",
+        preserve_speech=True,
+    )
+    sent = submit.calls.last.request
+    assert b"video_url=" in sent.content
+    assert b"Cinematic" in sent.content
+    assert b"preserve_speech=true" in sent.content
+    assert len(result) == 1
+    assert (output_dir / "cinematic.mp4").read_bytes() == b"video-bytes"
+
+
+@respx.mock
+async def test_video_to_video_music_path_mode_uploads_multipart(
+    monkeypatch, output_dir, tmp_path
+):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={"max_upload_size_mb": 300})
+    )
+    video = output_dir / "clip.mp4"
+    video.write_bytes(b"FAKE-MP4")
+    submit = respx.post("https://api.test.local/v1/video-to-video-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "vv-2", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/vv-2").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "vv-2", "type": "video_to_video_music", "status": "succeeded",
+            "video": {
+                "url": "https://r2.test/o2.mp4", "content_type": "video/mp4",
+                "file_size": 3,
+            },
+        })
+    )
+    respx.get("https://r2.test/o2.mp4").mock(
+        return_value=httpx.Response(200, content=b"v2")
+    )
+    api._reset_services_cache()
+    result = await api.video_to_video_music(video_path=str(video))
+    sent = submit.calls.last.request
+    assert sent.headers["content-type"].startswith("multipart/form-data")
+    assert b"FAKE-MP4" in sent.content
+    assert len(result) == 1
+    # No prompt -> base name falls back to v2v-music-{task_id[:8]}.
+    assert (output_dir / "v2v-music-vv-2.mp4").exists()
+
+
+async def test_video_to_video_music_both_inputs_rejected(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp.api import video_to_video_music
+    with pytest.raises(Exception, match="exactly one"):
+        await video_to_video_music(
+            video_path="/tmp/a.mp4", video_url="https://example.com/b.mp4"
+        )
+    with pytest.raises(Exception, match="exactly one"):
+        await video_to_video_music()
+
+
+@pytest.mark.parametrize("bad_url", ["file:///etc/passwd", "ftp://x/y.mp4"])
+async def test_video_to_video_music_rejects_non_http_url(monkeypatch, output_dir, bad_url):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp.api import video_to_video_music
+    with pytest.raises(Exception, match="http"):
+        await video_to_video_music(video_url=bad_url)
+
+
+@respx.mock
+async def test_video_to_video_sfx_url_mode_segments_passthrough(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-video-sfx").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "vvs-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/vvs-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "vvs-1", "type": "video_to_video_sfx", "status": "succeeded",
+            "video": {
+                "url": "https://r2.test/sfx.mp4", "content_type": "video/mp4",
+                "file_size": 3,
+            },
+        })
+    )
+    respx.get("https://r2.test/sfx.mp4").mock(
+        return_value=httpx.Response(200, content=b"sfx-video")
+    )
+    segs = [
+        {"start": 0, "end": 2, "prompt": "whoosh"},
+        {"start": 2, "end": 5, "prompt": "boom"},
+    ]
+    result = await api.video_to_video_sfx(
+        video_url="https://example.com/clip.mp4", segments=segs
+    )
+    from urllib.parse import parse_qs
+    sent_fields = parse_qs(submit.calls.last.request.content.decode())
+    assert json.loads(sent_fields["segments"][0]) == segs
+    assert len(result) == 1
+    # No prompt -> base name falls back to v2v-sfx-{task_id[:8]}.
+    assert (output_dir / "v2v-sfx-vvs-1.mp4").read_bytes() == b"sfx-video"
+
+
+@respx.mock
+async def test_video_to_video_sfx_rejects_video_over_180s(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp.api import video_to_video_sfx
+    # 200s passes the music cap (360) but must fail the SFX/v2v-sfx cap (180).
+    _patch_ffprobe(monkeypatch, duration=200.0)
+    submit_route = respx.post("https://api.test.local/v1/video-to-video-sfx").mock(
+        return_value=httpx.Response(202, json={"task_id": "t-should-not-charge"})
+    )
+    with pytest.raises(Exception, match="exceeds the maximum"):
+        await video_to_video_sfx(video_url="https://example.com/long.mp4")
+    # Must NOT charge — the duration check must reject before the submit POST.
+    assert submit_route.call_count == 0
+
+
+async def test_video_to_video_sfx_both_inputs_rejected(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp.api import video_to_video_sfx
+    with pytest.raises(Exception, match="exactly one"):
+        await video_to_video_sfx(
+            video_path="/tmp/a.mp4", video_url="https://example.com/b.mp4"
+        )
+    with pytest.raises(Exception, match="exactly one"):
+        await video_to_video_sfx()
+
+
 @respx.mock
 async def test_get_sfx_task_processing(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")

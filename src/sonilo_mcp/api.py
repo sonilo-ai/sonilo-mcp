@@ -1713,15 +1713,206 @@ async def video_to_sfx(
     return await _save_task_artifacts(body, out_path, base, task_id)
 
 
+# ---------- Tools: video-to-video ----------
+
 @mcp.tool(
     description=(
-        "Check a sound-effects, audio-ducking, or async video-to-music "
-        "(isolate_vocals) generation task and, if finished, download its "
-        "result file(s). Use this to recover a result when text_to_sfx, "
-        "video_to_sfx, audio_ducking, or video_to_music(isolate_vocals=true) "
-        "timed out — their error message contains the task_id. Does not "
-        "poll: a single status check per call. This tool itself never "
-        "charges.\n\n"
+        "Generate an original score for a video and return a NEW VIDEO with "
+        "the music muxed in (not just an audio file). Provide either a local "
+        "video path or a public video URL. Generation is asynchronous; this "
+        "tool waits for completion and returns the saved video path. Tracks "
+        "are fully licensed (via Shutterstock) and cleared for commercial "
+        "use.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges. Only use when explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    video_path (str, optional): Absolute local path, or relative to "
+        "SONILO_MCP_BASE_PATH. Subject to the account upload cap. Maximum "
+        "video duration is 360 seconds (6 minutes).\n"
+        "    video_url (str, optional): HTTPS URL to a video file.\n"
+        "    prompt (str, optional): Style hint for the generated music.\n"
+        "    preserve_speech (bool, optional): Keep the source speech/vocals "
+        "in the output. Defaults to False.\n"
+        "    isolate_vocals (bool, optional): Deprecated alias for "
+        "preserve_speech; both are accepted and OR'd together. Defaults to "
+        "False.\n"
+        "    output_directory (str, optional): Where to save the result. "
+        "Defaults to SONILO_MCP_BASE_PATH.\n\n"
+        "Exactly one of video_path and video_url must be provided.\n\n"
+        "Returns:\n"
+        "    TextContent with the saved .mp4 path. On timeout the error "
+        "message includes the task_id — recover with get_sfx_task."
+    )
+)
+async def video_to_video_music(
+    video_path: str | None = None,
+    video_url: str | None = None,
+    prompt: str | None = None,
+    preserve_speech: bool = False,
+    isolate_vocals: bool = False,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    if (video_path and video_url) or (not video_path and not video_url):
+        raise Exception(
+            "Provide either video_path or video_url (exactly one, not both)"
+        )
+
+    if video_url:
+        # Same scheme guard as video_to_music/video_to_sfx: keeps file://
+        # and flag-like values away from ffprobe and the backend.
+        _require_http_url(video_url, "video")
+
+    out_path = _make_output_path(output_directory)
+    cfg = _get_config()
+
+    form: dict = {}
+    if prompt:
+        form["prompt"] = prompt
+    if preserve_speech:
+        form["preserve_speech"] = "true"
+    if isolate_vocals:
+        form["isolate_vocals"] = "true"
+
+    if video_path:
+        resolved = _resolve_input_file(
+            video_path, cfg["base_path"], _VIDEO_EXTS, "video"
+        )
+        max_mb = await _get_max_upload_size_mb()
+        size_mb = resolved.stat().st_size / (1024 * 1024)
+        if size_mb > max_mb:
+            # Cheap fail-fast: avoids a wasted ffprobe run for an
+            # obviously-oversized file. NOT the authoritative check — see
+            # _read_capped, which enforces the cap on the bytes actually read.
+            raise Exception(
+                f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
+            )
+        await _check_media_duration(str(resolved))
+        mime, _ = mimetypes.guess_type(resolved.name)
+        content = _read_capped(resolved, max_mb, "Video")
+        files = {
+            "video": (
+                resolved.name, content, mime or "application/octet-stream"
+            )
+        }
+        task_id = await _post_task_submit(
+            "/v1/video-to-video-music", data=form or None, files=files
+        )
+    else:
+        await _check_media_duration(video_url)
+        form["video_url"] = video_url
+        task_id = await _post_task_submit("/v1/video-to-video-music", data=form)
+
+    body = await _poll_task(task_id, cfg["timeout"])
+    base = _slugify(prompt) if prompt else f"v2v-music-{task_id[:8]}"
+    return await _save_task_artifacts(body, out_path, base, task_id)
+
+
+@mcp.tool(
+    description=(
+        "Generate sound effects for a video and return a NEW VIDEO with the "
+        "SFX muxed in (not just an audio file). Provide either a local "
+        "video path or a public video URL. Generation is asynchronous; this "
+        "tool waits for completion and returns the saved video path.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges. Only use when explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    video_path (str, optional): Absolute local path, or relative "
+        "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.webm/.m4v/.gif (gif "
+        "must be animated). Subject to the account's max upload size "
+        "(typically 300 MB). Maximum video duration is 180 seconds "
+        "(3 minutes).\n"
+        "    video_url (str, optional): HTTPS URL to a video file.\n"
+        "    prompt (str, optional): Overall description of the desired "
+        "sound effects (max 2000 chars).\n"
+        "    segments (list, optional): Per-segment SFX descriptions, each "
+        '{"start": float, "end": float, "prompt": str}. Backend rules: '
+        "first start must be 0; segments must be contiguous (each end == "
+        "next start); every end > start; every prompt non-empty (max 200 "
+        "chars); last end must not exceed the video duration; max 30 "
+        "segments. Invalid segments are rejected before any charge.\n"
+        "    output_directory (str, optional): Where to save the result. "
+        "Defaults to SONILO_MCP_BASE_PATH.\n\n"
+        "Exactly one of video_path and video_url must be provided.\n\n"
+        "Returns:\n"
+        "    TextContent with the saved .mp4 path. On timeout the error "
+        "message includes the task_id — recover with get_sfx_task."
+    )
+)
+async def video_to_video_sfx(
+    video_path: str | None = None,
+    video_url: str | None = None,
+    prompt: str | None = None,
+    segments: list[dict] | None = None,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    if (video_path and video_url) or (not video_path and not video_url):
+        raise Exception(
+            "Provide either video_path or video_url (exactly one, not both)"
+        )
+
+    if video_url:
+        # Same scheme guard as video_to_video_music/video_to_sfx: keeps
+        # file:// and flag-like values away from ffprobe and the backend.
+        _require_http_url(video_url, "video")
+
+    out_path = _make_output_path(output_directory)
+    cfg = _get_config()
+
+    form: dict = {}
+    if prompt and prompt.strip():
+        form["prompt"] = prompt
+    if segments is not None:
+        # Pass-through: the backend validates segments strictly and rejects
+        # bad input with a 400 before charging.
+        form["segments"] = json.dumps(segments)
+
+    if video_path:
+        resolved = _resolve_input_file(
+            video_path, cfg["base_path"], _SFX_VIDEO_EXTS, "video"
+        )
+        max_mb = await _get_max_upload_size_mb()
+        size_mb = resolved.stat().st_size / (1024 * 1024)
+        if size_mb > max_mb:
+            # Cheap fail-fast: avoids a wasted ffprobe run for an
+            # obviously-oversized file. NOT the authoritative check — see
+            # _read_capped, which enforces the cap on the bytes actually read.
+            raise Exception(
+                f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
+            )
+        await _check_media_duration(
+            str(resolved), max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
+        )
+        mime, _ = mimetypes.guess_type(resolved.name)
+        content = _read_capped(resolved, max_mb, "Video")
+        files = {
+            "video": (
+                resolved.name, content, mime or "application/octet-stream"
+            )
+        }
+        task_id = await _post_task_submit(
+            "/v1/video-to-video-sfx", data=form or None, files=files
+        )
+    else:
+        await _check_media_duration(
+            video_url, max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
+        )
+        form["video_url"] = video_url
+        task_id = await _post_task_submit("/v1/video-to-video-sfx", data=form)
+
+    body = await _poll_task(task_id, cfg["timeout"])
+    base = _slugify(prompt) if prompt and prompt.strip() else f"v2v-sfx-{task_id[:8]}"
+    return await _save_task_artifacts(body, out_path, base, task_id)
+
+
+@mcp.tool(
+    description=(
+        "Check a sound-effects, audio-ducking, video-to-video, or async "
+        "video-to-music (isolate_vocals) generation task and, if finished, "
+        "download its result file(s). Use this to recover a result when "
+        "text_to_sfx, video_to_sfx, audio_ducking, video_to_video_music, "
+        "video_to_video_sfx, or video_to_music(isolate_vocals=true) timed "
+        "out — their error message contains the task_id. Does not poll: a "
+        "single status check per call. This tool itself never charges.\n\n"
         "Args:\n"
         "    task_id (str): The task id returned in the timeout message.\n"
         "    output_directory (str, optional): Where to save result files. "
@@ -1730,6 +1921,7 @@ async def video_to_sfx(
         "    Still processing -> a status message; try again later. "
         "Succeeded -> the saved file path(s): audio, plus video for "
         "video_to_sfx tasks; a single .wav or .mp4 for audio_ducking "
+        "tasks; a single .mp4 for video_to_video_music/video_to_video_sfx "
         "tasks; for a video_to_music(isolate_vocals=true) task, the audio "
         "stream(s) plus the isolated vocals stem plus the mux "
         "(vocals+music mixed — the ready-to-use combined result). "

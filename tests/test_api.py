@@ -1548,6 +1548,224 @@ async def test_video_to_music_isolate_vocals_no_audio_raises(monkeypatch, output
         )
 
 
+@respx.mock
+async def test_video_to_music_ducking_uses_async_path(monkeypatch, output_dir):
+    # ducking=False must route through the task submit+poll path (mode
+    # async), forwarding ducking as a form field, even though isolate_vocals
+    # and preserve_speech are both unset.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-duck-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-duck-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-duck-1", "type": "video_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"a")
+    )
+    await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", ducking=False
+    )
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["mode"] == ["async"]
+    assert sent["ducking"] == ["false"]
+    assert "isolate_vocals" not in sent
+
+
+@respx.mock
+async def test_video_to_music_ducking_unset_omits_field(monkeypatch, output_dir):
+    # ducking left unset must NOT be sent at all, so the backend's default-on
+    # behavior applies — sending "ducking" here would force a value.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-duck-2", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-duck-2").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-duck-2", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a2.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a2.m4a").mock(
+        return_value=httpx.Response(200, content=b"a")
+    )
+    await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", preserve_speech=True
+    )
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert "ducking" not in sent
+    assert sent["preserve_speech"] == ["true"]
+
+
+@respx.mock
+async def test_video_to_music_output_format_wav_uses_async_path(monkeypatch, output_dir):
+    # output_format="wav" alone (no isolate_vocals/preserve_speech/ducking)
+    # must also trigger the async submit+poll path.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-wav-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-wav-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-wav-1", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a3.wav",
+                "content_type": "audio/wav", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a3.wav").mock(
+        return_value=httpx.Response(200, content=b"w")
+    )
+    await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", output_format="wav"
+    )
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["mode"] == ["async"]
+    assert sent["output_format"] == ["wav"]
+
+
+@respx.mock
+async def test_video_to_music_ducked_stems_saved(monkeypatch, output_dir):
+    # A `ducked` list on the async result must be saved alongside audio,
+    # each labeled distinctly (Task C1's plumbing, exercised end-to-end
+    # through the tool).
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-duck-3", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-duck-3").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-duck-3", "type": "video_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a4.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+            "ducked": [{
+                "stream_index": 0, "url": "https://r2.test/d4.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a4.m4a").mock(return_value=httpx.Response(200, content=b"a"))
+    respx.get("https://r2.test/d4.m4a").mock(return_value=httpx.Response(200, content=b"d"))
+    result = await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", prompt="Duck Test", ducking=True
+    )
+    assert (output_dir / "duck-test.m4a").read_bytes() == b"a"
+    assert (output_dir / "duck-test-ducked.m4a").read_bytes() == b"d"
+    texts = [t.text for t in result]
+    assert any("ducked" in t.lower() and "duck-test-ducked.m4a" in t for t in texts)
+
+
+@respx.mock
+async def test_text_to_music_output_format_wav_uses_async_path(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "tm-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/tm-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "tm-1", "type": "text_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/tm.wav",
+                "content_type": "audio/wav", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/tm.wav").mock(
+        return_value=httpx.Response(200, content=b"w")
+    )
+    result = await api.text_to_music(prompt="lofi", duration=10, output_format="wav")
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["mode"] == ["async"]
+    assert sent["output_format"] == ["wav"]
+    assert sent["prompt"] == ["lofi"]
+    assert sent["duration"] == ["10"]
+    assert len(result) == 1
+    assert (output_dir / "lofi.wav").read_bytes() == b"w"
+
+
+@respx.mock
+async def test_text_to_music_no_output_format_still_streams(monkeypatch, output_dir):
+    # Default (no output_format) must keep streaming behavior UNCHANGED —
+    # no mode/output_format fields sent, no task_id round trip.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    ndjson = _ndjson_bytes([
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(b"x").decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import text_to_music
+    await text_to_music(prompt="lofi", duration=10)
+    from urllib.parse import parse_qs
+    sent = parse_qs(route.calls.last.request.content.decode())
+    assert "mode" not in sent
+    assert "output_format" not in sent
+
+
 async def test_play_audio_rejects_nonexistent(monkeypatch):
     monkeypatch.setenv("SONILO_MCP_BASE_PATH", "/tmp")
     from sonilo_mcp.api import play_audio

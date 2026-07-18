@@ -1397,27 +1397,46 @@ async def _save_music_task_artifacts(
         "    prompt (str): Description of the music to generate "
         "(1–1000 chars).\n"
         "    duration (int): Length in seconds (1–360).\n"
+        "    output_format (str, optional): 'm4a' (default) or 'wav'. "
+        "'wav' requires the backend's async generation mode (submit + "
+        "poll) instead of streaming — selected automatically, no "
+        "user-facing mode param needed.\n"
         "    output_directory (str, optional): Absolute path, or relative "
         "to SONILO_MCP_BASE_PATH. Defaults to SONILO_MCP_BASE_PATH "
         "(~/Desktop unless overridden).\n\n"
         "Returns:\n"
         "    One TextContent per generated audio stream, each containing "
-        "the absolute path of the saved .m4a file (AAC in MP4 container)."
+        "the absolute path of the saved audio file (.m4a by default, "
+        ".wav when output_format='wav')."
     )
 )
 async def text_to_music(
     prompt: str,
     duration: int,
+    output_format: str | None = None,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     out_path = _make_output_path(output_directory)
     # The backend's text-to-music endpoint expects form fields, not a JSON
     # body (same as video-to-music). Sending JSON yields a 422
     # "Field required" for prompt/duration.
+    data: dict = {"prompt": prompt, "duration": duration}
+    if output_format == "wav":
+        # 'wav' requires mode=async on the backend (else a 400) — always
+        # send both together, no user-facing mode param (mirrors
+        # video_to_music's isolate_vocals/preserve_speech/ducking handling).
+        data["mode"] = "async"
+        data["output_format"] = output_format
+        task_id = await _post_task_submit("/v1/text-to-music", data=data)
+        body = await _poll_task(task_id, _get_config()["timeout"])
+        base = _slugify(prompt) if prompt else f"music-{task_id[:8]}"
+        return await _save_music_task_artifacts(body, out_path, base, task_id)
+    if output_format:
+        data["output_format"] = output_format
     return await _post_streaming_generation(
         "/v1/text-to-music",
         out_path,
-        data={"prompt": prompt, "duration": duration},
+        data=data,
     )
 
 
@@ -1472,21 +1491,34 @@ async def _get_max_upload_size_mb() -> int:
         "    prompt (str, optional): Style hint for the generated music.\n"
         "    isolate_vocals (bool, optional): Also separate an isolated "
         "vocal stem and a ready-to-use mux (vocals+music, already mixed) "
-        "from the generated track. Defaults to False. When True this "
-        "internally uses the backend's async generation mode (submit + "
-        "poll) instead of streaming — the call takes longer but the tool "
-        "still waits for completion. Subject to the same 360-second video "
-        "duration cap as the plain case.\n"
+        "from the generated track. Deprecated alias for preserve_speech; "
+        "both are accepted and OR'd together. Defaults to False.\n"
+        "    preserve_speech (bool, optional): Keep the source speech in "
+        "the output alongside isolating a vocal stem and mux, same effect "
+        "as isolate_vocals. Defaults to False.\n"
+        "    output_format (str, optional): 'm4a' (default) or 'wav'.\n"
+        "    ducking (bool, optional): Duck the generated music under the "
+        "source voice at finalize time. Default-ON server-side: leave "
+        "unset to keep it on, pass False to opt out. Free, best-effort.\n"
+        "    Any of isolate_vocals/preserve_speech/output_format='wav'/"
+        "ducking makes this tool internally use the backend's async "
+        "generation mode (submit + poll) instead of streaming — the call "
+        "takes longer but the tool still waits for completion. Subject to "
+        "the same 360-second video duration cap as the plain case.\n"
         "    output_directory (str, optional): Where to save the resulting "
         "audio file(s). Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Exactly one of video_path and video_url must be provided.\n\n"
         "Returns:\n"
-        "    isolate_vocals=False (default): one TextContent per generated "
-        "audio stream, unchanged from before.\n"
-        "    isolate_vocals=True: one TextContent per generated audio "
-        "stream, plus one for the isolated vocals file, plus one per mux "
-        "stream (vocals+music mixed — this is the ready-to-use combined "
-        "result). Each TextContent's label says which kind of file it is."
+        "    Plain case (no async-triggering param set): one TextContent "
+        "per generated audio stream, unchanged from before.\n"
+        "    isolate_vocals/preserve_speech=True: one TextContent per "
+        "generated audio stream, plus one for the isolated vocals file, "
+        "plus one per mux stream (vocals+music mixed — this is the "
+        "ready-to-use combined result).\n"
+        "    ducking (default-on in async mode): also one TextContent per "
+        "ducked stream (music lowered under the source voice), when the "
+        "backend rendered one.\n"
+        "    Each TextContent's label says which kind of file it is."
     )
 )
 async def video_to_music(
@@ -1494,6 +1526,9 @@ async def video_to_music(
     video_url: str | None = None,
     prompt: str | None = None,
     isolate_vocals: bool = False,
+    preserve_speech: bool = False,
+    output_format: str | None = None,
+    ducking: bool | None = None,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     if (video_path and video_url) or (not video_path and not video_url):
@@ -1508,6 +1543,16 @@ async def video_to_music(
 
     out_path = _make_output_path(output_directory)
     cfg = _get_config()
+
+    # isolate_vocals/preserve_speech/ducking/output_format="wav" all
+    # require mode=async on the backend (else a 400) — always send it
+    # together, no user-facing mode param.
+    use_async = (
+        isolate_vocals
+        or preserve_speech
+        or output_format == "wav"
+        or ducking is not None
+    )
 
     if video_path:
         resolved = _resolve_input_file(
@@ -1525,14 +1570,19 @@ async def video_to_music(
         await _check_media_duration(str(resolved))
         data: dict = {"prompt": prompt} if prompt else {}
         if isolate_vocals:
-            # isolate_vocals requires mode=async on the backend (else a
-            # 400) — always send both together, no user-facing mode param.
-            data["mode"] = "async"
             data["isolate_vocals"] = "true"
+        if preserve_speech:
+            data["preserve_speech"] = "true"
+        if output_format:
+            data["output_format"] = output_format
+        if ducking is not None:
+            data["ducking"] = "true" if ducking else "false"
+        if use_async:
+            data["mode"] = "async"
         mime, _ = mimetypes.guess_type(resolved.name)
         content = _read_capped(resolved, max_mb, "Video")
         files = {"video": (resolved.name, content, mime or "application/octet-stream")}
-        if isolate_vocals:
+        if use_async:
             task_id = await _post_task_submit(
                 "/v1/video-to-music", data=data, files=files
             )
@@ -1552,8 +1602,15 @@ async def video_to_music(
     if prompt:
         form["prompt"] = prompt
     if isolate_vocals:
-        form["mode"] = "async"
         form["isolate_vocals"] = "true"
+    if preserve_speech:
+        form["preserve_speech"] = "true"
+    if output_format:
+        form["output_format"] = output_format
+    if ducking is not None:
+        form["ducking"] = "true" if ducking else "false"
+    if use_async:
+        form["mode"] = "async"
         task_id = await _post_task_submit("/v1/video-to-music", data=form)
         body = await _poll_task(task_id, cfg["timeout"])
         base = _slugify(prompt) if prompt else f"music-{task_id[:8]}"

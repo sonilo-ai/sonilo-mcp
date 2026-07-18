@@ -2299,6 +2299,83 @@ def test_normalize_task_envelope_rejects_unknown_output_type(output_type):
     assert "video" not in out
 
 
+def test_is_video_to_video_envelope():
+    from sonilo_mcp.api import _is_video_to_video_envelope
+    assert _is_video_to_video_envelope(
+        {"type": "video_to_video_music", "status": "succeeded", "video": {"url": "u"}}
+    )
+    assert _is_video_to_video_envelope(
+        {"type": "video_to_video_sfx", "status": "succeeded", "video": {"url": "u"}}
+    )
+    # Ducking's normalized envelope: video present, no audio, but its
+    # original output_url survives normalization — must not be mistaken
+    # for video-to-video.
+    assert not _is_video_to_video_envelope(
+        {"type": "audio_ducking", "status": "succeeded", "output_url": "u"}
+    )
+    # An explicit, different type is authoritative — must never be
+    # overridden by shape-sniffing, even when the shape matches (video
+    # present, no audio, no output_url).
+    assert not _is_video_to_video_envelope(
+        {"type": "video_to_sfx", "status": "succeeded", "video": {"url": "u"}}
+    )
+    # No `type` at all (defensive fallback for a malformed/older body):
+    # shape-sniffing kicks in.
+    assert _is_video_to_video_envelope({"status": "succeeded", "video": {"url": "u"}})
+    assert not _is_video_to_video_envelope(
+        {"status": "succeeded", "video": {"url": "u"}, "audio": {"url": "a"}}
+    )
+
+
+@respx.mock
+async def test_save_task_artifacts_saves_video_only(monkeypatch, tmp_path):
+    # A video-to-video result (`{"video": {...}}`, no `audio`) must be saved
+    # like the ducking video-only case — no "no audio artifact" error.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/v2v.mp4").mock(
+        return_value=httpx.Response(200, content=b"v2v-bytes")
+    )
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "v1", "type": "video_to_video_music", "status": "succeeded",
+        "video": {"url": "https://r2.test/v2v.mp4", "content_type": "video/mp4", "file_size": 9},
+    }
+    result = await _save_task_artifacts(body, tmp_path, "v2v-scene", "v1")
+    assert len(result) == 1
+    expected = tmp_path / "v2v-scene.mp4"
+    assert expected.read_bytes() == b"v2v-bytes"
+    assert str(expected) in result[0].text
+
+
+@respx.mock
+async def test_save_music_task_artifacts_saves_ducked_stems(monkeypatch, tmp_path):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/a.m4a").mock(return_value=httpx.Response(200, content=b"a"))
+    respx.get("https://r2.test/d0.m4a").mock(return_value=httpx.Response(200, content=b"d0"))
+    respx.get("https://r2.test/d1.m4a").mock(return_value=httpx.Response(200, content=b"d1"))
+    from sonilo_mcp.api import _save_music_task_artifacts
+    body = {
+        "task_id": "m-duck-1", "type": "video_to_music", "status": "succeeded",
+        "audio": [
+            {"stream_index": 0, "url": "https://r2.test/a.m4a",
+             "content_type": "audio/mp4", "file_size": 1},
+        ],
+        "ducked": [
+            {"stream_index": 0, "url": "https://r2.test/d0.m4a",
+             "content_type": "audio/mp4", "file_size": 2},
+            {"stream_index": 1, "url": "https://r2.test/d1.m4a",
+             "content_type": "audio/mp4", "file_size": 2},
+        ],
+    }
+    result = await _save_music_task_artifacts(body, tmp_path, "score", "m-duck-1")
+    assert (tmp_path / "score-ducked-0.m4a").read_bytes() == b"d0"
+    assert (tmp_path / "score-ducked-1.m4a").read_bytes() == b"d1"
+    texts = [t.text for t in result]
+    ducked_texts = [t for t in texts if "score-ducked-0.m4a" in t or "score-ducked-1.m4a" in t]
+    assert len(ducked_texts) == 2
+    assert all("ducked" in t.lower() for t in ducked_texts)
+
+
 @respx.mock
 async def test_save_task_artifacts_unknown_output_type_raises_recoverable(
     monkeypatch, tmp_path
@@ -2386,18 +2463,23 @@ async def test_save_task_artifacts_no_artifacts_still_raises(monkeypatch, tmp_pa
 async def test_save_task_artifacts_sfx_video_without_audio_still_raises(
     monkeypatch, tmp_path
 ):
-    # An SFX-shaped body is NOT a ducking envelope: it must always carry an
-    # audio artifact. A video-only SFX body means the audio half of a paid
-    # result went missing — downloading just the mp4 and reporting success
-    # would silently lose it, so this still raises the charged-and-
-    # recoverable error. (The video-only exemption belongs to ducking alone.)
+    # An SFX-shaped body is NOT a ducking or video-to-video envelope: it must
+    # always carry an audio artifact. A video-only SFX body means the audio
+    # half of a paid result went missing — downloading just the mp4 and
+    # reporting success would silently lose it, so this still raises the
+    # charged-and-recoverable error. (The video-only exemption belongs to
+    # ducking and video-to-video alone.) `type` is set to a real, unrelated
+    # task type — the backend's /v1/tasks/{id} always includes `type` — so
+    # this pins that an explicit non-v2v type is never overridden by the
+    # video-to-video shape-sniffing fallback (which only applies when `type`
+    # is missing entirely).
     monkeypatch.setenv("SONILO_API_KEY", "k")
     route = respx.get("https://r2.test/orphan.mp4").mock(
         return_value=httpx.Response(200, content=b"mp4-bytes")
     )
     from sonilo_mcp.api import _save_task_artifacts
     body = {
-        "task_id": "t-orphan", "status": "succeeded",
+        "task_id": "t-orphan", "type": "video_to_sfx", "status": "succeeded",
         "video": {"url": "https://r2.test/orphan.mp4", "content_type": "video/mp4"},
     }
     with pytest.raises(Exception) as exc:

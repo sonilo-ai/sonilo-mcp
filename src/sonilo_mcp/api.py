@@ -1052,9 +1052,12 @@ async def _save_task_artifacts(
     charge was refunded. succeeded -> download whichever artifacts the task
     produced — audio and/or video — one TextContent per saved file. An audio
     artifact is required: an SFX task always has audio (video-to-sfx returns
-    audio only). The sole exemption is an audio-ducking task with a video
-    voice input, whose only artifact is the re-muxed mp4 (see
-    _normalize_task_envelope, which reports whether it saw that envelope).
+    audio only). There are two exemptions: an audio-ducking task with a
+    video voice input, whose only artifact is the re-muxed mp4 (see
+    _normalize_task_envelope, which reports whether it saw that envelope);
+    and a video-to-video task (video_to_video_music/_sfx), whose only
+    artifact is the generated video with the new audio muxed in (see
+    _is_video_to_video_envelope).
 
     task_id must be the caller's own known-good id (from _post_task_submit
     or the tool's own task_id argument), NOT derived from body — the
@@ -1085,18 +1088,21 @@ async def _save_task_artifacts(
 
     audio = body.get("audio")
     video = body.get("video")
-    # An audio artifact is required, with exactly one exemption: a ducking
-    # task whose voice input was a video renders a single artifact, the
-    # re-muxed mp4, and has no audio slot at all. The exemption is keyed off
-    # _normalize_task_envelope having recognized a ducking envelope — NOT off
-    # "some artifact is present". An SFX body is still held to the audio
-    # requirement even when it carries a video: a video-without-audio SFX
-    # result means the audio half of an already-charged generation went
-    # missing, and quietly downloading just the mp4 would report success
-    # while losing it, with no recovery hint. Raising here keeps the task_id
-    # and the get_sfx_task call in the user's hands, which is the only way a
-    # paid result stays recoverable from the error message alone.
-    if not _has_artifact(audio) and not (is_ducking and _has_artifact(video)):
+    # An audio artifact is required, with exactly two exemptions: a ducking
+    # task whose voice input was a video, and a video-to-video task — both
+    # render a single artifact, the (re-)muxed mp4, and have no audio slot
+    # at all. Each exemption is keyed off its own recognizer having
+    # positively identified that envelope (_normalize_task_envelope's
+    # is_ducking / _is_video_to_video_envelope) — NOT off "some artifact is
+    # present". An SFX body is still held to the audio requirement even when
+    # it carries a video: a video-without-audio SFX result means the audio
+    # half of an already-charged generation went missing, and quietly
+    # downloading just the mp4 would report success while losing it, with no
+    # recovery hint. Raising here keeps the task_id and the get_sfx_task call
+    # in the user's hands, which is the only way a paid result stays
+    # recoverable from the error message alone.
+    is_v2v = _is_video_to_video_envelope(body)
+    if not _has_artifact(audio) and not ((is_ducking or is_v2v) and _has_artifact(video)):
         # Distinguish an unrecognized-output_type ducking result from a genuine
         # missing artifact. When there is a usable output_url but the
         # output_type is not one _normalize_task_envelope handles, get_sfx_task
@@ -1203,6 +1209,29 @@ async def _save_task_artifacts(
     return saved
 
 
+def _is_video_to_video_envelope(body: dict) -> bool:
+    """Whether a terminal /v1/tasks/{id} body is a video-to-video result:
+    a single `video` object and no `audio`. Prefers the backend `type`
+    field, falling back to shape-sniffing only for bodies that omit `type`
+    entirely.
+
+    An explicit, different `type` (e.g. "video_to_sfx", "audio_ducking") is
+    always authoritative and short-circuits straight to False: the backend's
+    /v1/tasks/{id} always sets `type` (see routers/v1/tasks.py), so shape-
+    sniffing over an explicitly-typed body would misclassify a genuine
+    video-only-without-audio SFX failure (audio half of a paid result went
+    missing — see _save_task_artifacts) as a healthy video-to-video result.
+    Ducking's normalized envelope is also excluded this way, though it is
+    additionally distinguishable by shape: it keeps its `output_url` key
+    even after _normalize_task_envelope adds the `video` slot, while a real
+    video-to-video body never has one.
+    """
+    t = body.get("type")
+    if isinstance(t, str) and t:
+        return t in ("video_to_video_music", "video_to_video_sfx")
+    return bool(body.get("video")) and body.get("audio") is None and "output_url" not in body
+
+
 def _is_music_task_envelope(body: dict) -> bool:
     """Whether a terminal /v1/tasks/{id} body is an async video-to-music
     envelope (list-shaped `audio`, optional single `vocals` and list `mux`)
@@ -1253,15 +1282,19 @@ async def _save_music_task_artifacts(
 
     succeeded -> download every entry in the `audio` list, then the single
     `vocals` object if present, then every entry in the `mux` list if
-    present — one TextContent per saved file, each labeled so the caller can
-    tell audio/vocals/mux apart. The mux files (vocals+music already mixed)
-    are called out as the ready-to-use combined result.
+    present, then every entry in the `ducked` list if present — one
+    TextContent per saved file, each labeled so the caller can tell audio/
+    vocals/mux/ducked apart. The mux files (vocals+music already mixed) are
+    called out as the ready-to-use combined result; `ducked` files are the
+    generated music lowered under the source voice (free, best-effort —
+    present only when the backend's `ducking` option ran).
 
     Naming follows the existing streaming convention: `{base}.m4a` for a
     single audio stream, `{base}-{idx}.m4a` when there is more than one.
-    `vocals` is saved as `{base}-vocals.{ext}`; `mux` follows the same
-    single/multi-stream pattern as audio: `{base}-mux.{ext}` or
-    `{base}-mux-{idx}.{ext}`.
+    `vocals` is saved as `{base}-vocals.{ext}`; `mux` and `ducked` follow
+    the same single/multi-stream pattern as audio: `{base}-mux.{ext}` or
+    `{base}-mux-{idx}.{ext}`, and likewise `{base}-ducked.{ext}` /
+    `{base}-ducked-{idx}.{ext}`.
 
     task_id must be the caller's own known-good id (from _post_task_submit),
     same rule as _save_task_artifacts — the terminal body is not a
@@ -1331,6 +1364,20 @@ async def _save_music_task_artifacts(
             entry,
             f"{base_name}-mux{suffix}",
             "mux — vocals + music mixed, ready to use",
+        )
+
+    ducked = body.get("ducked")
+    valid_ducked = (
+        [d for d in ducked if _has_artifact(d)] if isinstance(ducked, list) else []
+    )
+    multi_ducked = len(valid_ducked) > 1
+    for entry in sorted(valid_ducked, key=lambda d: d.get("stream_index") or 0):
+        idx = entry.get("stream_index") or 0
+        suffix = f"-{idx}" if multi_ducked else ""
+        await _save_one(
+            entry,
+            f"{base_name}-ducked{suffix}",
+            "ducked — music lowered under the source voice",
         )
 
     return saved

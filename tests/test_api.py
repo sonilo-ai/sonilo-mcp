@@ -1251,12 +1251,12 @@ async def test_video_to_music_path_too_long(monkeypatch, output_dir, tmp_path):
 
 
 @respx.mock
-async def test_video_to_music_isolate_vocals_url_mode_submits_async_fields(
+async def test_video_to_music_preserve_speech_url_mode_submits_async_fields(
     monkeypatch, output_dir
 ):
-    # isolate_vocals=True must route through the task submit+poll path (mode
-    # async), sending both mode and isolate_vocals as form fields, instead of
-    # the plain streaming POST.
+    # preserve_speech=True must route through the task submit+poll path (mode
+    # async), sending both mode and preserve_speech as form fields, instead
+    # of the plain streaming POST.
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     from sonilo_mcp import api
@@ -1286,12 +1286,12 @@ async def test_video_to_music_isolate_vocals_url_mode_submits_async_fields(
     result = await api.video_to_music(
         video_url="https://cdn.example.com/v.mp4",
         prompt="Chill Beat",
-        isolate_vocals=True,
+        preserve_speech=True,
     )
     from urllib.parse import parse_qs
     sent = parse_qs(submit.calls.last.request.content.decode())
     assert sent["mode"] == ["async"]
-    assert sent["isolate_vocals"] == ["true"]
+    assert sent["preserve_speech"] == ["true"]
     assert sent["video_url"] == ["https://cdn.example.com/v.mp4"]
     assert sent["prompt"] == ["Chill Beat"]
     assert len(result) == 1
@@ -1299,11 +1299,11 @@ async def test_video_to_music_isolate_vocals_url_mode_submits_async_fields(
 
 
 @respx.mock
-async def test_video_to_music_isolate_vocals_false_no_extra_fields(
+async def test_video_to_music_preserve_speech_false_no_extra_fields(
     monkeypatch, output_dir
 ):
-    # Default isolate_vocals=False must keep streaming behavior UNCHANGED —
-    # no mode/isolate_vocals fields sent, no task_id round trip.
+    # Default preserve_speech=False must keep streaming behavior UNCHANGED —
+    # no mode/preserve_speech fields sent, no task_id round trip.
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     ndjson = _ndjson_bytes([
@@ -1319,14 +1319,14 @@ async def test_video_to_music_isolate_vocals_false_no_extra_fields(
     from urllib.parse import parse_qs
     sent = parse_qs(route.calls.last.request.content.decode())
     assert "mode" not in sent
-    assert "isolate_vocals" not in sent
+    assert "preserve_speech" not in sent
 
 
 @respx.mock
-async def test_video_to_music_isolate_vocals_path_mode_multipart(
+async def test_video_to_music_preserve_speech_path_mode_multipart(
     monkeypatch, output_dir, tmp_path
 ):
-    # Local-file (multipart) submission must also carry mode/isolate_vocals
+    # Local-file (multipart) submission must also carry mode/preserve_speech
     # as form fields alongside the uploaded video.
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
@@ -1360,18 +1360,18 @@ async def test_video_to_music_isolate_vocals_path_mode_multipart(
         return_value=httpx.Response(200, content=b"a")
     )
     api._reset_services_cache()
-    result = await api.video_to_music(video_path=str(video), isolate_vocals=True)
+    result = await api.video_to_music(video_path=str(video), preserve_speech=True)
     sent = submit.calls.last.request
     assert sent.headers["content-type"].startswith("multipart/form-data")
     assert b"FAKE-MP4" in sent.content
     assert b'name="mode"' in sent.content and b"async" in sent.content
-    assert b'name="isolate_vocals"' in sent.content
+    assert b'name="preserve_speech"' in sent.content
     assert len(result) == 1
     assert (output_dir / "music-t-vocals.m4a").exists()
 
 
 @respx.mock
-async def test_video_to_music_isolate_vocals_saves_audio_vocals_and_mux(
+async def test_video_to_music_preserve_speech_saves_audio_vocals_and_mux(
     monkeypatch, output_dir
 ):
     # Full succeeded envelope with multi-stream audio, a single vocals stem,
@@ -1423,7 +1423,7 @@ async def test_video_to_music_isolate_vocals_saves_audio_vocals_and_mux(
     result = await api.video_to_music(
         video_url="https://cdn.example.com/v.mp4",
         prompt="Beat Drop",
-        isolate_vocals=True,
+        preserve_speech=True,
     )
 
     assert (output_dir / "beat-drop-0.m4a").read_bytes() == b"a0"
@@ -1443,7 +1443,7 @@ async def test_video_to_music_isolate_vocals_saves_audio_vocals_and_mux(
 
 
 @respx.mock
-async def test_video_to_music_isolate_vocals_single_stream_no_suffix(
+async def test_video_to_music_preserve_speech_single_stream_no_suffix(
     monkeypatch, output_dir
 ):
     # A single audio stream / single mux stream must use the unsuffixed
@@ -1484,7 +1484,7 @@ async def test_video_to_music_isolate_vocals_single_stream_no_suffix(
     respx.get("https://r2.test/mux.m4a").mock(return_value=httpx.Response(200, content=b"m"))
 
     await api.video_to_music(
-        video_url="https://cdn.example.com/v.mp4", isolate_vocals=True
+        video_url="https://cdn.example.com/v.mp4", preserve_speech=True
     )
     assert (output_dir / "music-t-vocals.m4a").read_bytes() == b"a"
     assert (output_dir / "music-t-vocals-vocals.m4a").read_bytes() == b"v"
@@ -1492,7 +1492,7 @@ async def test_video_to_music_isolate_vocals_single_stream_no_suffix(
 
 
 @respx.mock
-async def test_video_to_music_isolate_vocals_task_failed(monkeypatch, output_dir):
+async def test_video_to_music_preserve_speech_task_failed(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     from sonilo_mcp import api
@@ -1515,12 +1515,12 @@ async def test_video_to_music_isolate_vocals_task_failed(monkeypatch, output_dir
     )
     with pytest.raises(Exception, match="boom"):
         await api.video_to_music(
-            video_url="https://cdn.example.com/v.mp4", isolate_vocals=True
+            video_url="https://cdn.example.com/v.mp4", preserve_speech=True
         )
 
 
 @respx.mock
-async def test_video_to_music_isolate_vocals_no_audio_raises(monkeypatch, output_dir):
+async def test_video_to_music_preserve_speech_no_audio_raises(monkeypatch, output_dir):
     # Contract says `audio` is ALWAYS a list for async v2m — an empty/missing
     # list is a backend contract violation and must raise clearly rather
     # than silently report zero files saved.
@@ -1544,15 +1544,15 @@ async def test_video_to_music_isolate_vocals_no_audio_raises(monkeypatch, output
     )
     with pytest.raises(Exception, match="no audio artifact"):
         await api.video_to_music(
-            video_url="https://cdn.example.com/v.mp4", isolate_vocals=True
+            video_url="https://cdn.example.com/v.mp4", preserve_speech=True
         )
 
 
 @respx.mock
 async def test_video_to_music_ducking_uses_async_path(monkeypatch, output_dir):
     # ducking=False must route through the task submit+poll path (mode
-    # async), forwarding ducking as a form field, even though isolate_vocals
-    # and preserve_speech are both unset.
+    # async), forwarding ducking as a form field, even though
+    # preserve_speech is unset.
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     from sonilo_mcp import api
@@ -1585,7 +1585,7 @@ async def test_video_to_music_ducking_uses_async_path(monkeypatch, output_dir):
     sent = parse_qs(submit.calls.last.request.content.decode())
     assert sent["mode"] == ["async"]
     assert sent["ducking"] == ["false"]
-    assert "isolate_vocals" not in sent
+    assert "preserve_speech" not in sent
 
 
 @respx.mock
@@ -1628,8 +1628,8 @@ async def test_video_to_music_ducking_unset_omits_field(monkeypatch, output_dir)
 
 @respx.mock
 async def test_video_to_music_output_format_wav_uses_async_path(monkeypatch, output_dir):
-    # output_format="wav" alone (no isolate_vocals/preserve_speech/ducking)
-    # must also trigger the async submit+poll path.
+    # output_format="wav" alone (no preserve_speech/ducking) must also
+    # trigger the async submit+poll path.
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     from sonilo_mcp import api
@@ -3950,8 +3950,8 @@ async def test_get_sfx_task_recovers_ducking_task(monkeypatch, output_dir):
 
 
 @respx.mock
-async def test_get_sfx_task_recovers_isolate_vocals_music_task(monkeypatch, output_dir):
-    # /v1/tasks also serves async (isolate_vocals) video-to-music tasks now.
+async def test_get_sfx_task_recovers_preserve_speech_music_task(monkeypatch, output_dir):
+    # /v1/tasks also serves async (preserve_speech) video-to-music tasks now.
     # Their envelope shapes `audio` as a LIST plus optional `vocals`/`mux` —
     # get_sfx_task must detect that shape and route to
     # _save_music_task_artifacts instead of the SFX/ducking single-dict

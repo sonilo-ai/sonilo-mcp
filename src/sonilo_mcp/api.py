@@ -1352,7 +1352,7 @@ async def _save_music_task_artifacts(
 
     vocals = body.get("vocals")
     if _has_artifact(vocals):
-        await _save_one(vocals, f"{base_name}-vocals", "isolated vocals")
+        await _save_one(vocals, f"{base_name}-vocals", "preserved speech")
 
     mux = body.get("mux")
     valid_mux = [m for m in mux if _has_artifact(m)] if isinstance(mux, list) else []
@@ -1363,7 +1363,7 @@ async def _save_music_task_artifacts(
         await _save_one(
             entry,
             f"{base_name}-mux{suffix}",
-            "mux — vocals + music mixed, ready to use",
+            "mux — speech + music mixed, ready to use",
         )
 
     ducked = body.get("ducked")
@@ -1424,7 +1424,7 @@ async def text_to_music(
     if output_format == "wav":
         # 'wav' requires mode=async on the backend (else a 400) — always
         # send both together, no user-facing mode param (mirrors
-        # video_to_music's isolate_vocals/preserve_speech/ducking handling).
+        # video_to_music's preserve_speech/ducking handling).
         data["mode"] = "async"
         data["output_format"] = output_format
         task_id = await _post_task_submit("/v1/text-to-music", data=data)
@@ -1489,32 +1489,30 @@ async def _get_max_upload_size_mb() -> int:
         "Maximum video duration is 360 seconds (6 minutes).\n"
         "    video_url (str, optional): HTTPS URL to a video file.\n"
         "    prompt (str, optional): Style hint for the generated music.\n"
-        "    isolate_vocals (bool, optional): Also separate an isolated "
-        "vocal stem and a ready-to-use mux (vocals+music, already mixed) "
-        "from the generated track. Deprecated alias for preserve_speech; "
-        "both are accepted and OR'd together. Defaults to False.\n"
-        "    preserve_speech (bool, optional): Keep the source speech in "
-        "the output alongside isolating a vocal stem and mux, same effect "
-        "as isolate_vocals. Defaults to False.\n"
+        "    preserve_speech (bool, optional): Keep the source speech from "
+        "the video audible in the result. When set, in addition to the "
+        "generated music you also get a 'vocals' speech stem and a "
+        "ready-to-use 'mux' (speech+music, already mixed). Defaults to "
+        "False.\n"
         "    output_format (str, optional): 'm4a' (default) or 'wav'.\n"
         "    ducking (bool, optional): Duck the generated music under the "
         "source voice at finalize time. Default-ON server-side: leave "
         "unset to keep it on, pass False to opt out. Free, best-effort.\n"
-        "    Any of isolate_vocals/preserve_speech/output_format='wav'/"
-        "ducking makes this tool internally use the backend's async "
-        "generation mode (submit + poll) instead of streaming — the call "
-        "takes longer but the tool still waits for completion. Subject to "
-        "the same 360-second video duration cap as the plain case.\n"
+        "    Any of preserve_speech/output_format='wav'/ducking makes this "
+        "tool internally use the backend's async generation mode (submit + "
+        "poll) instead of streaming — the call takes longer but the tool "
+        "still waits for completion. Subject to the same 360-second video "
+        "duration cap as the plain case.\n"
         "    output_directory (str, optional): Where to save the resulting "
         "audio file(s). Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Exactly one of video_path and video_url must be provided.\n\n"
         "Returns:\n"
         "    Plain case (no async-triggering param set): one TextContent "
         "per generated audio stream, unchanged from before.\n"
-        "    isolate_vocals/preserve_speech=True: one TextContent per "
-        "generated audio stream, plus one for the isolated vocals file, "
-        "plus one per mux stream (vocals+music mixed — this is the "
-        "ready-to-use combined result).\n"
+        "    preserve_speech=True: one TextContent per generated audio "
+        "stream, plus one for the speech ('vocals') file, plus one per "
+        "mux stream (speech+music mixed — this is the ready-to-use "
+        "combined result).\n"
         "    ducking (default-on in async mode): also one TextContent per "
         "ducked stream (music lowered under the source voice), when the "
         "backend rendered one.\n"
@@ -1525,7 +1523,6 @@ async def video_to_music(
     video_path: str | None = None,
     video_url: str | None = None,
     prompt: str | None = None,
-    isolate_vocals: bool = False,
     preserve_speech: bool = False,
     output_format: str | None = None,
     ducking: bool | None = None,
@@ -1544,12 +1541,11 @@ async def video_to_music(
     out_path = _make_output_path(output_directory)
     cfg = _get_config()
 
-    # isolate_vocals/preserve_speech/ducking/output_format="wav" all
-    # require mode=async on the backend (else a 400) — always send it
-    # together, no user-facing mode param.
+    # preserve_speech/ducking/output_format="wav" all require mode=async on
+    # the backend (else a 400) — always send it together, no user-facing
+    # mode param.
     use_async = (
-        isolate_vocals
-        or preserve_speech
+        preserve_speech
         or output_format == "wav"
         or ducking is not None
     )
@@ -1569,8 +1565,6 @@ async def video_to_music(
             )
         await _check_media_duration(str(resolved))
         data: dict = {"prompt": prompt} if prompt else {}
-        if isolate_vocals:
-            data["isolate_vocals"] = "true"
         if preserve_speech:
             data["preserve_speech"] = "true"
         if output_format:
@@ -1601,8 +1595,6 @@ async def video_to_music(
     form: dict = {"video_url": video_url}
     if prompt:
         form["prompt"] = prompt
-    if isolate_vocals:
-        form["isolate_vocals"] = "true"
     if preserve_speech:
         form["preserve_speech"] = "true"
     if output_format:
@@ -1790,9 +1782,6 @@ async def video_to_sfx(
         "    prompt (str, optional): Style hint for the generated music.\n"
         "    preserve_speech (bool, optional): Keep the source speech/vocals "
         "in the output. Defaults to False.\n"
-        "    isolate_vocals (bool, optional): Deprecated alias for "
-        "preserve_speech; both are accepted and OR'd together. Defaults to "
-        "False.\n"
         "    output_directory (str, optional): Where to save the result. "
         "Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Exactly one of video_path and video_url must be provided.\n\n"
@@ -1806,7 +1795,6 @@ async def video_to_video_music(
     video_url: str | None = None,
     prompt: str | None = None,
     preserve_speech: bool = False,
-    isolate_vocals: bool = False,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     if (video_path and video_url) or (not video_path and not video_url):
@@ -1827,8 +1815,6 @@ async def video_to_video_music(
         form["prompt"] = prompt
     if preserve_speech:
         form["preserve_speech"] = "true"
-    if isolate_vocals:
-        form["isolate_vocals"] = "true"
 
     if video_path:
         resolved = _resolve_input_file(
@@ -1964,10 +1950,10 @@ async def video_to_video_sfx(
 @mcp.tool(
     description=(
         "Check a sound-effects, audio-ducking, video-to-video, or async "
-        "video-to-music (isolate_vocals) generation task and, if finished, "
-        "download its result file(s). Use this to recover a result when "
-        "text_to_sfx, video_to_sfx, audio_ducking, video_to_video_music, "
-        "video_to_video_sfx, or video_to_music(isolate_vocals=true) timed "
+        "video-to-music generation task and, if finished, download its "
+        "result file(s). Use this to recover a result when text_to_sfx, "
+        "video_to_sfx, audio_ducking, video_to_video_music, "
+        "video_to_video_sfx, or video_to_music(preserve_speech=true) timed "
         "out — their error message contains the task_id. Does not poll: a "
         "single status check per call. This tool itself never charges.\n\n"
         "Args:\n"
@@ -1979,9 +1965,9 @@ async def video_to_video_sfx(
         "Succeeded -> the saved file path(s): audio, plus video for "
         "video_to_sfx tasks; a single .wav or .mp4 for audio_ducking "
         "tasks; a single .mp4 for video_to_video_music/video_to_video_sfx "
-        "tasks; for a video_to_music(isolate_vocals=true) task, the audio "
-        "stream(s) plus the isolated vocals stem plus the mux "
-        "(vocals+music mixed — the ready-to-use combined result). "
+        "tasks; for a video_to_music(preserve_speech=true) task, the audio "
+        "stream(s) plus the preserved speech ('vocals') stem plus the mux "
+        "(speech+music mixed — the ready-to-use combined result). "
         "Failed -> an error including whether the charge was refunded."
     )
 )

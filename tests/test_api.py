@@ -1548,6 +1548,224 @@ async def test_video_to_music_isolate_vocals_no_audio_raises(monkeypatch, output
         )
 
 
+@respx.mock
+async def test_video_to_music_ducking_uses_async_path(monkeypatch, output_dir):
+    # ducking=False must route through the task submit+poll path (mode
+    # async), forwarding ducking as a form field, even though isolate_vocals
+    # and preserve_speech are both unset.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-duck-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-duck-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-duck-1", "type": "video_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"a")
+    )
+    await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", ducking=False
+    )
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["mode"] == ["async"]
+    assert sent["ducking"] == ["false"]
+    assert "isolate_vocals" not in sent
+
+
+@respx.mock
+async def test_video_to_music_ducking_unset_omits_field(monkeypatch, output_dir):
+    # ducking left unset must NOT be sent at all, so the backend's default-on
+    # behavior applies — sending "ducking" here would force a value.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-duck-2", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-duck-2").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-duck-2", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a2.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a2.m4a").mock(
+        return_value=httpx.Response(200, content=b"a")
+    )
+    await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", preserve_speech=True
+    )
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert "ducking" not in sent
+    assert sent["preserve_speech"] == ["true"]
+
+
+@respx.mock
+async def test_video_to_music_output_format_wav_uses_async_path(monkeypatch, output_dir):
+    # output_format="wav" alone (no isolate_vocals/preserve_speech/ducking)
+    # must also trigger the async submit+poll path.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-wav-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-wav-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-wav-1", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a3.wav",
+                "content_type": "audio/wav", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a3.wav").mock(
+        return_value=httpx.Response(200, content=b"w")
+    )
+    await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", output_format="wav"
+    )
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["mode"] == ["async"]
+    assert sent["output_format"] == ["wav"]
+
+
+@respx.mock
+async def test_video_to_music_ducked_stems_saved(monkeypatch, output_dir):
+    # A `ducked` list on the async result must be saved alongside audio,
+    # each labeled distinctly (Task C1's plumbing, exercised end-to-end
+    # through the tool).
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-duck-3", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-duck-3").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-duck-3", "type": "video_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a4.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+            "ducked": [{
+                "stream_index": 0, "url": "https://r2.test/d4.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a4.m4a").mock(return_value=httpx.Response(200, content=b"a"))
+    respx.get("https://r2.test/d4.m4a").mock(return_value=httpx.Response(200, content=b"d"))
+    result = await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", prompt="Duck Test", ducking=True
+    )
+    assert (output_dir / "duck-test.m4a").read_bytes() == b"a"
+    assert (output_dir / "duck-test-ducked.m4a").read_bytes() == b"d"
+    texts = [t.text for t in result]
+    assert any("ducked" in t.lower() and "duck-test-ducked.m4a" in t for t in texts)
+
+
+@respx.mock
+async def test_text_to_music_output_format_wav_uses_async_path(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "tm-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/tm-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "tm-1", "type": "text_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/tm.wav",
+                "content_type": "audio/wav", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/tm.wav").mock(
+        return_value=httpx.Response(200, content=b"w")
+    )
+    result = await api.text_to_music(prompt="lofi", duration=10, output_format="wav")
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["mode"] == ["async"]
+    assert sent["output_format"] == ["wav"]
+    assert sent["prompt"] == ["lofi"]
+    assert sent["duration"] == ["10"]
+    assert len(result) == 1
+    assert (output_dir / "lofi.wav").read_bytes() == b"w"
+
+
+@respx.mock
+async def test_text_to_music_no_output_format_still_streams(monkeypatch, output_dir):
+    # Default (no output_format) must keep streaming behavior UNCHANGED —
+    # no mode/output_format fields sent, no task_id round trip.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    ndjson = _ndjson_bytes([
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(b"x").decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import text_to_music
+    await text_to_music(prompt="lofi", duration=10)
+    from urllib.parse import parse_qs
+    sent = parse_qs(route.calls.last.request.content.decode())
+    assert "mode" not in sent
+    assert "output_format" not in sent
+
+
 async def test_play_audio_rejects_nonexistent(monkeypatch):
     monkeypatch.setenv("SONILO_MCP_BASE_PATH", "/tmp")
     from sonilo_mcp.api import play_audio
@@ -2299,6 +2517,83 @@ def test_normalize_task_envelope_rejects_unknown_output_type(output_type):
     assert "video" not in out
 
 
+def test_is_video_to_video_envelope():
+    from sonilo_mcp.api import _is_video_to_video_envelope
+    assert _is_video_to_video_envelope(
+        {"type": "video_to_video_music", "status": "succeeded", "video": {"url": "u"}}
+    )
+    assert _is_video_to_video_envelope(
+        {"type": "video_to_video_sfx", "status": "succeeded", "video": {"url": "u"}}
+    )
+    # Ducking's normalized envelope: video present, no audio, but its
+    # original output_url survives normalization — must not be mistaken
+    # for video-to-video.
+    assert not _is_video_to_video_envelope(
+        {"type": "audio_ducking", "status": "succeeded", "output_url": "u"}
+    )
+    # An explicit, different type is authoritative — must never be
+    # overridden by shape-sniffing, even when the shape matches (video
+    # present, no audio, no output_url).
+    assert not _is_video_to_video_envelope(
+        {"type": "video_to_sfx", "status": "succeeded", "video": {"url": "u"}}
+    )
+    # No `type` at all (defensive fallback for a malformed/older body):
+    # shape-sniffing kicks in.
+    assert _is_video_to_video_envelope({"status": "succeeded", "video": {"url": "u"}})
+    assert not _is_video_to_video_envelope(
+        {"status": "succeeded", "video": {"url": "u"}, "audio": {"url": "a"}}
+    )
+
+
+@respx.mock
+async def test_save_task_artifacts_saves_video_only(monkeypatch, tmp_path):
+    # A video-to-video result (`{"video": {...}}`, no `audio`) must be saved
+    # like the ducking video-only case — no "no audio artifact" error.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/v2v.mp4").mock(
+        return_value=httpx.Response(200, content=b"v2v-bytes")
+    )
+    from sonilo_mcp.api import _save_task_artifacts
+    body = {
+        "task_id": "v1", "type": "video_to_video_music", "status": "succeeded",
+        "video": {"url": "https://r2.test/v2v.mp4", "content_type": "video/mp4", "file_size": 9},
+    }
+    result = await _save_task_artifacts(body, tmp_path, "v2v-scene", "v1")
+    assert len(result) == 1
+    expected = tmp_path / "v2v-scene.mp4"
+    assert expected.read_bytes() == b"v2v-bytes"
+    assert str(expected) in result[0].text
+
+
+@respx.mock
+async def test_save_music_task_artifacts_saves_ducked_stems(monkeypatch, tmp_path):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/a.m4a").mock(return_value=httpx.Response(200, content=b"a"))
+    respx.get("https://r2.test/d0.m4a").mock(return_value=httpx.Response(200, content=b"d0"))
+    respx.get("https://r2.test/d1.m4a").mock(return_value=httpx.Response(200, content=b"d1"))
+    from sonilo_mcp.api import _save_music_task_artifacts
+    body = {
+        "task_id": "m-duck-1", "type": "video_to_music", "status": "succeeded",
+        "audio": [
+            {"stream_index": 0, "url": "https://r2.test/a.m4a",
+             "content_type": "audio/mp4", "file_size": 1},
+        ],
+        "ducked": [
+            {"stream_index": 0, "url": "https://r2.test/d0.m4a",
+             "content_type": "audio/mp4", "file_size": 2},
+            {"stream_index": 1, "url": "https://r2.test/d1.m4a",
+             "content_type": "audio/mp4", "file_size": 2},
+        ],
+    }
+    result = await _save_music_task_artifacts(body, tmp_path, "score", "m-duck-1")
+    assert (tmp_path / "score-ducked-0.m4a").read_bytes() == b"d0"
+    assert (tmp_path / "score-ducked-1.m4a").read_bytes() == b"d1"
+    texts = [t.text for t in result]
+    ducked_texts = [t for t in texts if "score-ducked-0.m4a" in t or "score-ducked-1.m4a" in t]
+    assert len(ducked_texts) == 2
+    assert all("ducked" in t.lower() for t in ducked_texts)
+
+
 @respx.mock
 async def test_save_task_artifacts_unknown_output_type_raises_recoverable(
     monkeypatch, tmp_path
@@ -2386,18 +2681,23 @@ async def test_save_task_artifacts_no_artifacts_still_raises(monkeypatch, tmp_pa
 async def test_save_task_artifacts_sfx_video_without_audio_still_raises(
     monkeypatch, tmp_path
 ):
-    # An SFX-shaped body is NOT a ducking envelope: it must always carry an
-    # audio artifact. A video-only SFX body means the audio half of a paid
-    # result went missing — downloading just the mp4 and reporting success
-    # would silently lose it, so this still raises the charged-and-
-    # recoverable error. (The video-only exemption belongs to ducking alone.)
+    # An SFX-shaped body is NOT a ducking or video-to-video envelope: it must
+    # always carry an audio artifact. A video-only SFX body means the audio
+    # half of a paid result went missing — downloading just the mp4 and
+    # reporting success would silently lose it, so this still raises the
+    # charged-and-recoverable error. (The video-only exemption belongs to
+    # ducking and video-to-video alone.) `type` is set to a real, unrelated
+    # task type — the backend's /v1/tasks/{id} always includes `type` — so
+    # this pins that an explicit non-v2v type is never overridden by the
+    # video-to-video shape-sniffing fallback (which only applies when `type`
+    # is missing entirely).
     monkeypatch.setenv("SONILO_API_KEY", "k")
     route = respx.get("https://r2.test/orphan.mp4").mock(
         return_value=httpx.Response(200, content=b"mp4-bytes")
     )
     from sonilo_mcp.api import _save_task_artifacts
     body = {
-        "task_id": "t-orphan", "status": "succeeded",
+        "task_id": "t-orphan", "type": "video_to_sfx", "status": "succeeded",
         "video": {"url": "https://r2.test/orphan.mp4", "content_type": "video/mp4"},
     }
     with pytest.raises(Exception) as exc:
@@ -3093,6 +3393,184 @@ async def test_video_to_sfx_size_cap_enforced_on_actual_bytes(
         await api.video_to_sfx(video_path=str(video))
     # Must NOT charge — the oversized (swapped) bytes must never be uploaded.
     assert submit_route.call_count == 0
+
+
+# ---------- video-to-video ----------
+
+@respx.mock
+async def test_video_to_video_music_url_mode_submits_and_saves(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-video-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "vv-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/vv-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "vv-1", "type": "video_to_video_music", "status": "succeeded",
+            "video": {
+                "url": "https://r2.test/o.mp4", "content_type": "video/mp4",
+                "file_size": 3,
+            },
+            "duration_seconds": 5.0,
+        })
+    )
+    respx.get("https://r2.test/o.mp4").mock(
+        return_value=httpx.Response(200, content=b"video-bytes")
+    )
+    result = await api.video_to_video_music(
+        video_url="https://example.com/clip.mp4",
+        prompt="Cinematic",
+        preserve_speech=True,
+    )
+    sent = submit.calls.last.request
+    assert b"video_url=" in sent.content
+    assert b"Cinematic" in sent.content
+    assert b"preserve_speech=true" in sent.content
+    assert len(result) == 1
+    assert (output_dir / "cinematic.mp4").read_bytes() == b"video-bytes"
+
+
+@respx.mock
+async def test_video_to_video_music_path_mode_uploads_multipart(
+    monkeypatch, output_dir, tmp_path
+):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={"max_upload_size_mb": 300})
+    )
+    video = output_dir / "clip.mp4"
+    video.write_bytes(b"FAKE-MP4")
+    submit = respx.post("https://api.test.local/v1/video-to-video-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "vv-2", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/vv-2").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "vv-2", "type": "video_to_video_music", "status": "succeeded",
+            "video": {
+                "url": "https://r2.test/o2.mp4", "content_type": "video/mp4",
+                "file_size": 3,
+            },
+        })
+    )
+    respx.get("https://r2.test/o2.mp4").mock(
+        return_value=httpx.Response(200, content=b"v2")
+    )
+    api._reset_services_cache()
+    result = await api.video_to_video_music(video_path=str(video))
+    sent = submit.calls.last.request
+    assert sent.headers["content-type"].startswith("multipart/form-data")
+    assert b"FAKE-MP4" in sent.content
+    assert len(result) == 1
+    # No prompt -> base name falls back to v2v-music-{task_id[:8]}.
+    assert (output_dir / "v2v-music-vv-2.mp4").exists()
+
+
+async def test_video_to_video_music_both_inputs_rejected(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp.api import video_to_video_music
+    with pytest.raises(Exception, match="exactly one"):
+        await video_to_video_music(
+            video_path="/tmp/a.mp4", video_url="https://example.com/b.mp4"
+        )
+    with pytest.raises(Exception, match="exactly one"):
+        await video_to_video_music()
+
+
+@pytest.mark.parametrize("bad_url", ["file:///etc/passwd", "ftp://x/y.mp4"])
+async def test_video_to_video_music_rejects_non_http_url(monkeypatch, output_dir, bad_url):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp.api import video_to_video_music
+    with pytest.raises(Exception, match="http"):
+        await video_to_video_music(video_url=bad_url)
+
+
+@respx.mock
+async def test_video_to_video_sfx_url_mode_segments_passthrough(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-video-sfx").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "vvs-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/vvs-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "vvs-1", "type": "video_to_video_sfx", "status": "succeeded",
+            "video": {
+                "url": "https://r2.test/sfx.mp4", "content_type": "video/mp4",
+                "file_size": 3,
+            },
+        })
+    )
+    respx.get("https://r2.test/sfx.mp4").mock(
+        return_value=httpx.Response(200, content=b"sfx-video")
+    )
+    segs = [
+        {"start": 0, "end": 2, "prompt": "whoosh"},
+        {"start": 2, "end": 5, "prompt": "boom"},
+    ]
+    result = await api.video_to_video_sfx(
+        video_url="https://example.com/clip.mp4", segments=segs
+    )
+    from urllib.parse import parse_qs
+    sent_fields = parse_qs(submit.calls.last.request.content.decode())
+    assert json.loads(sent_fields["segments"][0]) == segs
+    assert len(result) == 1
+    # No prompt -> base name falls back to v2v-sfx-{task_id[:8]}.
+    assert (output_dir / "v2v-sfx-vvs-1.mp4").read_bytes() == b"sfx-video"
+
+
+@respx.mock
+async def test_video_to_video_sfx_rejects_video_over_180s(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp.api import video_to_video_sfx
+    # 200s passes the music cap (360) but must fail the SFX/v2v-sfx cap (180).
+    _patch_ffprobe(monkeypatch, duration=200.0)
+    submit_route = respx.post("https://api.test.local/v1/video-to-video-sfx").mock(
+        return_value=httpx.Response(202, json={"task_id": "t-should-not-charge"})
+    )
+    with pytest.raises(Exception, match="exceeds the maximum"):
+        await video_to_video_sfx(video_url="https://example.com/long.mp4")
+    # Must NOT charge — the duration check must reject before the submit POST.
+    assert submit_route.call_count == 0
+
+
+async def test_video_to_video_sfx_both_inputs_rejected(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp.api import video_to_video_sfx
+    with pytest.raises(Exception, match="exactly one"):
+        await video_to_video_sfx(
+            video_path="/tmp/a.mp4", video_url="https://example.com/b.mp4"
+        )
+    with pytest.raises(Exception, match="exactly one"):
+        await video_to_video_sfx()
 
 
 @respx.mock

@@ -1962,7 +1962,7 @@ async def video_to_video_sfx(
         "Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Returns:\n"
         "    Still processing -> a status message; try again later. "
-        "Succeeded -> the saved file path(s): audio, plus video for "
+        "Succeeded -> the saved file path(s): audio for text_to_sfx and "
         "video_to_sfx tasks; a single .wav or .mp4 for audio_ducking "
         "tasks; a single .mp4 for video_to_video_music/video_to_video_sfx "
         "tasks; for a video_to_music(preserve_speech=true) task, the audio "

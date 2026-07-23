@@ -25,7 +25,8 @@ Get your API key from the [Sonilo dashboard](https://platform.sonilo.com/dashboa
 - **Video-to-SFX** — Sonilo watches the video and generates sound effects for what it sees. You get the SFX as a standalone audio file. Optional `segments` let you script effects to specific time ranges (`[{start, end, prompt}]`).
 - **Text-to-SFX** — generate a standalone sound effect from a description (1–180s), in `wav`, `mp3`, `aac`, or `flac`.
 - **Fully licensed, commercial-safe** — music licensed via Shutterstock; every generated track is cleared for commercial use on social, brand content, and advertising, with no Content ID worries.
-- **Pay as you go** — billed only for the seconds of music you generate; new accounts get free credits on signup.
+- **Video-to-sound** — generate music **and** sound effects for the same clip in one call, mixed into a single balanced soundtrack. Get back the mixed audio, or a new video with it muxed in.
+- **Pay as you go** — billed only for the seconds of music you generate. Self-serve accounts start with free runs on every endpoint, no card required: 2 each on text-to-music, text-to-sfx and audio-ducking, and 1 each on video-to-music, video-to-sfx, video-to-video-music, video-to-video-sfx, video-to-sound and video-to-video-sound. After that, calls bill at the normal rate.
 
 ### Audio Playback Dependencies
 
@@ -142,8 +143,12 @@ files. To opt out — e.g. to read a video from elsewhere on disk — set
 | `video_to_music(video_path? \| video_url?, prompt?, preserve_speech?, output_directory?)` | Generate music matched to a video. Max duration **360s (6 min)**; subject to the account's upload-size cap (typically 300 MB). `preserve_speech` (default `false`) keeps the source speech in the result — you also get a `vocals` speech stem and a ready-to-use mux; when set, the call runs the backend's async generation mode internally instead of streaming. | ✅ |
 | `text_to_sfx(prompt, duration, audio_format?, output_directory?)` | Generate a sound effect from text. Duration 1–180s; formats wav/mp3/aac/flac (default aac). | ✅ |
 | `video_to_sfx(video_path? \| video_url?, prompt?, segments?, audio_format?, output_directory?)` | Generate SFX for a video; saves the generated SFX audio. Max video duration **180s (3 min)**. | ✅ |
+| `video_to_video_music(video_path? \| video_url?, prompt?, preserve_speech?, output_directory?)` | Generate music for a video and return a new `.mp4` with it muxed in. Max video duration **360s (6 min)**. | ✅ |
+| `video_to_video_sfx(video_path? \| video_url?, prompt?, segments?, output_directory?)` | Generate SFX for a video and return a new `.mp4` with them muxed in. Max video duration **180s (3 min)**. | ✅ |
+| `video_to_sound(video_path? \| video_url?, music_prompt?, sfx_prompt?, segments?, preserve_speech?, ducking?, output_directory?)` | Generate music **and** SFX for a video in one call and save the mixed audio track. One charge instead of two, with the two layers balanced by the backend. `ducking` (default `true`) dips the music under the source speech. Max video duration **180s (3 min)**. | ✅ |
+| `video_to_video_sound(video_path? \| video_url?, music_prompt?, sfx_prompt?, segments?, preserve_speech?, ducking?, output_directory?)` | Same as `video_to_sound`, but returns a new `.mp4` with the mixed soundtrack muxed in. Max video duration **180s (3 min)**. | ✅ |
 | `audio_ducking(voice_path? \| voice_url?, music_path? \| music_url?, output_directory?)` | Duck a music bed under a voice track. The voice input may be a video — the ducked mix is muxed back into a new `.mp4`. Each input max **360s (6 min)**; subject to the account's upload-size cap. | ✅ |
-| `get_sfx_task(task_id, output_directory?)` | Check an SFX, audio-ducking, or async video-to-music task and download its result — recovery for timed-out `text_to_sfx`, `video_to_sfx`, `audio_ducking`, and `video_to_music(preserve_speech=true)` calls. | ❌ |
+| `get_sfx_task(task_id, output_directory?)` | Check an SFX, audio-ducking, video-to-video, video-to-sound, or async video-to-music task and download its result — recovery for timed-out `text_to_sfx`, `video_to_sfx`, `audio_ducking`, `video_to_video_music`, `video_to_video_sfx`, `video_to_sound`, `video_to_video_sound`, and `video_to_music(preserve_speech=true)` calls. | ❌ |
 | `get_account_services()` | List available services and limits. | ❌ |
 | `get_usage(days=30)` | Show usage summary + per-day breakdown. | ❌ |
 | `play_audio(input_file_path)` | Play a local audio file. | ❌ |
@@ -165,6 +170,8 @@ If a call times out, the generation keeps running (and is already charged). The 
 **`video_to_music(preserve_speech=true)`** saves up to three kinds of file, each labeled in the returned text: the generated music audio (same naming as above, based on `prompt` or falling back to `music-<first 8 chars of the task id>`), the preserved speech stem as `<base>-vocals.<ext>`, and the mux — speech and music already mixed together, the ready-to-use combined result — as `<base>-mux.<ext>` (or `<base>-mux-<index>.<ext>` for multiple streams). The speech stem and mux extensions come from the backend's reported `content_type` (typically `.m4a`).
 
 **Sound effects** are saved in the requested `audio_format` — `wav`, `mp3`, `flac`, or `aac` (the default, written as `.m4a`); `video_to_sfx` saves audio only, not the source video.
+
+**Combined sound** (`video_to_sound` / `video_to_video_sound`) is saved as a single file: a `.wav` for `video_to_sound`, a `.mp4` for `video_to_video_sound`. The name comes from `music_prompt`, falling back to `sfx_prompt` and then to `sound-<first 8 chars of the task id>` / `v2v-sound-<first 8 chars of the task id>`. The separate music and SFX stems stay on the backend — only the mixed result is downloaded.
 
 File names come from the prompt (slugified, truncated to 80 characters). When there is no prompt to name a file after — `video_to_sfx` without one, or an SFX/ducking file recovered via `get_sfx_task` — the name is `sfx-<first 8 chars of the task id>` instead. A `video_to_music(preserve_speech=true)` task recovered via `get_sfx_task` is named `music-<first 8 chars of the task id>` instead (`get_sfx_task` detects the music envelope shape and saves audio/vocals/mux the same way as a direct `video_to_music` call). Existing files are never overwritten: a `-1`, `-2`, … suffix is added instead.
 

@@ -4521,3 +4521,94 @@ async def test_audio_ducking_stat_fail_fast_rejects_oversized_music(
             voice_url="https://cdn.test/podcast.wav", music_path=str(music)
         )
     assert submit.call_count == 0
+
+
+@respx.mock
+async def test_video_to_sound_url_mode_submits_and_saves(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-sound").mock(
+        return_value=httpx.Response(202, json={"task_id": "sd-1", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/sd-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "sd-1", "type": "video_to_sound", "status": "succeeded",
+            "output_url": "https://r2.test/sound.wav",
+            "output_type": "audio",
+            "output_bytes": 11,
+            "music": {"url": "https://r2.test/music.m4a", "content_type": "audio/mp4"},
+            "sfx": {"url": "https://r2.test/sfx.wav", "content_type": "audio/wav"},
+            "duration_seconds": 5.0,
+        })
+    )
+    respx.get("https://r2.test/sound.wav").mock(
+        return_value=httpx.Response(200, content=b"sound-bytes")
+    )
+    result = await api.video_to_sound(
+        video_url="https://example.com/clip.mp4",
+        music_prompt="Cinematic",
+        sfx_prompt="footsteps",
+        segments=[{"start": 0, "end": 2, "prompt": "whoosh"}],
+        preserve_speech=True,
+        ducking=False,
+    )
+    sent = submit.calls.last.request
+    assert b"music_prompt=" in sent.content
+    assert b"sfx_prompt=" in sent.content
+    assert b"segments=" in sent.content
+    assert b"preserve_speech=true" in sent.content
+    assert b"ducking=false" in sent.content
+    assert b"isolate_vocals" not in sent.content
+    # Only the combined artifact is written; the stems are left on the backend.
+    assert len(result) == 1
+    assert (output_dir / "cinematic.wav").read_bytes() == b"sound-bytes"
+    assert not (output_dir / "cinematic.m4a").exists()
+
+
+@respx.mock
+async def test_video_to_video_sound_saves_mp4_and_defaults_ducking_on(
+    monkeypatch, output_dir
+):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-video-sound").mock(
+        return_value=httpx.Response(202, json={"task_id": "sd-2", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/sd-2").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "sd-2", "type": "video_to_video_sound", "status": "succeeded",
+            "output_url": "https://r2.test/sound.mp4",
+            "output_type": "video",
+            "output_bytes": 11,
+        })
+    )
+    respx.get("https://r2.test/sound.mp4").mock(
+        return_value=httpx.Response(200, content=b"video-bytes")
+    )
+    result = await api.video_to_video_sound(video_url="https://example.com/clip.mp4")
+    assert b"ducking=true" in submit.calls.last.request.content
+    assert len(result) == 1
+    assert (output_dir / "v2v-sound-sd-2.mp4").read_bytes() == b"video-bytes"
+
+
+async def test_video_to_sound_rejects_both_inputs(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp import api
+    with pytest.raises(Exception, match="exactly one"):
+        await api.video_to_sound(
+            video_path="/tmp/a.mp4", video_url="https://example.com/clip.mp4"
+        )

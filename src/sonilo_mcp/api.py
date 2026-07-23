@@ -397,9 +397,17 @@ def _raise_http_error(status_code: int, body: str) -> None:
             status_code,
         )
     if status_code == 402:
-        if "minute" in detail.lower() or "credit" in detail.lower():
-            raise SoniloHTTPError(f"{detail}. Top up at {_BILLING_URL}", status_code)
-        raise SoniloHTTPError(detail, status_code)
+        # Every 402 gets the billing link, unconditionally. This used to be
+        # gated on the detail containing "minute" or "credit", which silently
+        # stopped matching when billing moved to a cash wallet — the message
+        # for the most common 402 by far is now "Insufficient balance: ...",
+        # so the one case that most needs the top-up link was the one case
+        # that never got it. Both 402s the backend can return (insufficient
+        # balance, suspended account) are resolved on the same billing page,
+        # so there is nothing left to discriminate on.
+        raise SoniloHTTPError(
+            f"{_end_sentence(detail)} Top up at {_BILLING_URL}", status_code
+        )
     if status_code == 413:
         raise SoniloHTTPError(f"File too large: {detail}", status_code)
     if status_code == 422:

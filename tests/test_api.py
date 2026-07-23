@@ -319,14 +319,42 @@ def test_raise_http_error_402_minutes():
         )
 
 
+def test_raise_http_error_402_insufficient_balance():
+    # The cash-wallet wording — by far the most common 402, and the one the
+    # old "minute"/"credit" keyword gate silently failed to match.
+    from sonilo_mcp.api import _raise_http_error
+    with pytest.raises(Exception) as exc:
+        _raise_http_error(
+            402,
+            '{"code":"insufficient_balance",'
+            '"message":"Insufficient balance: balance=0.0000 < needed=1.3308"}',
+        )
+    message = str(exc.value)
+    assert "Insufficient balance" in message
+    assert "Top up at" in message
+    # detail has no trailing punctuation, so _end_sentence must supply it
+    # rather than letting the two sentences run together.
+    assert "needed=1.3308. Top up at" in message
+
+
 def test_raise_http_error_402_suspended():
+    # A suspended account is resolved on the same billing page, so it gets
+    # the link too — 402 is unconditional now.
     from sonilo_mcp.api import _raise_http_error
     with pytest.raises(Exception) as exc:
         _raise_http_error(
             402, '{"code":"account_suspended","message":"Account is suspended"}'
         )
     assert "suspended" in str(exc.value).lower()
-    assert "top up" not in str(exc.value).lower()
+    assert "top up at" in str(exc.value).lower()
+
+
+def test_raise_http_error_402_does_not_double_punctuate():
+    from sonilo_mcp.api import _raise_http_error
+    with pytest.raises(Exception) as exc:
+        _raise_http_error(402, '{"message":"Account is suspended."}')
+    assert ".. Top up" not in str(exc.value)
+    assert "suspended. Top up at" in str(exc.value)
 
 
 def test_raise_http_error_413():

@@ -4960,3 +4960,29 @@ async def test_dubbing_honours_a_larger_operator_timeout(monkeypatch, output_dir
     monkeypatch.setattr(api, "_poll_task", fake_poll)
     await api.dubbing(video_url="https://example.com/clip.mp4")
     assert seen["timeout"] == 7200.0
+
+
+@respx.mock
+async def test_get_sfx_task_recovers_a_dubbing_task(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    respx.get("https://api.test.local/v1/tasks/db-9").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "db-9", "type": "dubbing", "status": "succeeded",
+            "outputs": {
+                "es": "https://r2.test/es.mp4",
+                "ja": "https://r2.test/ja.mp4",
+            },
+        })
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/ja.mp4").mock(
+        return_value=httpx.Response(200, content=b"ja-bytes")
+    )
+    result = await api.get_sfx_task("db-9")
+    assert len(result) == 2
+    assert (output_dir / "dubbing-db-9.es.mp4").read_bytes() == b"es-bytes"
+    assert (output_dir / "dubbing-db-9.ja.mp4").read_bytes() == b"ja-bytes"

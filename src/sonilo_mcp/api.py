@@ -2464,6 +2464,17 @@ async def get_sfx_task(
     out_path = _make_output_path(output_directory)
     # No prompt available on recovery — name by task id; extension comes
     # from the envelope's content_type.
+    if _is_dubbing_envelope(body):
+        # A dubbing task renders one video per language under `outputs` —
+        # _save_task_artifacts only understands audio/video slots and would
+        # report a missing artifact for a task that was already charged and
+        # whose files are still on the backend. No reuse_existing here, for
+        # the same reason as the music branch: _save_dubbing_artifacts has no
+        # such mode, so a second recovery call lands in -1/-2-suffixed files
+        # rather than being detected as a duplicate.
+        return await _save_dubbing_artifacts(
+            body, out_path, f"dubbing-{task_id[:8]}", task_id
+        )
     if _is_music_task_envelope(body):
         # Async (isolate_vocals) video-to-music: list-shaped `audio` plus
         # optional `vocals`/`mux` — needs the music-aware save layer, not

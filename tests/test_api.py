@@ -4661,6 +4661,12 @@ def test_is_dubbing_envelope_recognizes_the_outputs_map():
     assert api._is_dubbing_envelope(
         {"status": "succeeded", "audio": {"url": "https://r2.test/a.wav"}}
     ) is False
+    # An explicit, different type is authoritative and short-circuits to
+    # False even when `outputs` happens to look dubbing-shaped — mirrors
+    # _is_video_to_video_envelope's short-circuit on a non-matching type.
+    assert api._is_dubbing_envelope(
+        {"type": "video_to_sfx", "outputs": {"es": "https://r2.test/es.mp4"}}
+    ) is False
 
 
 @respx.mock
@@ -4680,6 +4686,30 @@ async def test_save_dubbing_artifacts_writes_one_file_per_language(tmp_path):
     assert (tmp_path / "dubbing-db-1.fr.mp4").read_bytes() == b"fr-bytes"
     # Sorted, so the reported order is stable across runs.
     assert "es" in result[0].text and "fr" in result[1].text
+
+
+@respx.mock
+async def test_save_dubbing_artifacts_skips_blank_urls_in_a_mixed_map(tmp_path):
+    from sonilo_mcp import api
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    result = await api._save_dubbing_artifacts(
+        {
+            "task_id": "db-1",
+            "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4", "fr": ""},
+        },
+        tmp_path,
+        "dubbing-db-1",
+        "db-1",
+    )
+    # The blank "fr" entry is silently filtered out — no download attempted,
+    # no error raised — and only the valid "es" entry is saved.
+    assert len(result) == 1
+    assert "es" in result[0].text
+    assert (tmp_path / "dubbing-db-1.es.mp4").read_bytes() == b"es-bytes"
+    assert not (tmp_path / "dubbing-db-1.fr.mp4").exists()
 
 
 @respx.mock

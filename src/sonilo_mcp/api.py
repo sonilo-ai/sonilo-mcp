@@ -1399,7 +1399,11 @@ def _is_dubbing_envelope(body: dict) -> bool:
     Prefers the backend `type` field, falling back to shape-sniffing only for
     bodies that omit `type` entirely — same rule as
     _is_video_to_video_envelope, so the two stay consistent about which
-    signal wins.
+    signal wins: an explicit, different `type` (e.g. "video_to_sfx") is
+    always authoritative and short-circuits straight to False, rather than
+    falling through to sniff `outputs`. Without that short-circuit, a
+    non-dubbing task that happens to carry an `outputs`-shaped field would
+    get misrouted to this envelope's save layer instead of its own.
 
     Every value must be a non-empty string. A map with a blank or non-string
     URL is NOT treated as a dubbing envelope: it would otherwise be routed to
@@ -1407,8 +1411,9 @@ def _is_dubbing_envelope(body: dict) -> bool:
     landing in the generic missing-artifact error that hands the caller their
     task_id.
     """
-    if body.get("type") == "dubbing":
-        return True
+    t = body.get("type")
+    if isinstance(t, str) and t:
+        return t == "dubbing"
     outputs = body.get("outputs")
     if not isinstance(outputs, dict) or not outputs:
         return False

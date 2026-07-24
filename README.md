@@ -10,6 +10,12 @@ For sound design, **`video_to_sfx`** watches your video and generates matching s
 
 **▶ [Example result](https://github.com/cindyxu1030/sonilo-video-to-music-cookbook/blob/main/assets/demo-trailer.mp4)** — an AI-generated trailer with its soundtrack composed by `video_to_music` from the assembled cut. For recipes covering any AI-video pipeline (stitch → grade → add music → mux), see the [Sonilo video-to-music cookbook](https://github.com/cindyxu1030/sonilo-video-to-music-cookbook).
 
+## Pricing and getting started
+
+- **Commercial use:** every track is licensed and safe for commercial use (terms apply).
+- **Pricing:** API usage is billed per second of generated audio. Current rates: [sonilo.com](https://sonilo.com/?utm_source=github&utm_medium=oss&utm_campaign=sonilo-mcp).
+- **Free credits at sign-up:** new accounts start with free credits — try `video_to_music` on your own cut before paying anything.
+
 ## Quickstart with Claude Code
 
 ```bash

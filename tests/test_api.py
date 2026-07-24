@@ -4803,3 +4803,156 @@ async def test_stage_video_input_rejects_an_over_long_video(monkeypatch, tmp_pat
         await api._stage_video_input(
             None, "https://example.com/clip.mp4", str(tmp_path), 180
         )
+
+
+@respx.mock
+async def test_dubbing_url_mode_submits_and_saves_each_language(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-1", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/db-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "db-1", "type": "dubbing", "status": "succeeded",
+            "outputs": {
+                "es": "https://r2.test/es.mp4",
+                "fr": "https://r2.test/fr.mp4",
+            },
+        })
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/fr.mp4").mock(
+        return_value=httpx.Response(200, content=b"fr-bytes")
+    )
+    result = await api.dubbing(
+        video_url="https://example.com/clip.mp4", languages=["es", "fr"]
+    )
+    sent = submit.calls.last.request.content
+    assert b'["es", "fr"]' in sent
+    assert len(result) == 2
+    assert (output_dir / "dubbing-db-1.es.mp4").read_bytes() == b"es-bytes"
+    assert (output_dir / "dubbing-db-1.fr.mp4").read_bytes() == b"fr-bytes"
+
+
+@respx.mock
+async def test_dubbing_omits_languages_when_unset(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-2", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/db-2").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "db-2", "type": "dubbing", "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4"},
+        })
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    await api.dubbing(video_url="https://example.com/clip.mp4")
+    assert b"languages" not in submit.calls.last.request.content
+
+
+async def test_dubbing_rejects_both_inputs(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp import api
+    with pytest.raises(Exception):
+        await api.dubbing(video_path="clip.mp4", video_url="https://example.com/clip.mp4")
+    with pytest.raises(Exception):
+        await api.dubbing()
+
+
+async def test_dubbing_rejects_a_non_https_url(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp import api
+    with pytest.raises(Exception) as exc:
+        await api.dubbing(video_url="http://example.com/clip.mp4")
+    assert "https" in str(exc.value)
+
+
+@respx.mock
+async def test_dubbing_rejects_a_video_over_180_seconds(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=200.0)
+    submit = respx.post("https://api.test.local/v1/dubbing")
+    with pytest.raises(Exception):
+        await api.dubbing(video_url="https://example.com/clip.mp4")
+    # Nothing may be submitted, so nothing is charged.
+    assert not submit.called
+
+
+@respx.mock
+async def test_dubbing_polls_for_at_least_an_hour(monkeypatch, output_dir):
+    """TIME_OUT_SECONDS defaults to 600, but the dubbing backend polls its own
+    pipeline for up to 7200s. Giving up at 10 minutes would leave the caller
+    charged for videos they never receive."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    monkeypatch.setenv("TIME_OUT_SECONDS", "600")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+    respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-3", "status": "processing"})
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    seen: dict = {}
+
+    async def fake_poll(task_id, timeout):
+        seen["timeout"] = timeout
+        return {
+            "task_id": task_id, "type": "dubbing", "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4"},
+        }
+
+    monkeypatch.setattr(api, "_poll_task", fake_poll)
+    await api.dubbing(video_url="https://example.com/clip.mp4")
+    assert seen["timeout"] == 3600.0
+
+
+@respx.mock
+async def test_dubbing_honours_a_larger_operator_timeout(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    monkeypatch.setenv("TIME_OUT_SECONDS", "7200")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+    respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-4", "status": "processing"})
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    seen: dict = {}
+
+    async def fake_poll(task_id, timeout):
+        seen["timeout"] = timeout
+        return {
+            "task_id": task_id, "type": "dubbing", "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4"},
+        }
+
+    monkeypatch.setattr(api, "_poll_task", fake_poll)
+    await api.dubbing(video_url="https://example.com/clip.mp4")
+    assert seen["timeout"] == 7200.0

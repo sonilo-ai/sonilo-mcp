@@ -277,6 +277,10 @@ _MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — music endpoints
 _SFX_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sfx
 _SOUND_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sound*
 _DUCKING_MAX_DURATION_SECONDS = 360  # 6 minutes — /v1/audio-ducking, per input
+_DUBBING_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/dubbing
+# Floor for the dubbing poll. The backend polls its pipeline for up to 7200s;
+# TIME_OUT_SECONDS defaults to 600, which would abandon a charged job.
+_DUBBING_MIN_POLL_TIMEOUT_SECONDS = 3600.0
 
 
 async def _check_media_duration(
@@ -2300,6 +2304,102 @@ async def video_to_video_sound(
         preserve_speech=preserve_speech,
         ducking=ducking,
         output_directory=output_directory,
+    )
+
+
+@mcp.tool(
+    description=(
+        "Dub a video into one or more other languages and save one dubbed "
+        "video file per language. The speech is translated and re-voiced; "
+        "the result is a new .mp4 per target language, not an audio "
+        "track.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges, and you are billed PER LANGUAGE — asking for four "
+        "languages costs four times as much as one. Only use when "
+        "explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    video_path (str, optional): Absolute local path, or relative "
+        "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.webm/.m4v/.gif (gif "
+        "must be animated). Subject to the account's max upload size "
+        "(typically 300 MB). Maximum video duration is 180 seconds "
+        "(3 minutes).\n"
+        "    video_url (str, optional): HTTPS URL to a video file. Must be "
+        "https specifically — the dubbing pipeline fetches the source "
+        "itself and rejects plain http.\n"
+        "    languages (list, optional): Target language codes, e.g. "
+        '["es", "fr"]. Supported: en, zh_cn, ja, ko, pt, es, de, fr, it, '
+        'ru. Omit to get the default ["zh_cn", "es", "fr"].\n'
+        "    output_directory (str, optional): Where to save the results. "
+        "Defaults to SONILO_MCP_BASE_PATH.\n\n"
+        "Exactly one of video_path and video_url must be provided.\n\n"
+        "Returns:\n"
+        "    One TextContent per saved file, named "
+        "dubbing-<task id>.<language>.mp4. On timeout the error message "
+        "includes the task_id — recover with get_sfx_task."
+    )
+)
+async def dubbing(
+    video_path: str | None = None,
+    video_url: str | None = None,
+    languages: list[str] | None = None,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    if (video_path and video_url) or (not video_path and not video_url):
+        raise Exception(
+            "Provide either video_path or video_url (exactly one, not both)"
+        )
+
+    if video_url:
+        # Same scheme guard as the sound tools — keeps file:// and flag-like
+        # values away from ffprobe and the backend.
+        _require_http_url(video_url, "video")
+        # The dubbing pipeline fetches the source URL itself and requires
+        # https specifically, unlike the fal-backed endpoints. A plain http
+        # URL is a guaranteed 422, so reject it before the round trip.
+        if not video_url.lower().startswith("https://"):
+            raise Exception(
+                "video_url must use https — the dubbing pipeline requires an "
+                "https URL."
+            )
+
+    out_path = _make_output_path(output_directory)
+    cfg = _get_config()
+
+    form: dict = {}
+    if languages is not None:
+        # Pass-through as one JSON-array form field, the shape the backend
+        # parses. Codes are NOT checked here: the backend owns the supported
+        # list and rejects an unknown code with a 422 before charging, and a
+        # hardcoded copy would make this server reject codes added later.
+        form["languages"] = json.dumps(languages)
+
+    files, extra_form = await _stage_video_input(
+        video_path, video_url, cfg["base_path"], _DUBBING_MAX_VIDEO_DURATION_SECONDS
+    )
+    form.update(extra_form)
+    if files is None:
+        # /v1/dubbing expects multipart/form-data even for a URL-only
+        # submission (unlike the sound tools, which accept either encoding).
+        # httpx only switches to multipart when `files` is non-empty, so a
+        # plain `data=form` here would silently fall back to
+        # application/x-www-form-urlencoded. Routing every field through
+        # `files` as a filename-less part keeps the wire format multipart
+        # without needing a real file.
+        files = {key: (None, value) for key, value in form.items()}
+        form = None
+    task_id = await _post_task_submit("/v1/dubbing", data=form, files=files)
+
+    # TIME_OUT_SECONDS defaults to 600 (10 min), but the dubbing backend polls
+    # its own pipeline for up to 7200s (2 hours). Abandoning the poll at 10
+    # minutes would leave the caller charged for videos they never receive, so
+    # apply a floor — while still honouring a larger operator-set timeout.
+    body = await _poll_task(
+        task_id, max(cfg["timeout"], _DUBBING_MIN_POLL_TIMEOUT_SECONDS)
+    )
+    # No prompt to slugify — a dubbing call has no free text at all, so the
+    # task id is the only stable name available.
+    return await _save_dubbing_artifacts(
+        body, out_path, f"dubbing-{task_id[:8]}", task_id
     )
 
 

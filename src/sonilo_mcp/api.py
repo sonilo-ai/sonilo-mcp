@@ -15,7 +15,7 @@ import sys
 import time
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -277,6 +277,11 @@ _MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — music endpoints
 _SFX_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sfx
 _SOUND_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sound*
 _DUCKING_MAX_DURATION_SECONDS = 360  # 6 minutes — /v1/audio-ducking, per input
+_DUBBING_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/dubbing
+# Floor for the dubbing poll, matched to the backend's own ceiling: it polls
+# its pipeline for up to 7200s, so giving up any earlier abandons a job the
+# caller has already been charged for. TIME_OUT_SECONDS defaults to 600.
+_DUBBING_MIN_POLL_TIMEOUT_SECONDS = 7200.0
 
 
 async def _check_media_duration(
@@ -357,6 +362,25 @@ def _extract_detail(body: str) -> str:
     return body
 
 
+def _extract_code(body: str) -> Optional[str]:
+    """Pull the machine-readable `code` out of a backend error body.
+
+    The public /v1/* contract pairs every error `message` with a `code`, and
+    the code is the part that is stable — the message is product copy. Used
+    to tell the three 402s apart (see _raise_http_error). Returns None when
+    the body isn't JSON, isn't an object, or carries no string `code`.
+    """
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(parsed, dict):
+        code = parsed.get("code")
+        if isinstance(code, str):
+            return code
+    return None
+
+
 def _describe_exc(e: BaseException) -> str:
     """Render an exception for a user-facing message.
 
@@ -397,14 +421,24 @@ def _raise_http_error(status_code: int, body: str) -> None:
             status_code,
         )
     if status_code == 402:
-        # Every 402 gets the billing link, unconditionally. This used to be
-        # gated on the detail containing "minute" or "credit", which silently
-        # stopped matching when billing moved to a cash wallet — the message
-        # for the most common 402 by far is now "Insufficient balance: ...",
-        # so the one case that most needs the top-up link was the one case
-        # that never got it. Both 402s the backend can return (insufficient
-        # balance, suspended account) are resolved on the same billing page,
-        # so there is nothing left to discriminate on.
+        # A 402 whose code is trial_exhausted already ends in its own call to
+        # action ("Add a payment method to continue: <billing url>"), so the
+        # generic suffix below would print the same link twice in one
+        # sentence. It is also the one 402 that is NOT about topping up: the
+        # account has never paid, so "Top up" names a flow it hasn't reached.
+        if _extract_code(body) == "trial_exhausted":
+            # Passed through verbatim, without _end_sentence: this message
+            # ends ON the URL, and a period glued to the end of a link breaks
+            # click/copy detection in most terminals.
+            raise SoniloHTTPError(detail, status_code)
+        # Every other 402 gets the billing link, unconditionally. This used to
+        # be gated on the detail containing "minute" or "credit", which
+        # silently stopped matching when billing moved to a cash wallet — the
+        # message for the most common 402 by far is now "Insufficient balance:
+        # ...", so the one case that most needed the top-up link was the one
+        # case that never got it. The remaining 402s (insufficient balance,
+        # suspended account, credit limit) are all resolved on the same
+        # billing page, so there is nothing left to discriminate on.
         raise SoniloHTTPError(
             f"{_end_sentence(detail)} Top up at {_BILLING_URL}", status_code
         )
@@ -1392,6 +1426,118 @@ async def _save_music_task_artifacts(
     return saved
 
 
+def _is_dubbing_envelope(body: dict) -> bool:
+    """Whether a terminal /v1/tasks/{id} body is a dubbing result: an
+    `outputs` map of language code -> dubbed video URL.
+
+    Prefers the backend `type` field, falling back to shape-sniffing only for
+    bodies that omit `type` entirely — same rule as
+    _is_video_to_video_envelope, so the two stay consistent about which
+    signal wins: an explicit, different `type` (e.g. "video_to_sfx") is
+    always authoritative and short-circuits straight to False, rather than
+    falling through to sniff `outputs`. Without that short-circuit, a
+    non-dubbing task that happens to carry an `outputs`-shaped field would
+    get misrouted to this envelope's save layer instead of its own.
+
+    Every value must be a non-empty string. A map with a blank or non-string
+    URL is NOT treated as a dubbing envelope: it would otherwise be routed to
+    the save layer, which would fail mid-download on a paid task instead of
+    landing in the generic missing-artifact error that hands the caller their
+    task_id.
+    """
+    t = body.get("type")
+    if isinstance(t, str) and t:
+        return t == "dubbing"
+    outputs = body.get("outputs")
+    if not isinstance(outputs, dict) or not outputs:
+        return False
+    return all(isinstance(url, str) and url for url in outputs.values())
+
+
+async def _save_dubbing_artifacts(
+    body: dict,
+    output_path: Path,
+    base_name: str,
+    task_id: str,
+) -> list[TextContent]:
+    """Turn a terminal /v1/tasks/{id} body from a dubbing task into saved
+    local files — one `.mp4` per requested language.
+
+    failed/unexpected status -> see _raise_if_task_not_succeeded (shared with
+    _save_task_artifacts; that part is envelope-agnostic).
+
+    succeeded -> download every entry in `outputs`, named
+    `{base_name}.{language}.mp4`, in sorted language order so the reported
+    order is stable across runs. One TextContent per saved file, each naming
+    its language.
+
+    Languages are saved sequentially rather than concurrently: _artifact_dest
+    reserves each name with an exclusive create, and a serial loop keeps the
+    partial-failure message ("already saved: ...") accurate and ordered.
+
+    task_id must be the caller's own known-good id (from _post_task_submit),
+    same rule as _save_task_artifacts — the terminal body is not a
+    trustworthy source for the recovery id.
+
+    Every failure below happens AFTER the task succeeded and was charged, so
+    it must carry the task_id and any already-saved paths; without them the
+    caller has no way back to a result they have already paid for.
+    """
+    _raise_if_task_not_succeeded(body, task_id)
+
+    outputs = body.get("outputs")
+    valid = (
+        {
+            language: url
+            for language, url in outputs.items()
+            if isinstance(url, str) and url
+        }
+        if isinstance(outputs, dict)
+        else {}
+    )
+    if not valid:
+        raise Exception(
+            "Task succeeded but no dubbed video was returned. Task id: "
+            f"{task_id}."
+        )
+
+    saved: list[TextContent] = []
+    saved_paths: list[Path] = []
+    for language in sorted(valid):
+        try:
+            dest = _artifact_dest(output_path, f"{base_name}.{language}", ".mp4")
+            await _download_artifact(valid[language], dest)
+        except Exception as e:
+            already = (
+                " Already saved: " + ", ".join(str(p) for p in saved_paths) + "."
+                if saved_paths
+                else ""
+            )
+            raise Exception(
+                f"{_end_sentence(e)} The rest of this result is still stored "
+                f"on the backend — task id: {task_id}. Call "
+                f'get_sfx_task("{task_id}") to retry the download.{already}'
+            ) from e
+        saved_paths.append(dest)
+        saved.append(TextContent(
+            type="text", text=f"Success ({language}). File saved as: {dest}",
+        ))
+
+    dropped = sorted(set(outputs) - set(valid)) if isinstance(outputs, dict) else []
+    if dropped:
+        saved.append(TextContent(
+            type="text",
+            text=(
+                "Warning: no video URL was returned for: "
+                f"{', '.join(dropped)}. Task id: {task_id} — you were "
+                "billed for that language; call "
+                f'get_sfx_task("{task_id}") to re-check.'
+            ),
+        ))
+
+    return saved
+
+
 # ---------- Tools: generation ----------
 
 @mcp.tool(
@@ -1956,6 +2102,55 @@ async def video_to_video_sfx(
     return await _save_task_artifacts(body, out_path, base, task_id)
 
 
+async def _stage_video_input(
+    video_path: str | None,
+    video_url: str | None,
+    base_path: str | None,
+    max_seconds: int,
+) -> tuple[dict | None, dict[str, str]]:
+    """Validate one video input and prepare it for _post_task_submit.
+
+    Returns `(files, extra_form_fields)`: an uploaded local file yields the
+    `files` mapping and no extra form fields; a URL yields no files and a
+    `{"video_url": ...}` field for the caller to merge into its form. Either
+    way the source's duration has been probed against `max_seconds` before
+    returning, so an over-long video never reaches the backend and is never
+    charged.
+
+    Shared by _submit_video_to_sound and dubbing, the two current callers
+    that take a video and submit a task — video_to_music, video_to_sfx,
+    video_to_video_music, and video_to_video_sfx still carry their own inline
+    copies of this logic and are not wired to this helper, so a cap change
+    made only here does not reach them.
+
+    The caller owns the exactly-one-of check and any scheme guard — those
+    differ per tool (dubbing requires https specifically; the sound tools
+    accept either).
+    """
+    if video_path:
+        resolved = _resolve_input_file(
+            video_path, base_path, _SFX_VIDEO_EXTS, "video"
+        )
+        max_mb = await _get_max_upload_size_mb()
+        size_mb = resolved.stat().st_size / (1024 * 1024)
+        if size_mb > max_mb:
+            # Cheap fail-fast: avoids a wasted ffprobe run for an
+            # obviously-oversized file. NOT the authoritative check — see
+            # _read_capped, which enforces the cap on the bytes actually read.
+            raise Exception(
+                f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
+            )
+        await _check_media_duration(str(resolved), max_seconds=max_seconds)
+        mime, _ = mimetypes.guess_type(resolved.name)
+        content = _read_capped(resolved, max_mb, "Video")
+        return (
+            {"video": (resolved.name, content, mime or "application/octet-stream")},
+            {},
+        )
+    await _check_media_duration(video_url, max_seconds=max_seconds)
+    return None, {"video_url": video_url}
+
+
 async def _submit_video_to_sound(
     *,
     path: str,
@@ -2009,36 +2204,11 @@ async def _submit_video_to_sound(
     # tool's behavior identical to what its schema advertises.
     form["ducking"] = "true" if ducking else "false"
 
-    if video_path:
-        resolved = _resolve_input_file(
-            video_path, cfg["base_path"], _SFX_VIDEO_EXTS, "video"
-        )
-        max_mb = await _get_max_upload_size_mb()
-        size_mb = resolved.stat().st_size / (1024 * 1024)
-        if size_mb > max_mb:
-            # Cheap fail-fast: avoids a wasted ffprobe run for an
-            # obviously-oversized file. NOT the authoritative check — see
-            # _read_capped, which enforces the cap on the bytes actually read.
-            raise Exception(
-                f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
-            )
-        await _check_media_duration(
-            str(resolved), max_seconds=_SOUND_MAX_VIDEO_DURATION_SECONDS
-        )
-        mime, _ = mimetypes.guess_type(resolved.name)
-        content = _read_capped(resolved, max_mb, "Video")
-        files = {
-            "video": (
-                resolved.name, content, mime or "application/octet-stream"
-            )
-        }
-        task_id = await _post_task_submit(path, data=form, files=files)
-    else:
-        await _check_media_duration(
-            video_url, max_seconds=_SOUND_MAX_VIDEO_DURATION_SECONDS
-        )
-        form["video_url"] = video_url
-        task_id = await _post_task_submit(path, data=form)
+    files, extra_form = await _stage_video_input(
+        video_path, video_url, cfg["base_path"], _SOUND_MAX_VIDEO_DURATION_SECONDS
+    )
+    form.update(extra_form)
+    task_id = await _post_task_submit(path, data=form, files=files)
 
     body = await _poll_task(task_id, cfg["timeout"])
     prompt = music_prompt or sfx_prompt
@@ -2183,12 +2353,109 @@ async def video_to_video_sound(
 
 @mcp.tool(
     description=(
-        "Check a sound-effects, audio-ducking, video-to-video, or async "
-        "video-to-music generation task and, if finished, download its "
+        "Dub a video into one or more other languages and save one dubbed "
+        "video file per language. The speech is translated and re-voiced; "
+        "the result is a new .mp4 per target language, not an audio "
+        "track.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges, and you are billed PER LANGUAGE — asking for four "
+        "languages costs four times as much as one. This tool has ZERO "
+        "free-trial runs — even a trial account is billed from the first "
+        "call. Only use when explicitly requested by the user.\n\n"
+        "This call polls until the backend finishes and waits AT LEAST TWO "
+        "HOURS before giving up, regardless of any shorter configured "
+        "timeout — two hours is the backend's own ceiling for the job. A "
+        "call that sits for an hour or more is normal, not a hang; do not "
+        "cancel it, "
+        "since the task keeps running and charging on the backend either "
+        "way and a cancelled call just loses the caller's easy path to the "
+        "result.\n\n"
+        "Args:\n"
+        "    video_path (str, optional): Absolute local path, or relative "
+        "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.webm/.m4v/.gif (gif "
+        "must be animated). Subject to the account's max upload size "
+        "(typically 300 MB). Maximum video duration is 180 seconds "
+        "(3 minutes).\n"
+        "    video_url (str, optional): HTTPS URL to a video file. Must be "
+        "https specifically — the dubbing pipeline fetches the source "
+        "itself and rejects plain http.\n"
+        "    languages (list, optional): Target language codes, e.g. "
+        '["es", "fr"]. Supported: en, zh_cn, ja, ko, pt, es, de, fr, it, '
+        'ru. Omit to get the default ["zh_cn", "es", "fr"].\n'
+        "    output_directory (str, optional): Where to save the results. "
+        "Defaults to SONILO_MCP_BASE_PATH.\n\n"
+        "Exactly one of video_path and video_url must be provided.\n\n"
+        "Returns:\n"
+        "    One TextContent per saved file, named "
+        "dubbing-<first 8 chars of the task id>.<language>.mp4. On timeout "
+        "the error message includes the task_id — recover with "
+        "get_sfx_task."
+    )
+)
+async def dubbing(
+    video_path: str | None = None,
+    video_url: str | None = None,
+    languages: list[str] | None = None,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    if (video_path and video_url) or (not video_path and not video_url):
+        raise Exception(
+            "Provide either video_path or video_url (exactly one, not both)"
+        )
+
+    if video_url:
+        # Same scheme guard as the sound tools — keeps file:// and flag-like
+        # values away from ffprobe and the backend.
+        _require_http_url(video_url, "video")
+        # The dubbing pipeline fetches the source URL itself and requires
+        # https specifically, unlike the fal-backed endpoints. A plain http
+        # URL is a guaranteed 422, so reject it before the round trip.
+        if not video_url.lower().startswith("https://"):
+            raise Exception(
+                "video_url must use https — the dubbing pipeline requires an "
+                "https URL."
+            )
+
+    out_path = _make_output_path(output_directory)
+    cfg = _get_config()
+
+    form: dict = {}
+    if languages is not None:
+        # Pass-through as one JSON-array form field, the shape the backend
+        # parses. Codes are NOT checked here: the backend owns the supported
+        # list and rejects an unknown code with a 422 before charging, and a
+        # hardcoded copy would make this server reject codes added later.
+        form["languages"] = json.dumps(languages)
+
+    files, extra_form = await _stage_video_input(
+        video_path, video_url, cfg["base_path"], _DUBBING_MAX_VIDEO_DURATION_SECONDS
+    )
+    form.update(extra_form)
+    task_id = await _post_task_submit("/v1/dubbing", data=form, files=files)
+
+    # TIME_OUT_SECONDS defaults to 600 (10 min), but the dubbing backend polls
+    # its own pipeline for up to 7200s (2 hours). Abandoning the poll early
+    # would leave the caller charged for videos they never receive, so floor
+    # it at the backend's own ceiling — while still honouring a larger
+    # operator-set timeout.
+    body = await _poll_task(
+        task_id, max(cfg["timeout"], _DUBBING_MIN_POLL_TIMEOUT_SECONDS)
+    )
+    # No prompt to slugify — a dubbing call has no free text at all, so the
+    # task id is the only stable name available.
+    return await _save_dubbing_artifacts(
+        body, out_path, f"dubbing-{task_id[:8]}", task_id
+    )
+
+
+@mcp.tool(
+    description=(
+        "Check a sound-effects, audio-ducking, video-to-video, dubbing, or "
+        "async video-to-music generation task and, if finished, download its "
         "result file(s). Use this to recover a result when text_to_sfx, "
         "video_to_sfx, audio_ducking, video_to_video_music, "
-        "video_to_video_sfx, video_to_sound, video_to_video_sound, or "
-        "video_to_music(preserve_speech=true) timed "
+        "video_to_video_sfx, video_to_sound, video_to_video_sound, dubbing, "
+        "or video_to_music(preserve_speech=true) timed "
         "out — their error message contains the task_id. Does not poll: a "
         "single status check per call. This tool itself never charges.\n\n"
         "Args:\n"
@@ -2201,7 +2468,8 @@ async def video_to_video_sound(
         "video_to_sfx tasks; a single .wav or .mp4 for audio_ducking "
         "tasks; a single .mp4 for video_to_video_music/video_to_video_sfx/"
         "video_to_video_sound tasks; a single .wav for video_to_sound "
-        "tasks; for a video_to_music(preserve_speech=true) task, the audio "
+        "tasks; one .mp4 per language for dubbing tasks; for a "
+        "video_to_music(preserve_speech=true) task, the audio "
         "stream(s) plus the preserved speech ('vocals') stem plus the mux "
         "(speech+music mixed — the ready-to-use combined result). "
         "Failed -> an error including whether the charge was refunded."
@@ -2252,6 +2520,17 @@ async def get_sfx_task(
     out_path = _make_output_path(output_directory)
     # No prompt available on recovery — name by task id; extension comes
     # from the envelope's content_type.
+    if _is_dubbing_envelope(body):
+        # A dubbing task renders one video per language under `outputs` —
+        # _save_task_artifacts only understands audio/video slots and would
+        # report a missing artifact for a task that was already charged and
+        # whose files are still on the backend. No reuse_existing here, for
+        # the same reason as the music branch: _save_dubbing_artifacts has no
+        # such mode, so a second recovery call lands in -1/-2-suffixed files
+        # rather than being detected as a duplicate.
+        return await _save_dubbing_artifacts(
+            body, out_path, f"dubbing-{task_id[:8]}", task_id
+        )
     if _is_music_task_envelope(body):
         # Async (isolate_vocals) video-to-music: list-shaped `audio` plus
         # optional `vocals`/`mux` — needs the music-aware save layer, not
@@ -2423,9 +2702,24 @@ async def audio_ducking(
 @mcp.tool(
     description=(
         "Get the authenticated account's available Sonilo services, rate limits, "
-        "concurrency limit, discount factor, and max video upload size. "
+        "concurrency limit, discount factor, max video upload size, and — when "
+        "the account has one — its free-trial allowance. "
         "Use this to discover what generation endpoints are available before "
-        "calling them."
+        "calling them.\n\n"
+        "Returns:\n"
+        "    dict with available_services, rpm_limit, concurrency_limit, "
+        "discount_factor, max_upload_size_mb, and an optional trial object "
+        "keyed by service, each {granted, used, remaining}.\n\n"
+        "Check trial[service]['remaining'] before calling a paid generation "
+        "tool: at 0 that call fails with 402 trial_exhausted, which no retry "
+        "fixes — tell the user their free trial for that service is spent and "
+        "that continuing needs a payment method. The trial key is absent for "
+        "accounts that have no free-trial allowance; treat that as 'the "
+        "account bills normally', not as an error. A trial object that IS "
+        "present but has no entry for the service you're about to call means "
+        "that service has no free-trial allowance at all — it bills from the "
+        "first call (this is dubbing's situation on any self-serve trial "
+        "account)."
     )
 )
 async def get_account_services() -> dict:

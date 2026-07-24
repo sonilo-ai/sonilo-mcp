@@ -337,9 +337,31 @@ def test_raise_http_error_402_insufficient_balance():
     assert "needed=1.3308. Top up at" in message
 
 
+def test_raise_http_error_402_trial_exhausted_keeps_one_billing_link():
+    # This 402's message already ends in its own call to action carrying the
+    # billing URL, so appending the generic "Top up at <same url>" would show
+    # the same link twice in one sentence — and "top up" names a flow an
+    # account that has never paid us hasn't reached.
+    from sonilo_mcp.api import _raise_http_error
+    with pytest.raises(Exception) as exc:
+        _raise_http_error(
+            402,
+            '{"code":"trial_exhausted","message":"You\'ve used your 2 free '
+            "trial calls for text-to-music. Add a payment method to continue: "
+            'https://platform.sonilo.com/dashboard/billing"}',
+        )
+    message = str(exc.value)
+    assert "free trial calls for text-to-music" in message
+    assert "Add a payment method to continue" in message
+    assert "Top up at" not in message
+    assert message.count("https://platform.sonilo.com/dashboard/billing") == 1
+    # Ends on the URL, with no punctuation glued to it.
+    assert message.endswith("/dashboard/billing")
+
+
 def test_raise_http_error_402_suspended():
     # A suspended account is resolved on the same billing page, so it gets
-    # the link too — 402 is unconditional now.
+    # the link too — every 402 but trial_exhausted is unconditional.
     from sonilo_mcp.api import _raise_http_error
     with pytest.raises(Exception) as exc:
         _raise_http_error(
@@ -496,6 +518,42 @@ async def test_get_account_services(monkeypatch):
     out = await get_account_services()
     assert out["available_services"] == ["text-to-music", "video-to-music"]
     assert out["max_upload_size_mb"] == 300
+
+
+@respx.mock
+async def test_get_account_services_passes_the_trial_quota_through(monkeypatch):
+    # The whole point of the trial quota is that the assistant can see it and
+    # warn before spending it, so it must survive the response envelope check.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={
+            "available_services": ["text_to_music"],
+            "rpm_limit": 60,
+            "concurrency_limit": 4,
+            "discount_factor": 1.0,
+            "max_upload_size_mb": 300,
+            "trial": {"text_to_music": {"granted": 2, "used": 1, "remaining": 1}},
+        })
+    )
+    from sonilo_mcp.api import get_account_services
+    out = await get_account_services()
+    assert out["trial"]["text_to_music"] == {"granted": 2, "used": 1, "remaining": 1}
+
+
+def test_extract_code_reads_the_public_error_envelope():
+    from sonilo_mcp.api import _extract_code
+    assert _extract_code('{"code":"trial_exhausted","message":"x"}') == "trial_exhausted"
+
+
+def test_extract_code_returns_none_without_a_usable_code():
+    from sonilo_mcp.api import _extract_code
+    assert _extract_code('{"message":"no code here"}') is None
+    assert _extract_code("not json at all") is None
+    assert _extract_code('["not", "an", "object"]') is None
+    # A non-string code is a backend bug; treat it as absent rather than
+    # comparing it to the string literals in _raise_http_error.
+    assert _extract_code('{"code":402}') is None
 
 
 @respx.mock
@@ -4640,3 +4698,353 @@ async def test_video_to_sound_rejects_both_inputs(monkeypatch, output_dir):
         await api.video_to_sound(
             video_path="/tmp/a.mp4", video_url="https://example.com/clip.mp4"
         )
+
+
+DUBBING_BODY = {
+    "task_id": "db-1",
+    "type": "dubbing",
+    "status": "succeeded",
+    "outputs": {"fr": "https://r2.test/fr.mp4", "es": "https://r2.test/es.mp4"},
+}
+
+
+def test_is_dubbing_envelope_recognizes_the_outputs_map():
+    from sonilo_mcp import api
+    assert api._is_dubbing_envelope(DUBBING_BODY) is True
+    assert api._is_dubbing_envelope({"task_id": "x", "status": "succeeded"}) is False
+    assert api._is_dubbing_envelope({"outputs": {}}) is False
+    assert api._is_dubbing_envelope({"outputs": {"es": ""}}) is False
+    assert api._is_dubbing_envelope({"outputs": ["https://r2.test/es.mp4"]}) is False
+    # An SFX body must never be mistaken for one.
+    assert api._is_dubbing_envelope(
+        {"status": "succeeded", "audio": {"url": "https://r2.test/a.wav"}}
+    ) is False
+    # An explicit, different type is authoritative and short-circuits to
+    # False even when `outputs` happens to look dubbing-shaped — mirrors
+    # _is_video_to_video_envelope's short-circuit on a non-matching type.
+    assert api._is_dubbing_envelope(
+        {"type": "video_to_sfx", "outputs": {"es": "https://r2.test/es.mp4"}}
+    ) is False
+
+
+@respx.mock
+async def test_save_dubbing_artifacts_writes_one_file_per_language(tmp_path):
+    from sonilo_mcp import api
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/fr.mp4").mock(
+        return_value=httpx.Response(200, content=b"fr-bytes")
+    )
+    result = await api._save_dubbing_artifacts(
+        DUBBING_BODY, tmp_path, "dubbing-db-1", "db-1"
+    )
+    assert len(result) == 2
+    assert (tmp_path / "dubbing-db-1.es.mp4").read_bytes() == b"es-bytes"
+    assert (tmp_path / "dubbing-db-1.fr.mp4").read_bytes() == b"fr-bytes"
+    # Sorted, so the reported order is stable across runs.
+    assert "es" in result[0].text and "fr" in result[1].text
+
+
+@respx.mock
+async def test_save_dubbing_artifacts_skips_blank_urls_in_a_mixed_map(tmp_path):
+    from sonilo_mcp import api
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    result = await api._save_dubbing_artifacts(
+        {
+            "task_id": "db-1",
+            "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4", "fr": ""},
+        },
+        tmp_path,
+        "dubbing-db-1",
+        "db-1",
+    )
+    # The blank "fr" entry is filtered out of the save loop — no download
+    # attempted, no error raised — but a warning naming the dropped language
+    # and the task_id is appended so the caller knows they were billed for
+    # a language they did not receive.
+    assert len(result) == 2
+    assert "es" in result[0].text
+    assert (tmp_path / "dubbing-db-1.es.mp4").read_bytes() == b"es-bytes"
+    assert not (tmp_path / "dubbing-db-1.fr.mp4").exists()
+    assert "fr" in result[1].text
+    assert "db-1" in result[1].text
+    assert "Warning" in result[1].text
+
+
+@respx.mock
+async def test_save_dubbing_artifacts_keeps_the_task_id_and_saved_paths_on_failure(tmp_path):
+    from sonilo_mcp import api
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/fr.mp4").mock(return_value=httpx.Response(500))
+    with pytest.raises(Exception) as exc:
+        await api._save_dubbing_artifacts(
+            DUBBING_BODY, tmp_path, "dubbing-db-1", "db-1"
+        )
+    message = str(exc.value)
+    assert "db-1" in message
+    assert "dubbing-db-1.es.mp4" in message
+    # The failed download must not leave a half-written file behind.
+    assert not (tmp_path / "dubbing-db-1.fr.mp4").exists()
+
+
+async def test_save_dubbing_artifacts_raises_on_a_failed_task(tmp_path):
+    from sonilo_mcp import api
+    with pytest.raises(Exception) as exc:
+        await api._save_dubbing_artifacts(
+            {
+                "task_id": "db-1",
+                "status": "failed",
+                "error": {"code": "DUBBING_FAILED", "message": "dubbing job failed"},
+                "refunded": True,
+            },
+            tmp_path,
+            "dubbing-db-1",
+            "db-1",
+        )
+    assert "DUBBING_FAILED" in str(exc.value)
+
+
+async def test_save_dubbing_artifacts_raises_when_outputs_is_empty(tmp_path):
+    from sonilo_mcp import api
+    with pytest.raises(Exception) as exc:
+        await api._save_dubbing_artifacts(
+            {"task_id": "db-1", "status": "succeeded", "outputs": {}},
+            tmp_path,
+            "dubbing-db-1",
+            "db-1",
+        )
+    assert "db-1" in str(exc.value)
+
+
+async def test_stage_video_input_returns_form_fields_for_a_url(monkeypatch, tmp_path):
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+    files, extra = await api._stage_video_input(
+        None, "https://example.com/clip.mp4", str(tmp_path), 180
+    )
+    assert files is None
+    assert extra == {"video_url": "https://example.com/clip.mp4"}
+
+
+@respx.mock
+async def test_stage_video_input_returns_a_files_mapping_for_a_local_path(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    # Established pattern (see test_video_to_sfx_path_mode_uploads_multipart):
+    # _get_max_upload_size_mb is backed by a cached GET to /v1/account/services,
+    # so tests mock that route and reset the cache rather than stubbing the
+    # function directly.
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={"max_upload_size_mb": 300})
+    )
+    api._reset_services_cache()
+
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"video-bytes")
+    files, extra = await api._stage_video_input("clip.mp4", None, str(tmp_path), 180)
+    assert extra == {}
+    assert files is not None
+    assert files["video"][0] == "clip.mp4"
+    assert files["video"][1] == b"video-bytes"
+
+
+async def test_stage_video_input_rejects_an_over_long_video(monkeypatch, tmp_path):
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=200.0)
+    with pytest.raises(Exception):
+        await api._stage_video_input(
+            None, "https://example.com/clip.mp4", str(tmp_path), 180
+        )
+
+
+@respx.mock
+async def test_dubbing_url_mode_submits_and_saves_each_language(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-1", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/db-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "db-1", "type": "dubbing", "status": "succeeded",
+            "outputs": {
+                "es": "https://r2.test/es.mp4",
+                "fr": "https://r2.test/fr.mp4",
+            },
+        })
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/fr.mp4").mock(
+        return_value=httpx.Response(200, content=b"fr-bytes")
+    )
+    result = await api.dubbing(
+        video_url="https://example.com/clip.mp4", languages=["es", "fr"]
+    )
+    # URL-only submissions ride as application/x-www-form-urlencoded (same as
+    # every other tool's URL mode), so the JSON array arrives percent-encoded
+    # on the wire — decode before checking it reached the backend intact.
+    from urllib.parse import unquote_plus
+    sent = unquote_plus(submit.calls.last.request.content.decode())
+    assert '["es", "fr"]' in sent
+    assert len(result) == 2
+    assert (output_dir / "dubbing-db-1.es.mp4").read_bytes() == b"es-bytes"
+    assert (output_dir / "dubbing-db-1.fr.mp4").read_bytes() == b"fr-bytes"
+
+
+@respx.mock
+async def test_dubbing_omits_languages_when_unset(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-2", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/db-2").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "db-2", "type": "dubbing", "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4"},
+        })
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    await api.dubbing(video_url="https://example.com/clip.mp4")
+    assert b"languages" not in submit.calls.last.request.content
+
+
+async def test_dubbing_rejects_both_inputs(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp import api
+    with pytest.raises(Exception, match="exactly one"):
+        await api.dubbing(video_path="clip.mp4", video_url="https://example.com/clip.mp4")
+    with pytest.raises(Exception, match="exactly one"):
+        await api.dubbing()
+
+
+async def test_dubbing_rejects_a_non_https_url(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp import api
+    with pytest.raises(Exception, match="must use https"):
+        await api.dubbing(video_url="http://example.com/clip.mp4")
+
+
+@respx.mock
+async def test_dubbing_rejects_a_video_over_180_seconds(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=200.0)
+    submit = respx.post("https://api.test.local/v1/dubbing")
+    with pytest.raises(Exception):
+        await api.dubbing(video_url="https://example.com/clip.mp4")
+    # Nothing may be submitted, so nothing is charged.
+    assert not submit.called
+
+
+@respx.mock
+async def test_dubbing_polls_for_at_least_two_hours(monkeypatch, output_dir):
+    """TIME_OUT_SECONDS defaults to 600, but the dubbing backend polls its own
+    pipeline for up to 7200s. Giving up at 10 minutes would leave the caller
+    charged for videos they never receive."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    monkeypatch.setenv("TIME_OUT_SECONDS", "600")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+    respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-3", "status": "processing"})
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    seen: dict = {}
+
+    async def fake_poll(task_id, timeout):
+        seen["timeout"] = timeout
+        return {
+            "task_id": task_id, "type": "dubbing", "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4"},
+        }
+
+    monkeypatch.setattr(api, "_poll_task", fake_poll)
+    await api.dubbing(video_url="https://example.com/clip.mp4")
+    assert seen["timeout"] == 7200.0
+
+
+@respx.mock
+async def test_dubbing_honours_a_larger_operator_timeout(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    monkeypatch.setenv("TIME_OUT_SECONDS", "10800")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+    respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-4", "status": "processing"})
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    seen: dict = {}
+
+    async def fake_poll(task_id, timeout):
+        seen["timeout"] = timeout
+        return {
+            "task_id": task_id, "type": "dubbing", "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4"},
+        }
+
+    monkeypatch.setattr(api, "_poll_task", fake_poll)
+    await api.dubbing(video_url="https://example.com/clip.mp4")
+    assert seen["timeout"] == 10800.0
+
+
+@respx.mock
+async def test_get_sfx_task_recovers_a_dubbing_task(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    respx.get("https://api.test.local/v1/tasks/db-9").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "db-9", "type": "dubbing", "status": "succeeded",
+            "outputs": {
+                "es": "https://r2.test/es.mp4",
+                "ja": "https://r2.test/ja.mp4",
+            },
+        })
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/ja.mp4").mock(
+        return_value=httpx.Response(200, content=b"ja-bytes")
+    )
+    result = await api.get_sfx_task("db-9")
+    assert len(result) == 2
+    assert (output_dir / "dubbing-db-9.es.mp4").read_bytes() == b"es-bytes"
+    assert (output_dir / "dubbing-db-9.ja.mp4").read_bytes() == b"ja-bytes"

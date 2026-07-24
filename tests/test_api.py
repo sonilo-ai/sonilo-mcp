@@ -4757,3 +4757,49 @@ async def test_save_dubbing_artifacts_raises_when_outputs_is_empty(tmp_path):
             "db-1",
         )
     assert "db-1" in str(exc.value)
+
+
+async def test_stage_video_input_returns_form_fields_for_a_url(monkeypatch, tmp_path):
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+    files, extra = await api._stage_video_input(
+        None, "https://example.com/clip.mp4", str(tmp_path), 180
+    )
+    assert files is None
+    assert extra == {"video_url": "https://example.com/clip.mp4"}
+
+
+@respx.mock
+async def test_stage_video_input_returns_a_files_mapping_for_a_local_path(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    # Established pattern (see test_video_to_sfx_path_mode_uploads_multipart):
+    # _get_max_upload_size_mb is backed by a cached GET to /v1/account/services,
+    # so tests mock that route and reset the cache rather than stubbing the
+    # function directly.
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={"max_upload_size_mb": 300})
+    )
+    api._reset_services_cache()
+
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"video-bytes")
+    files, extra = await api._stage_video_input("clip.mp4", None, str(tmp_path), 180)
+    assert extra == {}
+    assert files is not None
+    assert files["video"][0] == "clip.mp4"
+    assert files["video"][1] == b"video-bytes"
+
+
+async def test_stage_video_input_rejects_an_over_long_video(monkeypatch, tmp_path):
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=200.0)
+    with pytest.raises(Exception):
+        await api._stage_video_input(
+            None, "https://example.com/clip.mp4", str(tmp_path), 180
+        )

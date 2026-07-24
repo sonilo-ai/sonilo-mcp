@@ -2056,6 +2056,53 @@ async def video_to_video_sfx(
     return await _save_task_artifacts(body, out_path, base, task_id)
 
 
+async def _stage_video_input(
+    video_path: str | None,
+    video_url: str | None,
+    base_path: str | None,
+    max_seconds: int,
+) -> tuple[dict | None, dict[str, str]]:
+    """Validate one video input and prepare it for _post_task_submit.
+
+    Returns `(files, extra_form_fields)`: an uploaded local file yields the
+    `files` mapping and no extra form fields; a URL yields no files and a
+    `{"video_url": ...}` field for the caller to merge into its form. Either
+    way the source's duration has been probed against `max_seconds` before
+    returning, so an over-long video never reaches the backend and is never
+    charged.
+
+    Shared by every tool that takes a video and submits a task, so the
+    extension allowlist, the upload size cap, the duration probe and the read
+    cap stay in one place rather than drifting per tool.
+
+    The caller owns the exactly-one-of check and any scheme guard — those
+    differ per tool (dubbing requires https specifically; the sound tools
+    accept either).
+    """
+    if video_path:
+        resolved = _resolve_input_file(
+            video_path, base_path, _SFX_VIDEO_EXTS, "video"
+        )
+        max_mb = await _get_max_upload_size_mb()
+        size_mb = resolved.stat().st_size / (1024 * 1024)
+        if size_mb > max_mb:
+            # Cheap fail-fast: avoids a wasted ffprobe run for an
+            # obviously-oversized file. NOT the authoritative check — see
+            # _read_capped, which enforces the cap on the bytes actually read.
+            raise Exception(
+                f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
+            )
+        await _check_media_duration(str(resolved), max_seconds=max_seconds)
+        mime, _ = mimetypes.guess_type(resolved.name)
+        content = _read_capped(resolved, max_mb, "Video")
+        return (
+            {"video": (resolved.name, content, mime or "application/octet-stream")},
+            {},
+        )
+    await _check_media_duration(video_url, max_seconds=max_seconds)
+    return None, {"video_url": video_url}
+
+
 async def _submit_video_to_sound(
     *,
     path: str,
@@ -2109,36 +2156,11 @@ async def _submit_video_to_sound(
     # tool's behavior identical to what its schema advertises.
     form["ducking"] = "true" if ducking else "false"
 
-    if video_path:
-        resolved = _resolve_input_file(
-            video_path, cfg["base_path"], _SFX_VIDEO_EXTS, "video"
-        )
-        max_mb = await _get_max_upload_size_mb()
-        size_mb = resolved.stat().st_size / (1024 * 1024)
-        if size_mb > max_mb:
-            # Cheap fail-fast: avoids a wasted ffprobe run for an
-            # obviously-oversized file. NOT the authoritative check — see
-            # _read_capped, which enforces the cap on the bytes actually read.
-            raise Exception(
-                f"Video file is too large ({size_mb:.1f} MB > {max_mb} MB cap)"
-            )
-        await _check_media_duration(
-            str(resolved), max_seconds=_SOUND_MAX_VIDEO_DURATION_SECONDS
-        )
-        mime, _ = mimetypes.guess_type(resolved.name)
-        content = _read_capped(resolved, max_mb, "Video")
-        files = {
-            "video": (
-                resolved.name, content, mime or "application/octet-stream"
-            )
-        }
-        task_id = await _post_task_submit(path, data=form, files=files)
-    else:
-        await _check_media_duration(
-            video_url, max_seconds=_SOUND_MAX_VIDEO_DURATION_SECONDS
-        )
-        form["video_url"] = video_url
-        task_id = await _post_task_submit(path, data=form)
+    files, extra_form = await _stage_video_input(
+        video_path, video_url, cfg["base_path"], _SOUND_MAX_VIDEO_DURATION_SECONDS
+    )
+    form.update(extra_form)
+    task_id = await _post_task_submit(path, data=form, files=files)
 
     body = await _poll_task(task_id, cfg["timeout"])
     prompt = music_prompt or sfx_prompt

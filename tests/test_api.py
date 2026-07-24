@@ -4640,3 +4640,90 @@ async def test_video_to_sound_rejects_both_inputs(monkeypatch, output_dir):
         await api.video_to_sound(
             video_path="/tmp/a.mp4", video_url="https://example.com/clip.mp4"
         )
+
+
+DUBBING_BODY = {
+    "task_id": "db-1",
+    "type": "dubbing",
+    "status": "succeeded",
+    "outputs": {"fr": "https://r2.test/fr.mp4", "es": "https://r2.test/es.mp4"},
+}
+
+
+def test_is_dubbing_envelope_recognizes_the_outputs_map():
+    from sonilo_mcp import api
+    assert api._is_dubbing_envelope(DUBBING_BODY) is True
+    assert api._is_dubbing_envelope({"task_id": "x", "status": "succeeded"}) is False
+    assert api._is_dubbing_envelope({"outputs": {}}) is False
+    assert api._is_dubbing_envelope({"outputs": {"es": ""}}) is False
+    assert api._is_dubbing_envelope({"outputs": ["https://r2.test/es.mp4"]}) is False
+    # An SFX body must never be mistaken for one.
+    assert api._is_dubbing_envelope(
+        {"status": "succeeded", "audio": {"url": "https://r2.test/a.wav"}}
+    ) is False
+
+
+@respx.mock
+async def test_save_dubbing_artifacts_writes_one_file_per_language(tmp_path):
+    from sonilo_mcp import api
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/fr.mp4").mock(
+        return_value=httpx.Response(200, content=b"fr-bytes")
+    )
+    result = await api._save_dubbing_artifacts(
+        DUBBING_BODY, tmp_path, "dubbing-db-1", "db-1"
+    )
+    assert len(result) == 2
+    assert (tmp_path / "dubbing-db-1.es.mp4").read_bytes() == b"es-bytes"
+    assert (tmp_path / "dubbing-db-1.fr.mp4").read_bytes() == b"fr-bytes"
+    # Sorted, so the reported order is stable across runs.
+    assert "es" in result[0].text and "fr" in result[1].text
+
+
+@respx.mock
+async def test_save_dubbing_artifacts_keeps_the_task_id_and_saved_paths_on_failure(tmp_path):
+    from sonilo_mcp import api
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/fr.mp4").mock(return_value=httpx.Response(500))
+    with pytest.raises(Exception) as exc:
+        await api._save_dubbing_artifacts(
+            DUBBING_BODY, tmp_path, "dubbing-db-1", "db-1"
+        )
+    message = str(exc.value)
+    assert "db-1" in message
+    assert "dubbing-db-1.es.mp4" in message
+    # The failed download must not leave a half-written file behind.
+    assert not (tmp_path / "dubbing-db-1.fr.mp4").exists()
+
+
+async def test_save_dubbing_artifacts_raises_on_a_failed_task(tmp_path):
+    from sonilo_mcp import api
+    with pytest.raises(Exception) as exc:
+        await api._save_dubbing_artifacts(
+            {
+                "task_id": "db-1",
+                "status": "failed",
+                "error": {"code": "DUBBING_FAILED", "message": "dubbing job failed"},
+                "refunded": True,
+            },
+            tmp_path,
+            "dubbing-db-1",
+            "db-1",
+        )
+    assert "DUBBING_FAILED" in str(exc.value)
+
+
+async def test_save_dubbing_artifacts_raises_when_outputs_is_empty(tmp_path):
+    from sonilo_mcp import api
+    with pytest.raises(Exception) as exc:
+        await api._save_dubbing_artifacts(
+            {"task_id": "db-1", "status": "succeeded", "outputs": {}},
+            tmp_path,
+            "dubbing-db-1",
+            "db-1",
+        )
+    assert "db-1" in str(exc.value)

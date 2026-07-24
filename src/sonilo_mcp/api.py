@@ -1392,6 +1392,101 @@ async def _save_music_task_artifacts(
     return saved
 
 
+def _is_dubbing_envelope(body: dict) -> bool:
+    """Whether a terminal /v1/tasks/{id} body is a dubbing result: an
+    `outputs` map of language code -> dubbed video URL.
+
+    Prefers the backend `type` field, falling back to shape-sniffing only for
+    bodies that omit `type` entirely — same rule as
+    _is_video_to_video_envelope, so the two stay consistent about which
+    signal wins.
+
+    Every value must be a non-empty string. A map with a blank or non-string
+    URL is NOT treated as a dubbing envelope: it would otherwise be routed to
+    the save layer, which would fail mid-download on a paid task instead of
+    landing in the generic missing-artifact error that hands the caller their
+    task_id.
+    """
+    if body.get("type") == "dubbing":
+        return True
+    outputs = body.get("outputs")
+    if not isinstance(outputs, dict) or not outputs:
+        return False
+    return all(isinstance(url, str) and url for url in outputs.values())
+
+
+async def _save_dubbing_artifacts(
+    body: dict,
+    output_path: Path,
+    base_name: str,
+    task_id: str,
+) -> list[TextContent]:
+    """Turn a terminal /v1/tasks/{id} body from a dubbing task into saved
+    local files — one `.mp4` per requested language.
+
+    failed/unexpected status -> see _raise_if_task_not_succeeded (shared with
+    _save_task_artifacts; that part is envelope-agnostic).
+
+    succeeded -> download every entry in `outputs`, named
+    `{base_name}.{language}.mp4`, in sorted language order so the reported
+    order is stable across runs. One TextContent per saved file, each naming
+    its language.
+
+    Languages are saved sequentially rather than concurrently: _artifact_dest
+    reserves each name with an exclusive create, and a serial loop keeps the
+    partial-failure message ("already saved: ...") accurate and ordered.
+
+    task_id must be the caller's own known-good id (from _post_task_submit),
+    same rule as _save_task_artifacts — the terminal body is not a
+    trustworthy source for the recovery id.
+
+    Every failure below happens AFTER the task succeeded and was charged, so
+    it must carry the task_id and any already-saved paths; without them the
+    caller has no way back to a result they have already paid for.
+    """
+    _raise_if_task_not_succeeded(body, task_id)
+
+    outputs = body.get("outputs")
+    valid = (
+        {
+            language: url
+            for language, url in outputs.items()
+            if isinstance(url, str) and url
+        }
+        if isinstance(outputs, dict)
+        else {}
+    )
+    if not valid:
+        raise Exception(
+            "Task succeeded but no dubbed video was returned. Task id: "
+            f"{task_id}."
+        )
+
+    saved: list[TextContent] = []
+    saved_paths: list[Path] = []
+    for language in sorted(valid):
+        try:
+            dest = _artifact_dest(output_path, f"{base_name}.{language}", ".mp4")
+            await _download_artifact(valid[language], dest)
+        except Exception as e:
+            already = (
+                " Already saved: " + ", ".join(str(p) for p in saved_paths) + "."
+                if saved_paths
+                else ""
+            )
+            raise Exception(
+                f"{_end_sentence(e)} The rest of this result is still stored "
+                f"on the backend — task id: {task_id}. Call "
+                f'get_sfx_task("{task_id}") to retry the download.{already}'
+            ) from e
+        saved_paths.append(dest)
+        saved.append(TextContent(
+            type="text", text=f"Success ({language}). File saved as: {dest}",
+        ))
+
+    return saved
+
+
 # ---------- Tools: generation ----------
 
 @mcp.tool(

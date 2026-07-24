@@ -15,7 +15,7 @@ import sys
 import time
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -361,6 +361,25 @@ def _extract_detail(body: str) -> str:
     return body
 
 
+def _extract_code(body: str) -> Optional[str]:
+    """Pull the machine-readable `code` out of a backend error body.
+
+    The public /v1/* contract pairs every error `message` with a `code`, and
+    the code is the part that is stable — the message is product copy. Used
+    to tell the three 402s apart (see _raise_http_error). Returns None when
+    the body isn't JSON, isn't an object, or carries no string `code`.
+    """
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(parsed, dict):
+        code = parsed.get("code")
+        if isinstance(code, str):
+            return code
+    return None
+
+
 def _describe_exc(e: BaseException) -> str:
     """Render an exception for a user-facing message.
 
@@ -401,14 +420,21 @@ def _raise_http_error(status_code: int, body: str) -> None:
             status_code,
         )
     if status_code == 402:
-        # Every 402 gets the billing link, unconditionally. This used to be
-        # gated on the detail containing "minute" or "credit", which silently
-        # stopped matching when billing moved to a cash wallet — the message
-        # for the most common 402 by far is now "Insufficient balance: ...",
-        # so the one case that most needs the top-up link was the one case
-        # that never got it. Both 402s the backend can return (insufficient
-        # balance, suspended account) are resolved on the same billing page,
-        # so there is nothing left to discriminate on.
+        # A 402 whose code is trial_exhausted already ends in its own call to
+        # action ("Add a payment method to continue: <billing url>"), so the
+        # generic suffix below would print the same link twice in one
+        # sentence. It is also the one 402 that is NOT about topping up: the
+        # account has never paid, so "Top up" names a flow it hasn't reached.
+        if _extract_code(body) == "trial_exhausted":
+            raise SoniloHTTPError(_end_sentence(detail), status_code)
+        # Every other 402 gets the billing link, unconditionally. This used to
+        # be gated on the detail containing "minute" or "credit", which
+        # silently stopped matching when billing moved to a cash wallet — the
+        # message for the most common 402 by far is now "Insufficient balance:
+        # ...", so the one case that most needed the top-up link was the one
+        # case that never got it. The remaining 402s (insufficient balance,
+        # suspended account, credit limit) are all resolved on the same
+        # billing page, so there is nothing left to discriminate on.
         raise SoniloHTTPError(
             f"{_end_sentence(detail)} Top up at {_BILLING_URL}", status_code
         )
@@ -2635,9 +2661,20 @@ async def audio_ducking(
 @mcp.tool(
     description=(
         "Get the authenticated account's available Sonilo services, rate limits, "
-        "concurrency limit, discount factor, and max video upload size. "
+        "concurrency limit, discount factor, max video upload size, and — when "
+        "the account has one — its free-trial allowance. "
         "Use this to discover what generation endpoints are available before "
-        "calling them."
+        "calling them.\n\n"
+        "Returns:\n"
+        "    dict with available_services, rpm_limit, concurrency_limit, "
+        "discount_factor, max_upload_size_mb, and an optional trial object "
+        "keyed by service, each {granted, used, remaining}.\n\n"
+        "Check trial[service]['remaining'] before calling a paid generation "
+        "tool: at 0 that call fails with 402 trial_exhausted, which no retry "
+        "fixes — tell the user their free trial for that service is spent and "
+        "that continuing needs a payment method. The trial key is absent for "
+        "accounts that have no free-trial allowance; treat that as 'the "
+        "account bills normally', not as an error."
     )
 )
 async def get_account_services() -> dict:

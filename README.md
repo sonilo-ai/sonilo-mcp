@@ -149,11 +149,13 @@ files. To opt out — e.g. to read a video from elsewhere on disk — set
 | `video_to_video_sound(video_path? \| video_url?, music_prompt?, sfx_prompt?, segments?, preserve_speech?, ducking?, output_directory?)` | Same as `video_to_sound`, but returns a new `.mp4` with the mixed soundtrack muxed in. Max video duration **180s (3 min)**. | ✅ |
 | `audio_ducking(voice_path? \| voice_url?, music_path? \| music_url?, output_directory?)` | Duck a music bed under a voice track. The voice input may be a video — the ducked mix is muxed back into a new `.mp4`. Each input max **360s (6 min)**; subject to the account's upload-size cap. | ✅ |
 | `get_sfx_task(task_id, output_directory?)` | Check an SFX, audio-ducking, video-to-video, video-to-sound, or async video-to-music task and download its result — recovery for timed-out `text_to_sfx`, `video_to_sfx`, `audio_ducking`, `video_to_video_music`, `video_to_video_sfx`, `video_to_sound`, `video_to_video_sound`, and `video_to_music(preserve_speech=true)` calls. | ❌ |
-| `get_account_services()` | List available services and limits. | ❌ |
+| `get_account_services()` | List available services, limits, and the free-trial allowance left per service. | ❌ |
 | `get_usage(days=30)` | Show usage summary + per-day breakdown. | ❌ |
 | `play_audio(input_file_path)` | Play a local audio file. | ❌ |
 
 Tools marked ✅ make API calls that incur charges on your Sonilo account.
+
+> **Free trial:** self-serve accounts start with a few free runs per service — no card required. `get_account_services()` reports what is left as `trial[service] = {granted, used, remaining}`; check it before calling a ✅ tool so you can warn the user instead of failing on them. When a service's `remaining` hits `0`, calls to it fail with `trial_exhausted` until a payment method is added. Dubbing has no free runs and bills from the first call. Accounts without a free-trial allowance simply have no `trial` key.
 
 > **Optional:** if [`ffprobe`](https://ffmpeg.org/) (part of FFmpeg) is installed, `video_to_music` checks a video's duration locally and rejects anything over 360s before uploading. `video_to_sfx` performs the same local check with its 180s cap. `audio_ducking` does the same for both of its inputs against its 360s cap. Without it, the same limits are still enforced by the backend.
 
@@ -183,6 +185,7 @@ File names come from the prompt (slugified, truncated to 80 characters). When th
 |---|---|
 | `Invalid SONILO_API_KEY` | Verify the key at <https://platform.sonilo.com/dashboard/api-keys>. |
 | `Insufficient minutes` / `Credit limit exceeded` | Top up at <https://platform.sonilo.com/dashboard/billing>. |
+| `You've used your N free trial calls for <service>` | That service's free trial is spent. Add a payment method at <https://platform.sonilo.com/dashboard/billing> — retrying can't help. `get_account_services` shows what is left on the other services. |
 | `Rate limit exceeded` | Check `get_account_services` for your rpm/concurrency limits. |
 | `Generation timed out` (music, `text_to_music`/`video_to_music` without `preserve_speech`) | Raise `TIME_OUT_SECONDS`. Check `get_usage` to confirm whether the backend completed and charged. |
 | `Timed out … waiting for task <id>` (SFX, ducking, or `video_to_music(preserve_speech=true)`) | The generation is still running. Call `get_sfx_task("<id>")` to retrieve the result — nothing is lost, including for a timed-out `preserve_speech` music task (`get_sfx_task` recognizes its result shape and saves audio/vocals/mux the same way `video_to_music` itself would). |

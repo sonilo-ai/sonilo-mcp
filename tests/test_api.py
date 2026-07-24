@@ -337,9 +337,31 @@ def test_raise_http_error_402_insufficient_balance():
     assert "needed=1.3308. Top up at" in message
 
 
+def test_raise_http_error_402_trial_exhausted_keeps_one_billing_link():
+    # This 402's message already ends in its own call to action carrying the
+    # billing URL, so appending the generic "Top up at <same url>" would show
+    # the same link twice in one sentence — and "top up" names a flow an
+    # account that has never paid us hasn't reached.
+    from sonilo_mcp.api import _raise_http_error
+    with pytest.raises(Exception) as exc:
+        _raise_http_error(
+            402,
+            '{"code":"trial_exhausted","message":"You\'ve used your 2 free '
+            "trial calls for text-to-music. Add a payment method to continue: "
+            'https://platform.sonilo.com/dashboard/billing"}',
+        )
+    message = str(exc.value)
+    assert "free trial calls for text-to-music" in message
+    assert "Add a payment method to continue" in message
+    assert "Top up at" not in message
+    assert message.count("https://platform.sonilo.com/dashboard/billing") == 1
+    # Ends on the URL, with no punctuation glued to it.
+    assert message.endswith("/dashboard/billing")
+
+
 def test_raise_http_error_402_suspended():
     # A suspended account is resolved on the same billing page, so it gets
-    # the link too — 402 is unconditional now.
+    # the link too — every 402 but trial_exhausted is unconditional.
     from sonilo_mcp.api import _raise_http_error
     with pytest.raises(Exception) as exc:
         _raise_http_error(
@@ -496,6 +518,42 @@ async def test_get_account_services(monkeypatch):
     out = await get_account_services()
     assert out["available_services"] == ["text-to-music", "video-to-music"]
     assert out["max_upload_size_mb"] == 300
+
+
+@respx.mock
+async def test_get_account_services_passes_the_trial_quota_through(monkeypatch):
+    # The whole point of the trial quota is that the assistant can see it and
+    # warn before spending it, so it must survive the response envelope check.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={
+            "available_services": ["text_to_music"],
+            "rpm_limit": 60,
+            "concurrency_limit": 4,
+            "discount_factor": 1.0,
+            "max_upload_size_mb": 300,
+            "trial": {"text_to_music": {"granted": 2, "used": 1, "remaining": 1}},
+        })
+    )
+    from sonilo_mcp.api import get_account_services
+    out = await get_account_services()
+    assert out["trial"]["text_to_music"] == {"granted": 2, "used": 1, "remaining": 1}
+
+
+def test_extract_code_reads_the_public_error_envelope():
+    from sonilo_mcp.api import _extract_code
+    assert _extract_code('{"code":"trial_exhausted","message":"x"}') == "trial_exhausted"
+
+
+def test_extract_code_returns_none_without_a_usable_code():
+    from sonilo_mcp.api import _extract_code
+    assert _extract_code('{"message":"no code here"}') is None
+    assert _extract_code("not json at all") is None
+    assert _extract_code('["not", "an", "object"]') is None
+    # A non-string code is a backend bug; treat it as absent rather than
+    # comparing it to the string literals in _raise_http_error.
+    assert _extract_code('{"code":402}') is None
 
 
 @respx.mock

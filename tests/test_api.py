@@ -355,6 +355,8 @@ def test_raise_http_error_402_trial_exhausted_keeps_one_billing_link():
     assert "Add a payment method to continue" in message
     assert "Top up at" not in message
     assert message.count("https://platform.sonilo.com/dashboard/billing") == 1
+    # Ends on the URL, with no punctuation glued to it.
+    assert message.endswith("/dashboard/billing")
 
 
 def test_raise_http_error_402_suspended():

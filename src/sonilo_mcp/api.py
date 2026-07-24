@@ -426,7 +426,10 @@ def _raise_http_error(status_code: int, body: str) -> None:
         # sentence. It is also the one 402 that is NOT about topping up: the
         # account has never paid, so "Top up" names a flow it hasn't reached.
         if _extract_code(body) == "trial_exhausted":
-            raise SoniloHTTPError(_end_sentence(detail), status_code)
+            # Passed through verbatim, without _end_sentence: this message
+            # ends ON the URL, and a period glued to the end of a link breaks
+            # click/copy detection in most terminals.
+            raise SoniloHTTPError(detail, status_code)
         # Every other 402 gets the billing link, unconditionally. This used to
         # be gated on the detail containing "minute" or "credit", which
         # silently stopped matching when billing moved to a cash wallet — the

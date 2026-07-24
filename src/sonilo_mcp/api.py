@@ -2377,16 +2377,6 @@ async def dubbing(
         video_path, video_url, cfg["base_path"], _DUBBING_MAX_VIDEO_DURATION_SECONDS
     )
     form.update(extra_form)
-    if files is None:
-        # /v1/dubbing expects multipart/form-data even for a URL-only
-        # submission (unlike the sound tools, which accept either encoding).
-        # httpx only switches to multipart when `files` is non-empty, so a
-        # plain `data=form` here would silently fall back to
-        # application/x-www-form-urlencoded. Routing every field through
-        # `files` as a filename-less part keeps the wire format multipart
-        # without needing a real file.
-        files = {key: (None, value) for key, value in form.items()}
-        form = None
     task_id = await _post_task_submit("/v1/dubbing", data=form, files=files)
 
     # TIME_OUT_SECONDS defaults to 600 (10 min), but the dubbing backend polls

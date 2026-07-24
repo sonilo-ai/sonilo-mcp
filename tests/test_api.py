@@ -4837,8 +4837,12 @@ async def test_dubbing_url_mode_submits_and_saves_each_language(monkeypatch, out
     result = await api.dubbing(
         video_url="https://example.com/clip.mp4", languages=["es", "fr"]
     )
-    sent = submit.calls.last.request.content
-    assert b'["es", "fr"]' in sent
+    # URL-only submissions ride as application/x-www-form-urlencoded (same as
+    # every other tool's URL mode), so the JSON array arrives percent-encoded
+    # on the wire — decode before checking it reached the backend intact.
+    from urllib.parse import unquote_plus
+    sent = unquote_plus(submit.calls.last.request.content.decode())
+    assert '["es", "fr"]' in sent
     assert len(result) == 2
     assert (output_dir / "dubbing-db-1.es.mp4").read_bytes() == b"es-bytes"
     assert (output_dir / "dubbing-db-1.fr.mp4").read_bytes() == b"fr-bytes"

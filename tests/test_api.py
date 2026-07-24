@@ -4968,7 +4968,7 @@ async def test_dubbing_rejects_a_video_over_180_seconds(monkeypatch, output_dir)
 
 
 @respx.mock
-async def test_dubbing_polls_for_at_least_an_hour(monkeypatch, output_dir):
+async def test_dubbing_polls_for_at_least_two_hours(monkeypatch, output_dir):
     """TIME_OUT_SECONDS defaults to 600, but the dubbing backend polls its own
     pipeline for up to 7200s. Giving up at 10 minutes would leave the caller
     charged for videos they never receive."""
@@ -4994,14 +4994,14 @@ async def test_dubbing_polls_for_at_least_an_hour(monkeypatch, output_dir):
 
     monkeypatch.setattr(api, "_poll_task", fake_poll)
     await api.dubbing(video_url="https://example.com/clip.mp4")
-    assert seen["timeout"] == 3600.0
+    assert seen["timeout"] == 7200.0
 
 
 @respx.mock
 async def test_dubbing_honours_a_larger_operator_timeout(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
-    monkeypatch.setenv("TIME_OUT_SECONDS", "7200")
+    monkeypatch.setenv("TIME_OUT_SECONDS", "10800")
     from sonilo_mcp import api
     _patch_ffprobe(monkeypatch, duration=60.0)
     respx.post("https://api.test.local/v1/dubbing").mock(
@@ -5021,7 +5021,7 @@ async def test_dubbing_honours_a_larger_operator_timeout(monkeypatch, output_dir
 
     monkeypatch.setattr(api, "_poll_task", fake_poll)
     await api.dubbing(video_url="https://example.com/clip.mp4")
-    assert seen["timeout"] == 7200.0
+    assert seen["timeout"] == 10800.0
 
 
 @respx.mock

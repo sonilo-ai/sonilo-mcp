@@ -278,9 +278,10 @@ _SFX_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sfx
 _SOUND_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sound*
 _DUCKING_MAX_DURATION_SECONDS = 360  # 6 minutes — /v1/audio-ducking, per input
 _DUBBING_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/dubbing
-# Floor for the dubbing poll. The backend polls its pipeline for up to 7200s;
-# TIME_OUT_SECONDS defaults to 600, which would abandon a charged job.
-_DUBBING_MIN_POLL_TIMEOUT_SECONDS = 3600.0
+# Floor for the dubbing poll, matched to the backend's own ceiling: it polls
+# its pipeline for up to 7200s, so giving up any earlier abandons a job the
+# caller has already been charged for. TIME_OUT_SECONDS defaults to 600.
+_DUBBING_MIN_POLL_TIMEOUT_SECONDS = 7200.0
 
 
 async def _check_media_duration(
@@ -2361,10 +2362,11 @@ async def video_to_video_sound(
         "languages costs four times as much as one. This tool has ZERO "
         "free-trial runs — even a trial account is billed from the first "
         "call. Only use when explicitly requested by the user.\n\n"
-        "This call polls until the backend finishes and waits AT LEAST ONE "
-        "HOUR before giving up, regardless of any shorter configured "
-        "timeout — the backend allows the job up to two hours. A call that "
-        "sits for 40+ minutes is normal, not a hang; do not cancel it, "
+        "This call polls until the backend finishes and waits AT LEAST TWO "
+        "HOURS before giving up, regardless of any shorter configured "
+        "timeout — two hours is the backend's own ceiling for the job. A "
+        "call that sits for an hour or more is normal, not a hang; do not "
+        "cancel it, "
         "since the task keeps running and charging on the backend either "
         "way and a cancelled call just loses the caller's easy path to the "
         "result.\n\n"
@@ -2432,9 +2434,10 @@ async def dubbing(
     task_id = await _post_task_submit("/v1/dubbing", data=form, files=files)
 
     # TIME_OUT_SECONDS defaults to 600 (10 min), but the dubbing backend polls
-    # its own pipeline for up to 7200s (2 hours). Abandoning the poll at 10
-    # minutes would leave the caller charged for videos they never receive, so
-    # apply a floor — while still honouring a larger operator-set timeout.
+    # its own pipeline for up to 7200s (2 hours). Abandoning the poll early
+    # would leave the caller charged for videos they never receive, so floor
+    # it at the backend's own ceiling — while still honouring a larger
+    # operator-set timeout.
     body = await _poll_task(
         task_id, max(cfg["timeout"], _DUBBING_MIN_POLL_TIMEOUT_SECONDS)
     )

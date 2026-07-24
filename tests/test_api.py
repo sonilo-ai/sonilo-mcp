@@ -4762,12 +4762,17 @@ async def test_save_dubbing_artifacts_skips_blank_urls_in_a_mixed_map(tmp_path):
         "dubbing-db-1",
         "db-1",
     )
-    # The blank "fr" entry is silently filtered out — no download attempted,
-    # no error raised — and only the valid "es" entry is saved.
-    assert len(result) == 1
+    # The blank "fr" entry is filtered out of the save loop — no download
+    # attempted, no error raised — but a warning naming the dropped language
+    # and the task_id is appended so the caller knows they were billed for
+    # a language they did not receive.
+    assert len(result) == 2
     assert "es" in result[0].text
     assert (tmp_path / "dubbing-db-1.es.mp4").read_bytes() == b"es-bytes"
     assert not (tmp_path / "dubbing-db-1.fr.mp4").exists()
+    assert "fr" in result[1].text
+    assert "db-1" in result[1].text
+    assert "Warning" in result[1].text
 
 
 @respx.mock
@@ -4936,18 +4941,17 @@ async def test_dubbing_omits_languages_when_unset(monkeypatch, output_dir):
 async def test_dubbing_rejects_both_inputs(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     from sonilo_mcp import api
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="exactly one"):
         await api.dubbing(video_path="clip.mp4", video_url="https://example.com/clip.mp4")
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="exactly one"):
         await api.dubbing()
 
 
 async def test_dubbing_rejects_a_non_https_url(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     from sonilo_mcp import api
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(Exception, match="must use https"):
         await api.dubbing(video_url="http://example.com/clip.mp4")
-    assert "https" in str(exc.value)
 
 
 @respx.mock

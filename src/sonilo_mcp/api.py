@@ -1522,6 +1522,18 @@ async def _save_dubbing_artifacts(
             type="text", text=f"Success ({language}). File saved as: {dest}",
         ))
 
+    dropped = sorted(set(outputs) - set(valid)) if isinstance(outputs, dict) else []
+    if dropped:
+        saved.append(TextContent(
+            type="text",
+            text=(
+                "Warning: no video URL was returned for: "
+                f"{', '.join(dropped)}. Task id: {task_id} — you were "
+                "billed for that language; call "
+                f'get_sfx_task("{task_id}") to re-check.'
+            ),
+        ))
+
     return saved
 
 
@@ -2104,9 +2116,11 @@ async def _stage_video_input(
     returning, so an over-long video never reaches the backend and is never
     charged.
 
-    Shared by every tool that takes a video and submits a task, so the
-    extension allowlist, the upload size cap, the duration probe and the read
-    cap stay in one place rather than drifting per tool.
+    Shared by _submit_video_to_sound and dubbing, the two current callers
+    that take a video and submit a task — video_to_music, video_to_sfx,
+    video_to_video_music, and video_to_video_sfx still carry their own inline
+    copies of this logic and are not wired to this helper, so a cap change
+    made only here does not reach them.
 
     The caller owns the exactly-one-of check and any scheme guard — those
     differ per tool (dubbing requires https specifically; the sound tools
@@ -2344,8 +2358,16 @@ async def video_to_video_sound(
         "track.\n\n"
         "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
         "incur charges, and you are billed PER LANGUAGE — asking for four "
-        "languages costs four times as much as one. Only use when "
-        "explicitly requested by the user.\n\n"
+        "languages costs four times as much as one. This tool has ZERO "
+        "free-trial runs — even a trial account is billed from the first "
+        "call. Only use when explicitly requested by the user.\n\n"
+        "This call polls until the backend finishes and waits AT LEAST ONE "
+        "HOUR before giving up, regardless of any shorter configured "
+        "timeout — the backend allows the job up to two hours. A call that "
+        "sits for 40+ minutes is normal, not a hang; do not cancel it, "
+        "since the task keeps running and charging on the backend either "
+        "way and a cancelled call just loses the caller's easy path to the "
+        "result.\n\n"
         "Args:\n"
         "    video_path (str, optional): Absolute local path, or relative "
         "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.webm/.m4v/.gif (gif "
@@ -2363,8 +2385,9 @@ async def video_to_video_sound(
         "Exactly one of video_path and video_url must be provided.\n\n"
         "Returns:\n"
         "    One TextContent per saved file, named "
-        "dubbing-<task id>.<language>.mp4. On timeout the error message "
-        "includes the task_id — recover with get_sfx_task."
+        "dubbing-<first 8 chars of the task id>.<language>.mp4. On timeout "
+        "the error message includes the task_id — recover with "
+        "get_sfx_task."
     )
 )
 async def dubbing(
@@ -2424,12 +2447,12 @@ async def dubbing(
 
 @mcp.tool(
     description=(
-        "Check a sound-effects, audio-ducking, video-to-video, or async "
-        "video-to-music generation task and, if finished, download its "
+        "Check a sound-effects, audio-ducking, video-to-video, dubbing, or "
+        "async video-to-music generation task and, if finished, download its "
         "result file(s). Use this to recover a result when text_to_sfx, "
         "video_to_sfx, audio_ducking, video_to_video_music, "
-        "video_to_video_sfx, video_to_sound, video_to_video_sound, or "
-        "video_to_music(preserve_speech=true) timed "
+        "video_to_video_sfx, video_to_sound, video_to_video_sound, dubbing, "
+        "or video_to_music(preserve_speech=true) timed "
         "out — their error message contains the task_id. Does not poll: a "
         "single status check per call. This tool itself never charges.\n\n"
         "Args:\n"
@@ -2442,7 +2465,8 @@ async def dubbing(
         "video_to_sfx tasks; a single .wav or .mp4 for audio_ducking "
         "tasks; a single .mp4 for video_to_video_music/video_to_video_sfx/"
         "video_to_video_sound tasks; a single .wav for video_to_sound "
-        "tasks; for a video_to_music(preserve_speech=true) task, the audio "
+        "tasks; one .mp4 per language for dubbing tasks; for a "
+        "video_to_music(preserve_speech=true) task, the audio "
         "stream(s) plus the preserved speech ('vocals') stem plus the mux "
         "(speech+music mixed — the ready-to-use combined result). "
         "Failed -> an error including whether the charge was refunded."
@@ -2688,7 +2712,11 @@ async def audio_ducking(
         "fixes — tell the user their free trial for that service is spent and "
         "that continuing needs a payment method. The trial key is absent for "
         "accounts that have no free-trial allowance; treat that as 'the "
-        "account bills normally', not as an error."
+        "account bills normally', not as an error. A trial object that IS "
+        "present but has no entry for the service you're about to call means "
+        "that service has no free-trial allowance at all — it bills from the "
+        "first call (this is dubbing's situation on any self-serve trial "
+        "account)."
     )
 )
 async def get_account_services() -> dict:

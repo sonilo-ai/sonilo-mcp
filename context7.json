@@ -1,0 +1,17 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "Sonilo MCP Server",
+  "description": "MCP server exposing Sonilo's licensed music, sound-effects, dubbing and audio-ducking API to MCP clients",
+  "folders": [],
+  "excludeFolders": ["src", "tests", "assets", "build", "dist", ".github", "docs/superpowers"],
+  "excludeFiles": ["PUBLISHING.md", "SECURITY.md", "LICENSE"],
+  "rules": [
+    "Generation tools bill the user's account. Call get_account_services() first to see the remaining free-trial allowance, and only call a paid tool after the user explicitly asks for it.",
+    "If a call times out, the job is still running and already charged — recover it with get_sfx_task(task_id). Never retry a timed-out generation.",
+    "dubbing has zero free runs and bills video duration × number of languages. Confirm the language list with the user before calling it.",
+    "Use video_to_music when there is a video (the score matches the cut); use text_to_music only when there is none. The video_to_video_* variants return a new .mp4 with the audio already muxed in.",
+    "Video duration caps differ per tool: 360s for video_to_music, video_to_video_music and audio_ducking; 180s for the SFX, video_to_sound and dubbing tools.",
+    "File paths are confined to SONILO_MCP_BASE_PATH (default ~/Desktop) unless SONILO_MCP_ALLOW_ANY_PATH=true."
+  ],
+  "previousVersions": [{ "tag": "v0.8.0" }, { "tag": "v0.7.0" }]
+}

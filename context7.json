@@ -1,5 +1,7 @@
 {
   "$schema": "https://context7.com/schema/context7.json",
+  "url": "https://context7.com/sonilo-ai/sonilo-mcp",
+  "public_key": "pk_h4BOrwVwv5CF9NJ5BIwvC",
   "projectTitle": "Sonilo MCP Server",
   "description": "MCP server exposing Sonilo's licensed music, sound-effects, dubbing and audio-ducking API to MCP clients",
   "folders": [],

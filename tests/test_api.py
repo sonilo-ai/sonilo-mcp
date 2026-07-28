@@ -59,6 +59,27 @@ def test_slugify_caps_length():
     assert _slugify("Happy Song Title") == "happy-song-title"
 
 
+def test_validate_variants_num_accepts_the_full_range():
+    from sonilo_mcp.api import _validate_variants_num
+    for n in (1, 2, 10):
+        _validate_variants_num(n)  # must not raise
+
+
+@pytest.mark.parametrize("bad", [0, -1, 11, 100])
+def test_validate_variants_num_rejects_out_of_range(bad):
+    from sonilo_mcp.api import _validate_variants_num
+    with pytest.raises(Exception, match="variants_num must be between 1 and 10"):
+        _validate_variants_num(bad)
+
+
+def test_music_audio_label_uses_title_when_present():
+    from sonilo_mcp.api import _music_audio_label
+    assert _music_audio_label({"title": {"title": "Sunrise"}}) == 'music audio — "Sunrise"'
+    assert _music_audio_label({}) == "music audio"
+    assert _music_audio_label({"title": {"title": "  "}}) == "music audio"
+    assert _music_audio_label({"title": "not-a-dict"}) == "music audio"
+
+
 def test_ducking_base_name_from_path():
     from sonilo_mcp.api import _ducking_base_name
     assert _ducking_base_name("/tmp/Interview Take 2.mp4", None, "t-abcdefgh") == (
@@ -1035,6 +1056,71 @@ async def test_text_to_music_sends_correct_body(monkeypatch, output_dir):
     assert auth == "Bearer k"
 
 
+@pytest.mark.parametrize("bad", [0, -1, 11, 100])
+async def test_text_to_music_rejects_out_of_range_variants_num(output_dir, bad):
+    from sonilo_mcp.api import text_to_music
+    with pytest.raises(Exception, match="variants_num must be between 1 and 10"):
+        await text_to_music(prompt="x", duration=5, variants_num=bad)
+
+
+@respx.mock
+async def test_text_to_music_variants_num_forces_async_and_sends_field(
+    monkeypatch, output_dir
+):
+    # variants_num > 1 requires mode=async on the backend — must be sent
+    # automatically, same as output_format='wav'.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp.api import text_to_music
+
+    async def no_sleep(s):
+        pass
+
+    import sonilo_mcp.api as api
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(202, json={"task_id": "vn-1", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/vn-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "vn-1", "status": "succeeded",
+            "audio": [
+                {"stream_index": 0, "url": "https://r2.test/v0.m4a",
+                 "content_type": "audio/mp4", "file_size": 2,
+                 "title": {"title": "Sunrise Drive", "summary": "s", "display_tags": []}},
+                {"stream_index": 1, "url": "https://r2.test/v1.m4a",
+                 "content_type": "audio/mp4", "file_size": 2,
+                 "title": {"title": "Night Cruise", "summary": "s", "display_tags": []}},
+                {"stream_index": 2, "url": "https://r2.test/v2.m4a",
+                 "content_type": "audio/mp4", "file_size": 2},
+            ],
+        })
+    )
+    respx.get("https://r2.test/v0.m4a").mock(return_value=httpx.Response(200, content=b"v0"))
+    respx.get("https://r2.test/v1.m4a").mock(return_value=httpx.Response(200, content=b"v1"))
+    respx.get("https://r2.test/v2.m4a").mock(return_value=httpx.Response(200, content=b"v2"))
+
+    result = await text_to_music(prompt="road trip", duration=20, variants_num=3)
+
+    sent = submit.calls.last.request
+    assert b"variants_num=3" in sent.content
+    assert b"mode=async" in sent.content
+
+    assert len(result) == 3
+    assert (output_dir / "road-trip-0.m4a").read_bytes() == b"v0"
+    assert (output_dir / "road-trip-1.m4a").read_bytes() == b"v1"
+    assert (output_dir / "road-trip-2.m4a").read_bytes() == b"v2"
+    texts = [t.text for t in result]
+    assert any('"Sunrise Drive"' in t and "road-trip-0.m4a" in t for t in texts)
+    assert any('"Night Cruise"' in t and "road-trip-1.m4a" in t for t in texts)
+    # Untitled entry (variant 2) still saves, just without a title in the label.
+    assert any(
+        t.startswith("Success (music audio). File saved as:")
+        and "road-trip-2.m4a" in t
+        for t in texts
+    )
+
+
 @respx.mock
 async def test_video_to_music_url_mode(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
@@ -1748,6 +1834,60 @@ async def test_video_to_music_output_format_wav_uses_async_path(monkeypatch, out
     sent = parse_qs(submit.calls.last.request.content.decode())
     assert sent["mode"] == ["async"]
     assert sent["output_format"] == ["wav"]
+
+
+@pytest.mark.parametrize("bad", [0, -1, 11])
+async def test_video_to_music_rejects_out_of_range_variants_num(output_dir, bad):
+    from sonilo_mcp.api import video_to_music
+    with pytest.raises(Exception, match="variants_num must be between 1 and 10"):
+        await video_to_music(
+            video_url="https://example.com/v.mp4", variants_num=bad
+        )
+
+
+@respx.mock
+async def test_video_to_music_variants_num_forces_async_and_sends_field(
+    monkeypatch, output_dir
+):
+    # variants_num > 1 alone (no preserve_speech/ducking/output_format) must
+    # also trigger the async submit+poll path, mirroring output_format="wav".
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-vn-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-vn-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-vn-1", "status": "succeeded",
+            "audio": [
+                {"stream_index": 0, "url": "https://r2.test/vm0.m4a",
+                 "content_type": "audio/mp4", "file_size": 1},
+                {"stream_index": 1, "url": "https://r2.test/vm1.m4a",
+                 "content_type": "audio/mp4", "file_size": 1},
+            ],
+        })
+    )
+    respx.get("https://r2.test/vm0.m4a").mock(return_value=httpx.Response(200, content=b"m0"))
+    respx.get("https://r2.test/vm1.m4a").mock(return_value=httpx.Response(200, content=b"m1"))
+
+    result = await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", prompt="Two Takes", variants_num=2
+    )
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["mode"] == ["async"]
+    assert sent["variants_num"] == ["2"]
+    assert len(result) == 2
+    assert (output_dir / "two-takes-0.m4a").read_bytes() == b"m0"
+    assert (output_dir / "two-takes-1.m4a").read_bytes() == b"m1"
 
 
 @respx.mock
@@ -3570,6 +3710,61 @@ async def test_video_to_video_music_path_mode_uploads_multipart(
     assert (output_dir / "v2v-music-vv-2.mp4").exists()
 
 
+@pytest.mark.parametrize("bad", [0, -1, 11])
+async def test_video_to_video_music_rejects_out_of_range_variants_num(output_dir, bad):
+    from sonilo_mcp.api import video_to_video_music
+    with pytest.raises(Exception, match="variants_num must be between 1 and 10"):
+        await video_to_video_music(
+            video_url="https://example.com/v.mp4", variants_num=bad
+        )
+
+
+@respx.mock
+async def test_video_to_video_music_variants_num_sends_field_and_saves_every_variant(
+    monkeypatch, output_dir
+):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-video-music").mock(
+        return_value=httpx.Response(202, json={"task_id": "vv-3", "status": "processing"})
+    )
+    # `videos` carries one entry per variant, no variant_index of its own —
+    # list position IS variant order (see VideoToVideoService.transfer_outputs).
+    # `video` stays as the variant-0 alias.
+    respx.get("https://api.test.local/v1/tasks/vv-3").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "vv-3", "type": "video_to_video_music", "status": "succeeded",
+            "videos": [
+                {"url": "https://r2.test/vv3-0.mp4", "content_type": "video/mp4", "file_size": 3},
+                {"url": "https://r2.test/vv3-1.mp4", "content_type": "video/mp4", "file_size": 3},
+            ],
+            "video": {"url": "https://r2.test/vv3-0.mp4", "content_type": "video/mp4", "file_size": 3},
+        })
+    )
+    respx.get("https://r2.test/vv3-0.mp4").mock(return_value=httpx.Response(200, content=b"vid0"))
+    respx.get("https://r2.test/vv3-1.mp4").mock(return_value=httpx.Response(200, content=b"vid1"))
+
+    result = await api.video_to_video_music(
+        video_url="https://example.com/clip.mp4", prompt="Two Cuts", variants_num=2
+    )
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["variants_num"] == ["2"]
+    assert len(result) == 2
+    assert (output_dir / "two-cuts-0.mp4").read_bytes() == b"vid0"
+    assert (output_dir / "two-cuts-1.mp4").read_bytes() == b"vid1"
+    texts = [t.text for t in result]
+    assert any("variant 0" in t for t in texts)
+    assert any("variant 1" in t for t in texts)
+
+
 async def test_video_to_video_music_both_inputs_rejected(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     from sonilo_mcp.api import video_to_video_music
@@ -4033,6 +4228,36 @@ async def test_get_sfx_task_recovers_ducking_task(monkeypatch, output_dir):
     saved = output_dir / "sfx-d-99.wav"
     assert saved.read_bytes() == b"ducked-bytes"
     assert str(saved) in result[0].text
+
+
+@respx.mock
+async def test_get_sfx_task_recovers_multi_variant_sound_task(monkeypatch, output_dir):
+    # A timed-out video_to_sound(variants_num=2) call is recovered here too:
+    # _save_task_artifacts' new outputs-list branch must fire on the
+    # get_sfx_task path exactly as it does on the direct video_to_sound call.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    respx.get("https://api.test.local/v1/tasks/sd-rec-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "sd-rec-1", "type": "video_to_sound", "status": "succeeded",
+            "variants_num": 2,
+            "outputs": [
+                {"variant_index": 0, "output_url": "https://r2.test/rec0.wav",
+                 "output_type": "audio", "output_bytes": 2},
+                {"variant_index": 1, "output_url": "https://r2.test/rec1.wav",
+                 "output_type": "audio", "output_bytes": 2},
+            ],
+            "output_url": "https://r2.test/rec0.wav", "output_type": "audio",
+            "output_bytes": 2,
+        })
+    )
+    respx.get("https://r2.test/rec0.wav").mock(return_value=httpx.Response(200, content=b"r0"))
+    respx.get("https://r2.test/rec1.wav").mock(return_value=httpx.Response(200, content=b"r1"))
+    from sonilo_mcp.api import get_sfx_task
+    result = await get_sfx_task("sd-rec-1")
+    assert len(result) == 2
+    assert (output_dir / "sfx-sd-rec-1-0.wav").read_bytes() == b"r0"
+    assert (output_dir / "sfx-sd-rec-1-1.wav").read_bytes() == b"r1"
 
 
 @respx.mock
@@ -4689,6 +4914,65 @@ async def test_video_to_video_sound_saves_mp4_and_defaults_ducking_on(
     assert b"ducking=true" in submit.calls.last.request.content
     assert len(result) == 1
     assert (output_dir / "v2v-sound-sd-2.mp4").read_bytes() == b"video-bytes"
+
+
+@pytest.mark.parametrize("bad", [0, -1, 11])
+async def test_video_to_sound_rejects_out_of_range_variants_num(output_dir, bad):
+    from sonilo_mcp import api
+    with pytest.raises(Exception, match="variants_num must be between 1 and 10"):
+        await api.video_to_sound(
+            video_url="https://example.com/clip.mp4", variants_num=bad
+        )
+
+
+@respx.mock
+async def test_video_to_sound_variants_num_sends_field_and_saves_every_variant(
+    monkeypatch, output_dir
+):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-sound").mock(
+        return_value=httpx.Response(202, json={"task_id": "sd-3", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/sd-3").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "sd-3", "type": "video_to_sound", "status": "succeeded",
+            "outputs": [
+                {"variant_index": 0, "output_url": "https://r2.test/sd3-0.wav",
+                 "output_type": "audio", "output_bytes": 3,
+                 "music": {"url": "https://r2.test/m0.m4a"}, "sfx": {"url": "https://r2.test/s0.wav"}},
+                {"variant_index": 1, "output_url": "https://r2.test/sd3-1.wav",
+                 "output_type": "audio", "output_bytes": 3,
+                 "music": {"url": "https://r2.test/m1.m4a"}, "sfx": {"url": "https://r2.test/s1.wav"}},
+            ],
+            # Pre-variants aliases, kept for older/single-variant clients.
+            "output_url": "https://r2.test/sd3-0.wav", "output_type": "audio",
+            "output_bytes": 3,
+        })
+    )
+    respx.get("https://r2.test/sd3-0.wav").mock(return_value=httpx.Response(200, content=b"o0"))
+    respx.get("https://r2.test/sd3-1.wav").mock(return_value=httpx.Response(200, content=b"o1"))
+
+    result = await api.video_to_sound(
+        video_url="https://example.com/clip.mp4",
+        music_prompt="Two Mixes",
+        variants_num=2,
+    )
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["variants_num"] == ["2"]
+    # Only the combined artifact per variant is saved — stems stay on the backend.
+    assert len(result) == 2
+    assert (output_dir / "two-mixes-0.wav").read_bytes() == b"o0"
+    assert (output_dir / "two-mixes-1.wav").read_bytes() == b"o1"
+    assert not (output_dir / "two-mixes-0.m4a").exists()
 
 
 async def test_video_to_sound_rejects_both_inputs(monkeypatch, output_dir):

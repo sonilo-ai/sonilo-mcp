@@ -250,6 +250,22 @@ def _require_http_url(url: str, label: str) -> None:
         raise Exception(f"{label}_url must be an http:// or https:// URL")
 
 
+_VARIANTS_NUM_MIN = 1
+_VARIANTS_NUM_MAX = 10
+
+
+def _validate_variants_num(variants_num: int) -> None:
+    """Range-check variants_num before it reaches the backend (and before
+    anything is charged) — same fail-fast policy as get_usage's days check,
+    just shared across five call sites instead of inlined once.
+    """
+    if not (_VARIANTS_NUM_MIN <= variants_num <= _VARIANTS_NUM_MAX):
+        raise Exception(
+            f"variants_num must be between {_VARIANTS_NUM_MIN} and "
+            f"{_VARIANTS_NUM_MAX} (got {variants_num})"
+        )
+
+
 def _read_capped(path: Path, max_mb: int, label: str) -> bytes:
     """Read a file for upload, enforcing the account's size cap on the bytes
     actually read.
@@ -1082,6 +1098,157 @@ def _raise_if_task_not_succeeded(body: dict, task_id: str) -> None:
         )
 
 
+def _is_sound_output_entry(entry: object) -> bool:
+    """Whether one entry of a video-to-sound/video-to-video-sound `outputs`
+    list carries a usable artifact — the `outputs`-list analogue of
+    _has_artifact, which instead expects a `url` key (SFX/ducking/
+    video-to-video's shape)."""
+    return (
+        isinstance(entry, dict)
+        and isinstance(entry.get("output_url"), str)
+        and bool(entry.get("output_url"))
+    )
+
+
+# output_type -> extension for video-to-sound `outputs` entries. There is no
+# per-entry content_type on this shape (unlike SFX's audio/video slots), so
+# the extension is fixed by output_type alone — "audio" is always the
+# combined mix as .wav (music_runner never varies this), "video" the muxed
+# .mp4 — same fixed choices _normalize_task_envelope's ducking-content-type
+# mapping makes for the single-variant alias fields this replaces.
+_SOUND_OUTPUT_EXTS = {"audio": ".wav", "video": ".mp4"}
+
+
+async def _save_sound_variant_artifacts(
+    outputs: list[dict],
+    output_path: Path,
+    base_name: str,
+    task_id: str,
+    reuse_existing: bool,
+) -> list[TextContent]:
+    """Save every variant of a multi-variant video-to-sound /
+    video-to-video-sound task (`outputs`, one entry per `variants_num`).
+
+    Only called when there is more than one usable entry — at
+    variants_num=1 (or a malformed body with a single-entry list), the
+    caller falls through to the pre-existing single-artifact path below,
+    which downloads the exact same file under the exact same name, so
+    single-variant behavior is unchanged byte-for-byte.
+
+    Only the combined artifact per variant is saved, same policy as the
+    single-variant path (_submit_video_to_sound's docstring): the music/sfx/
+    music_processed stems are deliberately left on the backend, for every
+    variant alike.
+
+    Naming follows _save_music_task_artifacts' multi-stream convention:
+    `{base}-{variant_index}.<ext>` per variant, indexed by the entry's own
+    `variant_index` (NOT list position) so a variant is always named after
+    its own request-order slot.
+    """
+    saved: list[TextContent] = []
+    saved_paths: list[Path] = []
+    for entry in sorted(outputs, key=lambda o: o.get("variant_index") or 0):
+        idx = entry.get("variant_index") or 0
+        ext = _SOUND_OUTPUT_EXTS.get(entry.get("output_type"), ".wav")
+        try:
+            # Same reasoning as _save_task_artifacts' single-artifact wrap:
+            # this task already succeeded and was charged, so any failure
+            # here must keep the task_id and recovery hint.
+            existing = (
+                _existing_canonical_dest(
+                    output_path, f"{base_name}-{idx}", ext, entry.get("output_bytes")
+                )
+                if reuse_existing
+                else None
+            )
+            if existing is None:
+                dest = _artifact_dest(output_path, f"{base_name}-{idx}", ext)
+                await _download_artifact(entry["output_url"], dest)
+            else:
+                dest = existing
+        except Exception as e:
+            already = (
+                " Already saved: " + ", ".join(str(p) for p in saved_paths) + "."
+                if saved_paths
+                else ""
+            )
+            raise Exception(
+                f"{_end_sentence(e)} The rest of this result is still stored "
+                f"on the backend — task id: {task_id}. Call "
+                f'get_sfx_task("{task_id}") to retry.{already}'
+            ) from e
+        saved_paths.append(dest)
+        if existing is not None:
+            saved.append(TextContent(
+                type="text",
+                text=f"Already downloaded (variant {idx}). File saved as: {dest}",
+            ))
+        else:
+            saved.append(TextContent(
+                type="text", text=f"Success (variant {idx}). File saved as: {dest}",
+            ))
+    return saved
+
+
+async def _save_video_variant_artifacts(
+    videos: list[dict],
+    output_path: Path,
+    base_name: str,
+    task_id: str,
+    reuse_existing: bool,
+) -> list[TextContent]:
+    """Save every variant of a multi-variant video_to_video_music task
+    (`videos`, one entry per `variants_num`; video_to_video_sfx never sends
+    more than one — see VideoToVideoService.transfer_outputs).
+
+    Only called when there is more than one entry — the single-video case
+    falls through to the pre-existing path below unchanged.
+
+    Unlike the sound variants above, `videos` entries carry no
+    variant_index of their own (transfer_outputs builds the list in
+    request order and never labels it) — list position IS the variant
+    index, so entries are named by enumerate() order, not a body field.
+    """
+    saved: list[TextContent] = []
+    saved_paths: list[Path] = []
+    for idx, entry in enumerate(videos):
+        try:
+            existing = (
+                _existing_canonical_dest(
+                    output_path, f"{base_name}-{idx}", ".mp4", entry.get("file_size")
+                )
+                if reuse_existing
+                else None
+            )
+            if existing is None:
+                dest = _artifact_dest(output_path, f"{base_name}-{idx}", ".mp4")
+                await _download_artifact(entry["url"], dest)
+            else:
+                dest = existing
+        except Exception as e:
+            already = (
+                " Already saved: " + ", ".join(str(p) for p in saved_paths) + "."
+                if saved_paths
+                else ""
+            )
+            raise Exception(
+                f"{_end_sentence(e)} The rest of this result is still stored "
+                f"on the backend — task id: {task_id}. Call "
+                f'get_sfx_task("{task_id}") to retry.{already}'
+            ) from e
+        saved_paths.append(dest)
+        if existing is not None:
+            saved.append(TextContent(
+                type="text",
+                text=f"Already downloaded (variant {idx}). File saved as: {dest}",
+            ))
+        else:
+            saved.append(TextContent(
+                type="text", text=f"Success (variant {idx}). File saved as: {dest}",
+            ))
+    return saved
+
+
 async def _save_task_artifacts(
     body: dict,
     output_path: Path,
@@ -1102,6 +1269,16 @@ async def _save_task_artifacts(
     artifact is the generated video with the new audio muxed in (see
     _is_video_to_video_envelope).
 
+    Multi-variant results (`variants_num > 1`, video_to_sound/
+    video_to_video_sound/video_to_video_music only) are detected and routed
+    to _save_sound_variant_artifacts/_save_video_variant_artifacts BEFORE
+    any of the above single-artifact logic runs — those results carry an
+    `outputs`/`videos` list with one entry per variant, and the top-level
+    output_url/video fields _normalize_task_envelope and the code below
+    would otherwise use are only ALIASES for variant 0 (kept for
+    single-variant/pre-variants callers), which would silently drop every
+    other variant.
+
     task_id must be the caller's own known-good id (from _post_task_submit
     or the tool's own task_id argument), NOT derived from body — the
     backend's terminal body is not a trustworthy source for the recovery
@@ -1118,7 +1295,9 @@ async def _save_task_artifacts(
     the same paid result. text_to_sfx/video_to_sfx must NOT set this: two
     calls with the same prompt are two different generations and must
     always land in two distinct files (see _artifact_dest's atomic
-    reservation), so they keep the default of False.
+    reservation), so they keep the default of False. Multi-variant results
+    honor the same flag, passed straight through to whichever variant-save
+    helper handles them.
 
     This is NOT used for async (isolate_vocals) video-to-music tasks — their
     envelope shapes `audio` as a LIST (one entry per stream_index) plus
@@ -1126,6 +1305,35 @@ async def _save_task_artifacts(
     _normalize_task_envelope don't model. See _save_music_task_artifacts.
     """
     _raise_if_task_not_succeeded(body, task_id)
+
+    # Multi-variant video-to-sound / video-to-video-sound: `outputs` is a
+    # LIST there (dubbing also has an `outputs` key, but it's a language ->
+    # URL MAP — isinstance(..., list) is what keeps the two from colliding).
+    outputs_list = body.get("outputs")
+    multi_outputs = (
+        [o for o in outputs_list if _is_sound_output_entry(o)]
+        if isinstance(outputs_list, list)
+        else []
+    )
+    if len(multi_outputs) > 1:
+        return await _save_sound_variant_artifacts(
+            multi_outputs, output_path, base_name, task_id, reuse_existing
+        )
+
+    # Multi-variant video_to_video_music. Computed before
+    # _normalize_task_envelope (which never touches `type` or `videos`), so
+    # this check is unaffected by running early.
+    is_v2v = _is_video_to_video_envelope(body)
+    videos_list = body.get("videos")
+    multi_videos = (
+        [v for v in videos_list if _has_artifact(v)]
+        if is_v2v and isinstance(videos_list, list)
+        else []
+    )
+    if len(multi_videos) > 1:
+        return await _save_video_variant_artifacts(
+            multi_videos, output_path, base_name, task_id, reuse_existing
+        )
 
     body, is_ducking = _normalize_task_envelope(body)
 
@@ -1144,7 +1352,6 @@ async def _save_task_artifacts(
     # recovery hint. Raising here keeps the task_id and the get_sfx_task call
     # in the user's hands, which is the only way a paid result stays
     # recoverable from the error message alone.
-    is_v2v = _is_video_to_video_envelope(body)
     if not _has_artifact(audio) and not ((is_ducking or is_v2v) and _has_artifact(video)):
         # Distinguish an unrecognized-output_type ducking result from a genuine
         # missing artifact. When there is a usable output_url but the
@@ -1311,6 +1518,23 @@ def _is_music_task_envelope(body: dict) -> bool:
 # handle a second envelope shape.
 
 
+def _music_audio_label(entry: dict) -> str:
+    """Label for one `audio` entry: "music audio", or "music audio —
+    "<title>"" when the entry carries a (server-permitted) title.
+
+    Each variant's title lives on its own entry (see run_music_generation's
+    per-entry `entry["title"] = ...`), so this is the one place a
+    variants_num > 1 caller learns which saved file is which without
+    guessing from stream_index alone.
+    """
+    title_obj = entry.get("title")
+    if isinstance(title_obj, dict):
+        title_text = title_obj.get("title")
+        if isinstance(title_text, str) and title_text.strip():
+            return f'music audio — "{title_text.strip()}"'
+    return "music audio"
+
+
 async def _save_music_task_artifacts(
     body: dict,
     output_path: Path,
@@ -1331,6 +1555,13 @@ async def _save_music_task_artifacts(
     called out as the ready-to-use combined result; `ducked` files are the
     generated music lowered under the source voice (free, best-effort —
     present only when the backend's `ducking` option ran).
+
+    When `variants_num > 1` was sent, `audio` has one entry per variant
+    (indexed by `stream_index`, same as any other multi-stream result) and
+    each entry MAY carry its own `title` ({title, summary, display_tags}),
+    gated server-side by the account's stream-event whitelist. When present,
+    the title is folded into that entry's label so a multi-variant caller
+    can tell which file is which without opening them.
 
     Naming follows the existing streaming convention: `{base}.m4a` for a
     single audio stream, `{base}-{idx}.m4a` when there is more than one.
@@ -1391,7 +1622,7 @@ async def _save_music_task_artifacts(
     for entry in sorted(valid_audio, key=lambda a: a.get("stream_index") or 0):
         idx = entry.get("stream_index") or 0
         suffix = f"-{idx}" if multi_audio else ""
-        await _save_one(entry, f"{base_name}{suffix}", "music audio")
+        await _save_one(entry, f"{base_name}{suffix}", _music_audio_label(entry))
 
     vocals = body.get("vocals")
     if _has_artifact(vocals):
@@ -1556,32 +1787,47 @@ async def _save_dubbing_artifacts(
         "'wav' requires the backend's async generation mode (submit + "
         "poll) instead of streaming — selected automatically, no "
         "user-facing mode param needed.\n"
+        "    variants_num (int, optional): 1-10, default 1. Generate this "
+        "many distinct music variants in one request — each is its own "
+        "creative direction with its own title, not just a re-roll. Cost "
+        "scales linearly with N. Values above 1 require the backend's "
+        "async generation mode (handled automatically, same as "
+        "output_format='wav') and are never covered by the free trial — "
+        "even a trial account is billed for variants beyond the first.\n"
         "    output_directory (str, optional): Absolute path, or relative "
         "to SONILO_MCP_BASE_PATH. Defaults to SONILO_MCP_BASE_PATH "
         "(~/Desktop unless overridden).\n\n"
         "Returns:\n"
         "    One TextContent per generated audio stream, each containing "
         "the absolute path of the saved audio file (.m4a by default, "
-        ".wav when output_format='wav')."
+        ".wav when output_format='wav'). At variants_num > 1, one entry "
+        "per variant (suffixed -0, -1, ...), each labeled with its title "
+        "when the backend provides one."
     )
 )
 async def text_to_music(
     prompt: str,
     duration: int,
     output_format: str | None = None,
+    variants_num: int = 1,
     output_directory: str | None = None,
 ) -> list[TextContent]:
+    _validate_variants_num(variants_num)
     out_path = _make_output_path(output_directory)
     # The backend's text-to-music endpoint expects form fields, not a JSON
     # body (same as video-to-music). Sending JSON yields a 422
     # "Field required" for prompt/duration.
     data: dict = {"prompt": prompt, "duration": duration}
-    if output_format == "wav":
-        # 'wav' requires mode=async on the backend (else a 400) — always
-        # send both together, no user-facing mode param (mirrors
-        # video_to_music's preserve_speech/ducking handling).
+    if variants_num != 1:
+        data["variants_num"] = variants_num
+    # 'wav' and variants_num > 1 both require mode=async on the backend
+    # (else a 400) — always send mode together with whichever triggered it,
+    # no user-facing mode param (mirrors video_to_music's preserve_speech/
+    # ducking handling).
+    if output_format == "wav" or variants_num > 1:
         data["mode"] = "async"
-        data["output_format"] = output_format
+        if output_format:
+            data["output_format"] = output_format
         task_id = await _post_task_submit("/v1/text-to-music", data=data)
         body = await _poll_task(task_id, _get_config()["timeout"])
         base = _slugify(prompt) if prompt else f"music-{task_id[:8]}"
@@ -1653,7 +1899,14 @@ async def _get_max_upload_size_mb() -> int:
         "    ducking (bool, optional): Duck the generated music under the "
         "source voice at finalize time. Default-ON server-side: leave "
         "unset to keep it on, pass False to opt out. Free, best-effort.\n"
-        "    Any of preserve_speech/output_format='wav'/ducking makes this "
+        "    variants_num (int, optional): 1-10, default 1. Generate this "
+        "many distinct music variants in one request — each is its own "
+        "creative direction with its own title, not just a re-roll. Cost "
+        "scales linearly with N. Values above 1 are never covered by the "
+        "free trial — even a trial account is billed for variants beyond "
+        "the first.\n"
+        "    Any of preserve_speech/output_format='wav'/ducking/"
+        "variants_num>1 makes this "
         "tool internally use the backend's async generation mode (submit + "
         "poll) instead of streaming — the call takes longer but the tool "
         "still waits for completion. Subject to the same 360-second video "
@@ -1671,6 +1924,9 @@ async def _get_max_upload_size_mb() -> int:
         "    ducking (default-on in async mode): also one TextContent per "
         "ducked stream (music lowered under the source voice), when the "
         "backend rendered one.\n"
+        "    variants_num > 1: one audio TextContent per variant (suffixed "
+        "-0, -1, ...), each labeled with its title when the backend "
+        "provides one.\n"
         "    Each TextContent's label says which kind of file it is."
     )
 )
@@ -1681,8 +1937,10 @@ async def video_to_music(
     preserve_speech: bool = False,
     output_format: str | None = None,
     ducking: bool | None = None,
+    variants_num: int = 1,
     output_directory: str | None = None,
 ) -> list[TextContent]:
+    _validate_variants_num(variants_num)
     if (video_path and video_url) or (not video_path and not video_url):
         raise Exception(
             "Provide either video_path or video_url (exactly one, not both)"
@@ -1696,13 +1954,14 @@ async def video_to_music(
     out_path = _make_output_path(output_directory)
     cfg = _get_config()
 
-    # preserve_speech/ducking/output_format="wav" all require mode=async on
-    # the backend (else a 400) — always send it together, no user-facing
-    # mode param.
+    # preserve_speech/ducking/output_format="wav"/variants_num>1 all require
+    # mode=async on the backend (else a 400) — always send it together, no
+    # user-facing mode param.
     use_async = (
         preserve_speech
         or output_format == "wav"
         or ducking is not None
+        or variants_num > 1
     )
 
     if video_path:
@@ -1726,6 +1985,8 @@ async def video_to_music(
             data["output_format"] = output_format
         if ducking is not None:
             data["ducking"] = "true" if ducking else "false"
+        if variants_num != 1:
+            data["variants_num"] = variants_num
         if use_async:
             data["mode"] = "async"
         mime, _ = mimetypes.guess_type(resolved.name)
@@ -1756,6 +2017,8 @@ async def video_to_music(
         form["output_format"] = output_format
     if ducking is not None:
         form["ducking"] = "true" if ducking else "false"
+    if variants_num != 1:
+        form["variants_num"] = variants_num
     if use_async:
         form["mode"] = "async"
         task_id = await _post_task_submit("/v1/video-to-music", data=form)
@@ -1937,12 +2200,19 @@ async def video_to_sfx(
         "    prompt (str, optional): Style hint for the generated music.\n"
         "    preserve_speech (bool, optional): Keep the source speech/vocals "
         "in the output. Defaults to False.\n"
+        "    variants_num (int, optional): 1-10, default 1. Generate this "
+        "many distinct video variants in one request, each scored with its "
+        "own creative direction. Cost scales linearly with N. Values above "
+        "1 are never covered by the free trial — even a trial account is "
+        "billed for variants beyond the first.\n"
         "    output_directory (str, optional): Where to save the result. "
         "Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Exactly one of video_path and video_url must be provided.\n\n"
         "Returns:\n"
-        "    TextContent with the saved .mp4 path. On timeout the error "
-        "message includes the task_id — recover with get_sfx_task."
+        "    TextContent with the saved .mp4 path. At variants_num > 1, one "
+        "TextContent per variant, saved as <base>-0.mp4, <base>-1.mp4, ... "
+        "On timeout the error message includes the task_id — recover with "
+        "get_sfx_task."
     )
 )
 async def video_to_video_music(
@@ -1950,8 +2220,10 @@ async def video_to_video_music(
     video_url: str | None = None,
     prompt: str | None = None,
     preserve_speech: bool = False,
+    variants_num: int = 1,
     output_directory: str | None = None,
 ) -> list[TextContent]:
+    _validate_variants_num(variants_num)
     if (video_path and video_url) or (not video_path and not video_url):
         raise Exception(
             "Provide either video_path or video_url (exactly one, not both)"
@@ -1970,6 +2242,8 @@ async def video_to_video_music(
         form["prompt"] = prompt
     if preserve_speech:
         form["preserve_speech"] = "true"
+    if variants_num != 1:
+        form["variants_num"] = variants_num
 
     if video_path:
         resolved = _resolve_input_file(
@@ -2162,6 +2436,7 @@ async def _submit_video_to_sound(
     segments: list[dict] | None,
     preserve_speech: bool,
     ducking: bool,
+    variants_num: int,
     output_directory: str | None,
 ) -> list[TextContent]:
     """Shared body for video_to_sound and video_to_video_sound.
@@ -2170,11 +2445,18 @@ async def _submit_video_to_sound(
     path and the fallback name of the saved file, so they share everything
     here rather than duplicating the upload/duration/poll/save sequence.
 
-    Only the combined artifact is saved. The music/sfx/music_processed stems
-    in the task body are deliberately left on the backend: four files per call
-    would bury the actual result, and callers who want the stems have them via
-    the REST API and the language SDKs.
+    Only the combined artifact per variant is saved. The music/sfx/
+    music_processed stems in the task body are deliberately left on the
+    backend: four files per call (times variants_num) would bury the actual
+    result, and callers who want the stems have them via the REST API and
+    the language SDKs.
+
+    variants_num > 1 makes the backend's `outputs` list carry one entry per
+    variant instead of one — _save_task_artifacts detects that and saves
+    every entry (see its multi-variant branch), so nothing else here needs
+    to change to support it.
     """
+    _validate_variants_num(variants_num)
     if (video_path and video_url) or (not video_path and not video_url):
         raise Exception(
             "Provide either video_path or video_url (exactly one, not both)"
@@ -2203,6 +2485,8 @@ async def _submit_video_to_sound(
     # no-op and "false" is the opt-out — sending it either way keeps the
     # tool's behavior identical to what its schema advertises.
     form["ducking"] = "true" if ducking else "false"
+    if variants_num != 1:
+        form["variants_num"] = variants_num
 
     files, extra_form = await _stage_video_input(
         video_path, video_url, cfg["base_path"], _SOUND_MAX_VIDEO_DURATION_SECONDS
@@ -2253,12 +2537,19 @@ async def _submit_video_to_sound(
         "source video in the result. Defaults to False.\n"
         "    ducking (bool, optional): Dip the generated music under the "
         "source speech. Defaults to True.\n"
+        "    variants_num (int, optional): 1-10, default 1. Generate this "
+        "many distinct combined-mix variants in one request. Cost scales "
+        "linearly with N. Values above 1 are never covered by the free "
+        "trial — even a trial account is billed for variants beyond the "
+        "first.\n"
         "    output_directory (str, optional): Where to save the result. "
         "Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Exactly one of video_path and video_url must be provided.\n\n"
         "Returns:\n"
-        "    TextContent with the saved .wav path. On timeout the error "
-        "message includes the task_id — recover with get_sfx_task."
+        "    TextContent with the saved .wav path. At variants_num > 1, one "
+        "TextContent per variant, saved as <base>-0.wav, <base>-1.wav, ... "
+        "On timeout the error message includes the task_id — recover with "
+        "get_sfx_task."
     )
 )
 async def video_to_sound(
@@ -2269,6 +2560,7 @@ async def video_to_sound(
     segments: list[dict] | None = None,
     preserve_speech: bool = False,
     ducking: bool = True,
+    variants_num: int = 1,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     return await _submit_video_to_sound(
@@ -2281,6 +2573,7 @@ async def video_to_sound(
         segments=segments,
         preserve_speech=preserve_speech,
         ducking=ducking,
+        variants_num=variants_num,
         output_directory=output_directory,
     )
 
@@ -2319,12 +2612,19 @@ async def video_to_sound(
         "source video in the result. Defaults to False.\n"
         "    ducking (bool, optional): Dip the generated music under the "
         "source speech. Defaults to True.\n"
+        "    variants_num (int, optional): 1-10, default 1. Generate this "
+        "many distinct combined-mix variants in one request. Cost scales "
+        "linearly with N. Values above 1 are never covered by the free "
+        "trial — even a trial account is billed for variants beyond the "
+        "first.\n"
         "    output_directory (str, optional): Where to save the result. "
         "Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Exactly one of video_path and video_url must be provided.\n\n"
         "Returns:\n"
-        "    TextContent with the saved .mp4 path. On timeout the error "
-        "message includes the task_id — recover with get_sfx_task."
+        "    TextContent with the saved .mp4 path. At variants_num > 1, one "
+        "TextContent per variant, saved as <base>-0.mp4, <base>-1.mp4, ... "
+        "On timeout the error message includes the task_id — recover with "
+        "get_sfx_task."
     )
 )
 async def video_to_video_sound(
@@ -2335,6 +2635,7 @@ async def video_to_video_sound(
     segments: list[dict] | None = None,
     preserve_speech: bool = False,
     ducking: bool = True,
+    variants_num: int = 1,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     return await _submit_video_to_sound(
@@ -2347,6 +2648,7 @@ async def video_to_video_sound(
         segments=segments,
         preserve_speech=preserve_speech,
         ducking=ducking,
+        variants_num=variants_num,
         output_directory=output_directory,
     )
 
@@ -2471,7 +2773,11 @@ async def dubbing(
         "tasks; one .mp4 per language for dubbing tasks; for a "
         "video_to_music(preserve_speech=true) task, the audio "
         "stream(s) plus the preserved speech ('vocals') stem plus the mux "
-        "(speech+music mixed — the ready-to-use combined result). "
+        "(speech+music mixed — the ready-to-use combined result). If the "
+        "original call used variants_num > 1 (video_to_music, "
+        "video_to_video_music, video_to_sound, or video_to_video_sound), "
+        "every variant is saved here too — one file per variant, suffixed "
+        "-0, -1, .... "
         "Failed -> an error including whether the charge was refunded."
     )
 )

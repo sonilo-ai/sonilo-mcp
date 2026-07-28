@@ -16,7 +16,7 @@ For sound design, **`video_to_sfx`** watches your video and generates matching s
 claude mcp add sonilo --env SONILO_API_KEY=sks_... -- uvx sonilo-mcp
 ```
 
-Get your API key from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys), then start a session and ask, e.g. *"Make background music that matches this video: `~/Desktop/promo.mp4`."*
+Get your API key from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys?utm_source=sonilo_mcp&utm_medium=readme&utm_campaign=mcp_quickstart), then start a session and ask, e.g. *"Make background music that matches this video: `~/Desktop/promo.mp4`."*
 
 ## Why Sonilo
 
@@ -39,7 +39,7 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
 
 ## Quickstart with Claude Desktop
 
-1. **Get your API key** from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys).
+1. **Get your API key** from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys?utm_source=sonilo_mcp&utm_medium=readme&utm_campaign=mcp_quickstart).
 
 2. **Install the `uv` package manager** (provides `uvx`):
 
@@ -71,7 +71,7 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
 
 ## Quickstart with Codex
 
-1. **Get your API key** from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys).
+1. **Get your API key** from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys?utm_source=sonilo_mcp&utm_medium=readme&utm_campaign=mcp_quickstart).
 
 2. **Install the `uv` package manager** (provides `uvx`):
 

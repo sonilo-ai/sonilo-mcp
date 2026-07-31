@@ -2684,6 +2684,10 @@ async def video_to_video_sound(
         "    languages (list, optional): Target language codes, e.g. "
         '["es", "fr"]. Supported: en, zh_cn, ja, ko, pt, es, de, fr, it, '
         'ru. Omit to get the default ["zh_cn", "es", "fr"].\n'
+        "    ducking (bool, optional): Duck the background music/effects "
+        "bed under the dubbed voice while it speaks. Off by default: the "
+        "bed is always kept, at a constant level unless this is true. "
+        "Free.\n"
         "    output_directory (str, optional): Where to save the results. "
         "Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Exactly one of video_path and video_url must be provided.\n\n"
@@ -2698,6 +2702,7 @@ async def dubbing(
     video_path: str | None = None,
     video_url: str | None = None,
     languages: list[str] | None = None,
+    ducking: bool | None = None,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     if (video_path and video_url) or (not video_path and not video_url):
@@ -2728,6 +2733,10 @@ async def dubbing(
         # list and rejects an unknown code with a 422 before charging, and a
         # hardcoded copy would make this server reject codes added later.
         form["languages"] = json.dumps(languages)
+    # Default-OFF server-side (the opposite of video_to_music's ducking):
+    # omitted when unset so the server default applies.
+    if ducking is not None:
+        form["ducking"] = "true" if ducking else "false"
 
     files, extra_form = await _stage_video_input(
         video_path, video_url, cfg["base_path"], _DUBBING_MAX_VIDEO_DURATION_SECONDS

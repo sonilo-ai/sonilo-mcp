@@ -5220,6 +5220,36 @@ async def test_dubbing_omits_languages_when_unset(monkeypatch, output_dir):
     )
     await api.dubbing(video_url="https://example.com/clip.mp4")
     assert b"languages" not in submit.calls.last.request.content
+    # ducking unset → omitted so the server default (off) applies.
+    assert b"ducking" not in submit.calls.last.request.content
+
+
+@respx.mock
+async def test_dubbing_sends_ducking_when_set(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-3", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/db-3").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "db-3", "type": "dubbing", "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4"},
+        })
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    await api.dubbing(video_url="https://example.com/clip.mp4", ducking=True)
+    assert b'name="ducking"\r\n\r\ntrue' in submit.calls.last.request.content or \
+        b"ducking=true" in submit.calls.last.request.content
 
 
 async def test_dubbing_rejects_both_inputs(monkeypatch, output_dir):

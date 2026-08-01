@@ -5362,3 +5362,98 @@ async def test_get_sfx_task_recovers_a_dubbing_task(monkeypatch, output_dir):
     assert len(result) == 2
     assert (output_dir / "dubbing-db-9.es.mp4").read_bytes() == b"es-bytes"
     assert (output_dir / "dubbing-db-9.ja.mp4").read_bytes() == b"ja-bytes"
+
+
+# ---------- mp3 container, v2s output_format, v2v-music ducking/segments ----------
+
+def _v2v_music_stub(monkeypatch, output_dir):
+    """Wire up the common respx/ffprobe stubs for a video-to-video-music call
+    and return the submit route so a test can inspect the multipart body."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-video-music").mock(
+        return_value=httpx.Response(202, json={"task_id": "d1", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/d1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "d1", "type": "video_to_video_music", "status": "succeeded",
+            "video": {
+                "url": "https://r2.test/o.mp4", "content_type": "video/mp4",
+                "file_size": 3,
+            },
+            "duration_seconds": 5.0,
+        })
+    )
+    respx.get("https://r2.test/o.mp4").mock(
+        return_value=httpx.Response(200, content=b"video-bytes")
+    )
+    return api, submit
+
+
+@respx.mock
+async def test_v2v_music_omits_ducking_by_default(monkeypatch, output_dir):
+    """ducking defaults True to match the backend, so the default call must
+    send nothing — an explicit "true" would be pointless and an explicit
+    "false" would silently strip the speech the caller expects."""
+    api, submit = _v2v_music_stub(monkeypatch, output_dir)
+    await api.video_to_video_music(video_url="https://example.com/c.mp4")
+    assert b"ducking" not in submit.calls.last.request.content
+
+
+@respx.mock
+async def test_v2v_music_sends_ducking_false_when_opted_out(monkeypatch, output_dir):
+    api, submit = _v2v_music_stub(monkeypatch, output_dir)
+    await api.video_to_video_music(
+        video_url="https://example.com/c.mp4", ducking=False
+    )
+    assert b"ducking=false" in submit.calls.last.request.content
+
+
+@respx.mock
+async def test_v2v_music_serializes_segments(monkeypatch, output_dir):
+    api, submit = _v2v_music_stub(monkeypatch, output_dir)
+    await api.video_to_video_music(
+        video_url="https://example.com/c.mp4",
+        segments=[{"start": 0, "prompt": "sparse pads", "label": "intro"}],
+    )
+    # The body is form-encoded, so decode before asserting on the JSON.
+    from urllib.parse import parse_qs
+
+    fields = parse_qs(submit.calls.last.request.content.decode())
+    assert json.loads(fields["segments"][0]) == [
+        {"start": 0, "prompt": "sparse pads", "label": "intro"}
+    ]
+
+
+def test_non_m4a_output_format_forces_async_on_text_to_music():
+    """The gate used to name 'wav' specifically; mp3 would have streamed and
+    been silently ignored. Asserted on the source since the branch is a plain
+    conditional with no seam to stub."""
+    import inspect
+
+    from sonilo_mcp import api
+
+    src = inspect.getsource(api.text_to_music)
+    assert 'output_format != "m4a"' in src
+    assert 'output_format == "wav"' not in src
+
+
+def test_video_to_video_sound_never_exposes_output_format():
+    """Only the audio endpoint takes it — video_to_video_sound always muxes
+    the mix into an mp4."""
+    import inspect
+
+    from sonilo_mcp import api
+
+    assert "output_format" in inspect.signature(api.video_to_sound).parameters
+    assert (
+        "output_format" not in inspect.signature(api.video_to_video_sound).parameters
+    )

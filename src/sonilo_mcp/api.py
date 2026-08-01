@@ -1783,8 +1783,9 @@ async def _save_dubbing_artifacts(
         "    prompt (str): Description of the music to generate "
         "(1–1000 chars).\n"
         "    duration (int): Length in seconds (1–360).\n"
-        "    output_format (str, optional): 'm4a' (default) or 'wav'. "
-        "'wav' requires the backend's async generation mode (submit + "
+        "    output_format (str, optional): 'm4a' (default), 'wav', or "
+        "'mp3' (320 kbps). Anything but 'm4a' requires the backend's "
+        "async generation mode (submit + "
         "poll) instead of streaming — selected automatically, no "
         "user-facing mode param needed.\n"
         "    variants_num (int, optional): 1-10, default 1. Generate this "
@@ -1820,11 +1821,13 @@ async def text_to_music(
     data: dict = {"prompt": prompt, "duration": duration}
     if variants_num != 1:
         data["variants_num"] = variants_num
-    # 'wav' and variants_num > 1 both require mode=async on the backend
-    # (else a 400) — always send mode together with whichever triggered it,
-    # no user-facing mode param (mirrors video_to_music's preserve_speech/
-    # ducking handling).
-    if output_format == "wav" or variants_num > 1:
+    # Any container other than the m4a default is a finalize-time transcode
+    # and needs mode=async on the backend (else a 400), as does
+    # variants_num > 1 — always send mode together with whichever triggered
+    # it, no user-facing mode param (mirrors video_to_music's
+    # preserve_speech/ducking handling). Testing != 'm4a' rather than
+    # == 'wav' keeps this correct as formats are added.
+    if (output_format is not None and output_format != "m4a") or variants_num > 1:
         data["mode"] = "async"
         if output_format:
             data["output_format"] = output_format
@@ -1895,7 +1898,8 @@ async def _get_max_upload_size_mb() -> int:
         "generated music you also get a 'vocals' speech stem and a "
         "ready-to-use 'mux' (speech+music, already mixed). Defaults to "
         "False.\n"
-        "    output_format (str, optional): 'm4a' (default) or 'wav'.\n"
+        "    output_format (str, optional): 'm4a' (default), 'wav', or "
+        "'mp3' (320 kbps).\n"
         "    ducking (bool, optional): Duck the generated music under the "
         "source voice at finalize time. Default-ON server-side: leave "
         "unset to keep it on, pass False to opt out. Free, best-effort.\n"
@@ -1905,7 +1909,7 @@ async def _get_max_upload_size_mb() -> int:
         "scales linearly with N. Values above 1 are never covered by the "
         "free trial — even a trial account is billed for variants beyond "
         "the first.\n"
-        "    Any of preserve_speech/output_format='wav'/ducking/"
+        "    Any of preserve_speech/a non-m4a output_format/ducking/"
         "variants_num>1 makes this "
         "tool internally use the backend's async generation mode (submit + "
         "poll) instead of streaming — the call takes longer but the tool "
@@ -1959,7 +1963,7 @@ async def video_to_music(
     # user-facing mode param.
     use_async = (
         preserve_speech
-        or output_format == "wav"
+        or (output_format is not None and output_format != "m4a")
         or ducking is not None
         or variants_num > 1
     )
@@ -2017,6 +2021,10 @@ async def video_to_music(
         form["output_format"] = output_format
     if ducking is not None:
         form["ducking"] = "true" if ducking else "false"
+    # Audio endpoint only: video_to_video_sound always muxes the mix into an
+    # mp4, so that tool never passes this and the field never goes out.
+    if output_format:
+        form["output_format"] = output_format
     if variants_num != 1:
         form["variants_num"] = variants_num
     if use_async:
@@ -2190,6 +2198,12 @@ async def video_to_sfx(
         "tool waits for completion and returns the saved video path. Tracks "
         "are fully licensed (via Shutterstock) and cleared for commercial "
         "use.\n\n"
+        "By default the returned video's audio carries the source's original "
+        "speech with the generated music ducked underneath it; pass "
+        "ducking=False for music-only audio. The source picture is copied "
+        "without re-encoding, so the input must carry H.264, H.265/HEVC, VP9 "
+        "or AV1 video in an mp4, mov, m4v or webm container — animated gif "
+        "and VP8 webm are rejected.\n\n"
         "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
         "incur charges. Only use when explicitly requested by the user.\n\n"
         "Args:\n"
@@ -2198,6 +2212,18 @@ async def video_to_sfx(
         "video duration is 360 seconds (6 minutes).\n"
         "    video_url (str, optional): HTTPS URL to a video file.\n"
         "    prompt (str, optional): Style hint for the generated music.\n"
+        "    segments (list[dict], optional): How the music should develop "
+        "over time, as [{\"start\": float, \"prompt\": str, \"label\": str}, "
+        "...]. The first start must be 0, starts must be at least 5 seconds "
+        "apart, and label is one of intro/verse/pre-chorus/chorus/bridge/"
+        "break/silence/outro/none. Supplying these skips the plan the "
+        "backend would otherwise derive from prompt.\n"
+        "    ducking (bool, optional): Duck the generated music under the "
+        "source's speech — or, with preserve_speech, under the isolated "
+        "vocals. Default True, matching the backend. Pass False for "
+        "music-only audio. Free and best-effort: silently falls back to "
+        "music-only if the source has no usable audio track, voice isolation "
+        "fails, or the duck mix fails.\n"
         "    preserve_speech (bool, optional): Keep the source speech/vocals "
         "in the output. Defaults to False.\n"
         "    variants_num (int, optional): 1-10, default 1. Generate this "
@@ -2219,6 +2245,8 @@ async def video_to_video_music(
     video_path: str | None = None,
     video_url: str | None = None,
     prompt: str | None = None,
+    segments: list[dict] | None = None,
+    ducking: bool = True,
     preserve_speech: bool = False,
     variants_num: int = 1,
     output_directory: str | None = None,
@@ -2240,6 +2268,13 @@ async def video_to_video_music(
     form: dict = {}
     if prompt:
         form["prompt"] = prompt
+    if segments:
+        form["segments"] = json.dumps(segments)
+    # Default-ON server-side, so only send it to opt OUT. Sending "true"
+    # explicitly would be harmless but pointless; sending nothing when the
+    # caller wanted it off would silently keep the speech in the result.
+    if not ducking:
+        form["ducking"] = "false"
     if preserve_speech:
         form["preserve_speech"] = "true"
     if variants_num != 1:
@@ -2437,6 +2472,7 @@ async def _submit_video_to_sound(
     preserve_speech: bool,
     ducking: bool,
     variants_num: int,
+    output_format: str | None = None,
     output_directory: str | None,
 ) -> list[TextContent]:
     """Shared body for video_to_sound and video_to_video_sound.
@@ -2485,6 +2521,10 @@ async def _submit_video_to_sound(
     # no-op and "false" is the opt-out — sending it either way keeps the
     # tool's behavior identical to what its schema advertises.
     form["ducking"] = "true" if ducking else "false"
+    # Audio endpoint only: video_to_video_sound always muxes the mix into an
+    # mp4, so that tool never passes this and the field never goes out.
+    if output_format:
+        form["output_format"] = output_format
     if variants_num != 1:
         form["variants_num"] = variants_num
 
@@ -2537,6 +2577,11 @@ async def _submit_video_to_sound(
         "source video in the result. Defaults to False.\n"
         "    ducking (bool, optional): Dip the generated music under the "
         "source speech. Defaults to True.\n"
+        "    output_format (str, optional): Container for the combined "
+        "track — 'wav' (default), 'm4a', or 'mp3' (320 kbps). Applies "
+        "to the combined output only; the music and sfx stems keep their "
+        "native formats. Not available on video_to_video_sound, which "
+        "always returns an mp4.\n"
         "    variants_num (int, optional): 1-10, default 1. Generate this "
         "many distinct combined-mix variants in one request. Cost scales "
         "linearly with N. Values above 1 are never covered by the free "
@@ -2560,6 +2605,7 @@ async def video_to_sound(
     segments: list[dict] | None = None,
     preserve_speech: bool = False,
     ducking: bool = True,
+    output_format: str | None = None,
     variants_num: int = 1,
     output_directory: str | None = None,
 ) -> list[TextContent]:
@@ -2573,6 +2619,7 @@ async def video_to_sound(
         segments=segments,
         preserve_speech=preserve_speech,
         ducking=ducking,
+        output_format=output_format,
         variants_num=variants_num,
         output_directory=output_directory,
     )

@@ -5401,11 +5401,61 @@ def _v2v_music_stub(monkeypatch, output_dir):
 @respx.mock
 async def test_v2v_music_omits_ducking_by_default(monkeypatch, output_dir):
     """ducking defaults True to match the backend, so the default call must
-    send nothing — an explicit "true" would be pointless and an explicit
-    "false" would silently strip the speech the caller expects."""
+    send nothing. An explicit "true" would be pointless, and an explicit
+    "false" would pin a default that belongs to the server."""
     api, submit = _v2v_music_stub(monkeypatch, output_dir)
     await api.video_to_video_music(video_url="https://example.com/c.mp4")
     assert b"ducking" not in submit.calls.last.request.content
+
+
+@respx.mock
+async def test_v2v_music_omits_keep_original_sound_by_default(monkeypatch, output_dir):
+    """Default-OFF on the backend, so the default call sends nothing and the
+    delivered video's audio is the generated music alone."""
+    api, submit = _v2v_music_stub(monkeypatch, output_dir)
+    await api.video_to_video_music(video_url="https://example.com/c.mp4")
+    assert b"keep_original_sound" not in submit.calls.last.request.content
+
+
+@respx.mock
+async def test_v2v_music_sends_keep_original_sound_when_opted_in(monkeypatch, output_dir):
+    api, submit = _v2v_music_stub(monkeypatch, output_dir)
+    await api.video_to_video_music(
+        video_url="https://example.com/c.mp4", keep_original_sound=True
+    )
+    body = submit.calls.last.request.content
+    assert b'name="keep_original_sound"\r\n\r\ntrue' in body or \
+        b"keep_original_sound=true" in body
+
+
+@respx.mock
+async def test_v2v_music_static_mix_row(monkeypatch, output_dir):
+    """keep_original_sound with ducking=False is the new static-mix row: the
+    whole original track, mixed at a fixed offset rather than ducked."""
+    api, submit = _v2v_music_stub(monkeypatch, output_dir)
+    await api.video_to_video_music(
+        video_url="https://example.com/c.mp4",
+        keep_original_sound=True,
+        ducking=False,
+    )
+    body = submit.calls.last.request.content
+    assert b"keep_original_sound" in body
+    assert b'name="ducking"\r\n\r\nfalse' in body or b"ducking=false" in body
+
+
+def test_audio_sound_tool_does_not_expose_keep_original_sound():
+    """keep_original_sound is video-only: it only means something when the
+    deliverable is a video whose own audio could be preserved. video_to_sound
+    must not expose it — the mirror of how output_format is kept off
+    video_to_video_sound. Asserted on the signatures so adding it by reflex
+    fails here rather than shipping a field the backend silently drops."""
+    import inspect
+
+    from sonilo_mcp import api
+
+    assert "keep_original_sound" not in inspect.signature(api.video_to_sound).parameters
+    assert "keep_original_sound" in inspect.signature(api.video_to_video_sound).parameters
+    assert "keep_original_sound" in inspect.signature(api.video_to_video_music).parameters
 
 
 @respx.mock

@@ -2198,9 +2198,12 @@ async def video_to_sfx(
         "tool waits for completion and returns the saved video path. Tracks "
         "are fully licensed (via Shutterstock) and cleared for commercial "
         "use.\n\n"
-        "By default the returned video's audio carries the source's original "
-        "speech with the generated music ducked underneath it; pass "
-        "ducking=False for music-only audio. The source picture is copied "
+        "By default the returned video's audio is the generated music ALONE — "
+        "the source video's own audio is removed. Pass "
+        "keep_original_sound=True to keep the whole source track with the "
+        "music ducked under it, adding ducking=False for a static mix instead "
+        "of a duck; or preserve_speech=True to keep only the isolated speech. "
+        "The source picture is copied "
         "without re-encoding, so the input must carry H.264, H.265/HEVC, VP9 "
         "or AV1 video in an mp4, mov, m4v or webm container — animated gif "
         "and VP8 webm are rejected.\n\n"
@@ -2218,14 +2221,23 @@ async def video_to_sfx(
         "apart, and label is one of intro/verse/pre-chorus/chorus/bridge/"
         "break/silence/outro/none. Supplying these skips the plan the "
         "backend would otherwise derive from prompt.\n"
-        "    ducking (bool, optional): Duck the generated music under the "
-        "source's speech — or, with preserve_speech, under the isolated "
-        "vocals. Default True, matching the backend. Pass False for "
-        "music-only audio. Free and best-effort: silently falls back to "
-        "music-only if the source has no usable audio track, voice isolation "
-        "fails, or the duck mix fails.\n"
-        "    preserve_speech (bool, optional): Keep the source speech/vocals "
-        "in the output. Defaults to False.\n"
+        "    keep_original_sound (bool, optional): Keep the source video's "
+        "whole original audio track in the result, with the generated music "
+        "combined under it. Defaults to False, so by default the returned "
+        "video's audio is the generated music alone. Supersedes "
+        "preserve_speech.\n"
+        "    ducking (bool, optional): How the voice and the generated music "
+        "are COMBINED — not whether a voice is kept. Default True, matching "
+        "the backend: the music dips only while the voice is present. Pass "
+        "False for a static voice-forward mix at a fixed offset. Has no "
+        "effect when there is no voice source, i.e. neither "
+        "keep_original_sound nor preserve_speech is set. Free and "
+        "best-effort: silently falls back to generated-audio-only if the "
+        "source has no usable audio track, voice isolation fails, or the mix "
+        "fails.\n"
+        "    preserve_speech (bool, optional): Keep only the source's "
+        "ISOLATED speech (not the whole track) in the output. Defaults to "
+        "False. Superseded by keep_original_sound.\n"
         "    variants_num (int, optional): 1-10, default 1. Generate this "
         "many distinct video variants in one request, each scored with its "
         "own creative direction. Cost scales linearly with N. Values above "
@@ -2246,6 +2258,7 @@ async def video_to_video_music(
     video_url: str | None = None,
     prompt: str | None = None,
     segments: list[dict] | None = None,
+    keep_original_sound: bool = False,
     ducking: bool = True,
     preserve_speech: bool = False,
     variants_num: int = 1,
@@ -2270,9 +2283,14 @@ async def video_to_video_music(
         form["prompt"] = prompt
     if segments:
         form["segments"] = json.dumps(segments)
-    # Default-ON server-side, so only send it to opt OUT. Sending "true"
-    # explicitly would be harmless but pointless; sending nothing when the
-    # caller wanted it off would silently keep the speech in the result.
+    # Each flag is sent only when it differs from the backend's own default,
+    # and the two defaults run in opposite directions. `ducking` is default-ON,
+    # so it is sent only to opt OUT; `keep_original_sound` is default-OFF, so it
+    # is sent only to opt IN. Sending the matching value explicitly would be
+    # harmless but pointless; omitting a differing value would silently give the
+    # caller the wrong audio.
+    if keep_original_sound:
+        form["keep_original_sound"] = "true"
     if not ducking:
         form["ducking"] = "false"
     if preserve_speech:
@@ -2473,13 +2491,17 @@ async def _submit_video_to_sound(
     ducking: bool,
     variants_num: int,
     output_format: str | None = None,
+    keep_original_sound: bool = False,
     output_directory: str | None,
 ) -> list[TextContent]:
     """Shared body for video_to_sound and video_to_video_sound.
 
-    The two endpoints take identical form fields and differ only in the URL
-    path and the fallback name of the saved file, so they share everything
-    here rather than duplicating the upload/duration/poll/save sequence.
+    The two endpoints differ only in the URL path, the fallback name of the
+    saved file, and two form fields that point in opposite directions —
+    `output_format` is audio-only and `keep_original_sound` is video-only, each
+    defaulted here so the tool that must not send one simply never passes it.
+    Everything else is shared rather than duplicating the
+    upload/duration/poll/save sequence.
 
     Only the combined artifact per variant is saved. The music/sfx/
     music_processed stems in the task body are deliberately left on the
@@ -2515,6 +2537,12 @@ async def _submit_video_to_sound(
         # Pass-through: the backend validates segments strictly and rejects
         # bad input with a 400 before charging.
         form["segments"] = json.dumps(segments)
+    # Video endpoint only, and the mirror of output_format below: it only means
+    # something when the deliverable is a video whose own audio could be
+    # preserved, so video_to_sound never passes it and the field never goes
+    # out. Default-OFF on the backend, so it is sent only to opt IN.
+    if keep_original_sound:
+        form["keep_original_sound"] = "true"
     if preserve_speech:
         form["preserve_speech"] = "true"
     # Always sent explicitly. The backend default is ON, so "true" is the
@@ -2655,10 +2683,22 @@ async def video_to_sound(
         "next start); every end > start; every prompt non-empty (max 200 "
         "chars); last end must not exceed the video duration; max 30 "
         "segments. Invalid segments are rejected before any charge.\n"
-        "    preserve_speech (bool, optional): Keep the speech from the "
-        "source video in the result. Defaults to False.\n"
-        "    ducking (bool, optional): Dip the generated music under the "
-        "source speech. Defaults to True.\n"
+        "    keep_original_sound (bool, optional): Keep the source video's "
+        "whole original audio track in the result, with the generated music "
+        "and effects combined under it. Defaults to False, so by default the "
+        "returned video's audio is the generated music and effects ALONE and "
+        "the source's own audio is removed — and the result carries no "
+        "music_processed stem, since with no voice source there is no "
+        "processed track. Supersedes preserve_speech.\n"
+        "    preserve_speech (bool, optional): Keep only the source's "
+        "ISOLATED speech (not the whole track) in the result. Defaults to "
+        "False. Superseded by keep_original_sound.\n"
+        "    ducking (bool, optional): How the voice and the generated bed "
+        "are COMBINED — not whether a voice is kept. Defaults to True: the "
+        "bed dips only while the voice is present. Pass False for a static "
+        "voice-forward mix at a fixed offset. Has no effect when there is no "
+        "voice source, i.e. neither keep_original_sound nor preserve_speech "
+        "is set.\n"
         "    variants_num (int, optional): 1-10, default 1. Generate this "
         "many distinct combined-mix variants in one request. Cost scales "
         "linearly with N. Values above 1 are never covered by the free "
@@ -2680,6 +2720,7 @@ async def video_to_video_sound(
     music_prompt: str | None = None,
     sfx_prompt: str | None = None,
     segments: list[dict] | None = None,
+    keep_original_sound: bool = False,
     preserve_speech: bool = False,
     ducking: bool = True,
     variants_num: int = 1,
@@ -2693,6 +2734,9 @@ async def video_to_video_sound(
         music_prompt=music_prompt,
         sfx_prompt=sfx_prompt,
         segments=segments,
+        # Video endpoint only — video_to_sound never passes this, which is what
+        # keeps the field off the audio request entirely.
+        keep_original_sound=keep_original_sound,
         preserve_speech=preserve_speech,
         ducking=ducking,
         variants_num=variants_num,

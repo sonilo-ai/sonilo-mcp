@@ -428,12 +428,11 @@ def test_raise_http_error_429():
     "message",
     [
         "Rate limit exceeded: your account allows 60 requests per minute. "
-        "Rejected requests count toward the limit too, so wait for the next "
-        "minute window (up to 60 sec) rather than retrying right away. "
-        "To raise your limit, contact info@sonilo.com.",
-        "Too many concurrent generations: 5 of 5 in progress. Wait for one to "
-        "finish before starting another. To raise your limit, contact "
+        "Please retry after 1 minute. To raise your limit, please contact "
         "info@sonilo.com.",
+        "Too many concurrent generations: 5 of 5 in progress. Please wait for "
+        "one to finish before starting another. To raise your limit, please "
+        "contact info@sonilo.com.",
     ],
 )
 def test_raise_http_error_429_does_not_repeat_the_backend_phrase(message):

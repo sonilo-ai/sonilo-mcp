@@ -428,6 +428,17 @@ class SoniloHTTPError(Exception):
         self.status_code = status_code
 
 
+# How the backend's own 429 messages open. Matched on the START of the detail
+# rather than anywhere inside it: a message that merely mentions a rate limit in
+# passing still reads better with the prefix.
+_RATE_LIMIT_OPENINGS = ("rate limit exceeded", "too many concurrent generations")
+
+
+def _announces_rate_limit(detail: str) -> bool:
+    """Whether the backend's text already says this was a rate limit."""
+    return detail.strip().lower().startswith(_RATE_LIMIT_OPENINGS)
+
+
 def _raise_http_error(status_code: int, body: str) -> None:
     """Map a backend HTTP error to a clear user-facing exception. Always raises."""
     detail = _extract_detail(body)
@@ -463,6 +474,14 @@ def _raise_http_error(status_code: int, body: str) -> None:
     if status_code == 422:
         raise SoniloHTTPError(detail, status_code)
     if status_code == 429:
+        # The backend's 429 now names the limit it hit and how to raise it:
+        # "Rate limit exceeded: your account allows 60 requests per minute..."
+        # or "Too many concurrent generations: 5 of 5 in progress...". Prefixing
+        # unconditionally printed the phrase twice in one sentence. Prefix only
+        # a detail that does not announce itself — an older backend, the daily
+        # MCP cap, or a proxy that swallowed the body.
+        if _announces_rate_limit(detail):
+            raise SoniloHTTPError(detail, status_code)
         raise SoniloHTTPError(f"Rate limit exceeded: {detail}", status_code)
     if 400 <= status_code < 500:
         raise SoniloHTTPError(detail, status_code)

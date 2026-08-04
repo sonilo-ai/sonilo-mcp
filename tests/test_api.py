@@ -424,6 +424,48 @@ def test_raise_http_error_429():
         _raise_http_error(429, '{"code":"rate_limited","message":"Rate limit exceeded"}')
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Rate limit exceeded: your account allows 60 requests per minute. "
+        "Rejected requests count toward the limit too, so wait for the next "
+        "minute window (up to 60 sec) rather than retrying right away. "
+        "To raise your limit, contact info@sonilo.com.",
+        "Too many concurrent generations: 5 of 5 in progress. Wait for one to "
+        "finish before starting another. To raise your limit, contact "
+        "info@sonilo.com.",
+    ],
+)
+def test_raise_http_error_429_does_not_repeat_the_backend_phrase(message):
+    """The backend's 429 already names the limit; do not say it a second time.
+
+    Both sentences carry the account's numbers and the address to raise the
+    limit, so they must arrive whole — an agent acts on which limit was hit.
+    """
+    from sonilo_mcp.api import _raise_http_error
+
+    with pytest.raises(Exception) as exc_info:
+        _raise_http_error(
+            429, json.dumps({"code": "rate_limit_exceeded", "message": message})
+        )
+
+    assert str(exc_info.value) == message
+    assert str(exc_info.value).lower().count("rate limit exceeded") <= 1
+
+
+def test_raise_http_error_429_still_labels_an_unannounced_detail():
+    """A 429 whose text doesn't say it was a rate limit still gets the label —
+    the daily MCP cap, an older backend, or a proxy that ate the body."""
+    from sonilo_mcp.api import _raise_http_error
+
+    with pytest.raises(Exception, match="Rate limit exceeded: Daily MCP generation"):
+        _raise_http_error(
+            429,
+            '{"code":"rate_limit_exceeded","message":"Daily MCP generation limit '
+            'reached for this account. Try again tomorrow."}',
+        )
+
+
 def test_raise_http_error_500():
     from sonilo_mcp.api import _raise_http_error
     with pytest.raises(Exception, match="Server error.*retry"):

@@ -1803,7 +1803,7 @@ async def test_video_to_music_ducking_uses_async_path(monkeypatch, output_dir):
 
 @respx.mock
 async def test_video_to_music_ducking_unset_omits_field(monkeypatch, output_dir):
-    # ducking left unset must NOT be sent at all, so the backend's default-on
+    # ducking left unset must NOT be sent at all, so the backend's default-off
     # behavior applies — sending "ducking" here would force a value.
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
@@ -4925,7 +4925,7 @@ async def test_video_to_sound_url_mode_submits_and_saves(monkeypatch, output_dir
 
 
 @respx.mock
-async def test_video_to_video_sound_saves_mp4_and_defaults_ducking_on(
+async def test_video_to_video_sound_saves_mp4_and_defaults_ducking_off(
     monkeypatch, output_dir
 ):
     monkeypatch.setenv("SONILO_API_KEY", "k")
@@ -4952,7 +4952,9 @@ async def test_video_to_video_sound_saves_mp4_and_defaults_ducking_on(
         return_value=httpx.Response(200, content=b"video-bytes")
     )
     result = await api.video_to_video_sound(video_url="https://example.com/clip.mp4")
-    assert b"ducking=true" in submit.calls.last.request.content
+    # The sound path always states ducking explicitly, and the backend default
+    # is now off, so the default call sends "false".
+    assert b"ducking=false" in submit.calls.last.request.content
     assert len(result) == 1
     assert (output_dir / "v2v-sound-sd-2.mp4").read_bytes() == b"video-bytes"
 
@@ -5441,9 +5443,9 @@ def _v2v_music_stub(monkeypatch, output_dir):
 
 @respx.mock
 async def test_v2v_music_omits_ducking_by_default(monkeypatch, output_dir):
-    """ducking defaults True to match the backend, so the default call must
-    send nothing. An explicit "true" would be pointless, and an explicit
-    "false" would pin a default that belongs to the server."""
+    """ducking defaults False to match the backend, so the default call must
+    send nothing. An explicit "false" would be pointless, and an explicit
+    "true" would pin a default that belongs to the server."""
     api, submit = _v2v_music_stub(monkeypatch, output_dir)
     await api.video_to_video_music(video_url="https://example.com/c.mp4")
     assert b"ducking" not in submit.calls.last.request.content
@@ -5471,17 +5473,17 @@ async def test_v2v_music_sends_keep_original_sound_when_opted_in(monkeypatch, ou
 
 @respx.mock
 async def test_v2v_music_static_mix_row(monkeypatch, output_dir):
-    """keep_original_sound with ducking=False is the new static-mix row: the
-    whole original track, mixed at a fixed offset rather than ducked."""
+    """keep_original_sound alone is the static-mix row: the whole original
+    track, mixed at a fixed offset rather than ducked. Now that ducking is
+    default-off it takes no second flag, and nothing pins it on the wire."""
     api, submit = _v2v_music_stub(monkeypatch, output_dir)
     await api.video_to_video_music(
         video_url="https://example.com/c.mp4",
         keep_original_sound=True,
-        ducking=False,
     )
     body = submit.calls.last.request.content
     assert b"keep_original_sound" in body
-    assert b'name="ducking"\r\n\r\nfalse' in body or b"ducking=false" in body
+    assert b"ducking" not in body
 
 
 def test_audio_sound_tool_does_not_expose_keep_original_sound():
@@ -5500,12 +5502,23 @@ def test_audio_sound_tool_does_not_expose_keep_original_sound():
 
 
 @respx.mock
-async def test_v2v_music_sends_ducking_false_when_opted_out(monkeypatch, output_dir):
+async def test_v2v_music_sends_ducking_true_when_opted_in(monkeypatch, output_dir):
+    api, submit = _v2v_music_stub(monkeypatch, output_dir)
+    await api.video_to_video_music(
+        video_url="https://example.com/c.mp4", ducking=True
+    )
+    assert b"ducking=true" in submit.calls.last.request.content
+
+
+@respx.mock
+async def test_v2v_music_omits_ducking_when_explicitly_false(monkeypatch, output_dir):
+    """An explicit False matches the backend default, so it stays off the wire
+    — the tool pins nothing the server already decides."""
     api, submit = _v2v_music_stub(monkeypatch, output_dir)
     await api.video_to_video_music(
         video_url="https://example.com/c.mp4", ducking=False
     )
-    assert b"ducking=false" in submit.calls.last.request.content
+    assert b"ducking" not in submit.calls.last.request.content
 
 
 @respx.mock

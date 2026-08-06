@@ -72,6 +72,21 @@ def test_validate_variants_num_rejects_out_of_range(bad):
         _validate_variants_num(bad)
 
 
+def test_validate_prompt_influence_accepts_the_full_range():
+    from sonilo_mcp.api import _validate_prompt_influence
+    # Both endpoints are inclusive, and 0.0 in particular is a meaningful
+    # value (loosest adherence) — it must never be treated as "unset".
+    for v in (None, 0.0, 0.25, 0.5, 1.0):
+        _validate_prompt_influence(v)  # must not raise
+
+
+@pytest.mark.parametrize("bad", [-0.1, -1.0, 1.01, 2.0])
+def test_validate_prompt_influence_rejects_out_of_range(bad):
+    from sonilo_mcp.api import _validate_prompt_influence
+    with pytest.raises(Exception, match="prompt_influence must be between 0 and 1"):
+        _validate_prompt_influence(bad)
+
+
 def test_music_audio_label_uses_title_when_present():
     from sonilo_mcp.api import _music_audio_label
     assert _music_audio_label({"title": {"title": "Sunrise"}}) == 'music audio — "Sunrise"'
@@ -1929,6 +1944,132 @@ async def test_video_to_music_variants_num_forces_async_and_sends_field(
     assert len(result) == 2
     assert (output_dir / "two-takes-0.m4a").read_bytes() == b"m0"
     assert (output_dir / "two-takes-1.m4a").read_bytes() == b"m1"
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5])
+async def test_video_to_music_rejects_out_of_range_prompt_influence(output_dir, bad):
+    from sonilo_mcp.api import video_to_music
+    with pytest.raises(Exception, match="prompt_influence must be between 0 and 1"):
+        await video_to_music(
+            video_url="https://example.com/v.mp4", prompt_influence=bad
+        )
+
+
+@respx.mock
+async def test_video_to_music_prompt_influence_streams_and_sends_field(
+    monkeypatch, output_dir
+):
+    # prompt_influence is an upstream generation param the backend accepts
+    # on the STREAM path too — unlike preserve_speech/ducking/output_format/
+    # variants_num>1 it must NOT force mode=async, and the value goes out as
+    # a form field.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    ndjson = _ndjson_bytes([
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(b"x").decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import video_to_music
+    from urllib.parse import parse_qs
+    await video_to_music(
+        video_url="https://cdn.example.com/v.mp4", prompt_influence=0.8
+    )
+    sent = parse_qs(route.calls.last.request.content.decode())
+    assert sent["prompt_influence"] == ["0.8"]
+    assert "mode" not in sent
+
+
+@respx.mock
+async def test_video_to_music_prompt_influence_zero_is_sent(
+    monkeypatch, output_dir
+):
+    # 0.0 is a meaningful value (loosest adherence) — the `is not None`
+    # gate must put it on the wire; a truthiness gate would drop it and
+    # silently give the caller the API's 0.5 default instead.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    ndjson = _ndjson_bytes([
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(b"x").decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import video_to_music
+    from urllib.parse import parse_qs
+    await video_to_music(
+        video_url="https://cdn.example.com/v.mp4", prompt_influence=0.0
+    )
+    sent = parse_qs(route.calls.last.request.content.decode())
+    assert sent["prompt_influence"] == ["0.0"]
+
+
+@respx.mock
+async def test_video_to_music_prompt_influence_unset_omits_field(
+    monkeypatch, output_dir
+):
+    # Left unset, the field must not be sent at all — the API's own 0.5
+    # default is the long-standing behavior and stays the backend's call.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    ndjson = _ndjson_bytes([
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(b"x").decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import video_to_music
+    await video_to_music(video_url="https://cdn.example.com/v.mp4")
+    assert b"prompt_influence" not in route.calls.last.request.content
+
+
+@respx.mock
+async def test_video_to_music_prompt_influence_rides_along_on_async_path(
+    monkeypatch, output_dir
+):
+    # When something else (here variants_num) forces the async submit+poll
+    # path, prompt_influence still goes out on the same form.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "t-pi-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/t-pi-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t-pi-1", "status": "succeeded",
+            "audio": [
+                {"stream_index": 0, "url": "https://r2.test/pi0.m4a",
+                 "content_type": "audio/mp4", "file_size": 1},
+                {"stream_index": 1, "url": "https://r2.test/pi1.m4a",
+                 "content_type": "audio/mp4", "file_size": 1},
+            ],
+        })
+    )
+    respx.get("https://r2.test/pi0.m4a").mock(return_value=httpx.Response(200, content=b"a"))
+    respx.get("https://r2.test/pi1.m4a").mock(return_value=httpx.Response(200, content=b"b"))
+    await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", variants_num=2,
+        prompt_influence=0.25,
+    )
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["mode"] == ["async"]
+    assert sent["prompt_influence"] == ["0.25"]
 
 
 @respx.mock
@@ -5499,6 +5640,68 @@ def test_audio_sound_tool_does_not_expose_keep_original_sound():
     assert "keep_original_sound" not in inspect.signature(api.video_to_sound).parameters
     assert "keep_original_sound" in inspect.signature(api.video_to_video_sound).parameters
     assert "keep_original_sound" in inspect.signature(api.video_to_video_music).parameters
+
+
+def test_prompt_influence_only_on_the_two_video_music_tools():
+    """prompt_influence is a music-generation upstream param: only
+    video_to_music and video_to_video_music forward it. Asserted on the
+    signatures so adding it by reflex to a tool whose backend endpoint
+    silently drops (or 422s on) the field fails here first — the mirror of
+    the keep_original_sound exposure test above."""
+    import inspect
+
+    from sonilo_mcp import api
+
+    assert "prompt_influence" in inspect.signature(api.video_to_music).parameters
+    assert "prompt_influence" in inspect.signature(api.video_to_video_music).parameters
+    for tool in (
+        api.text_to_music,
+        api.text_to_sfx,
+        api.video_to_sfx,
+        api.video_to_video_sfx,
+        api.video_to_sound,
+        api.video_to_video_sound,
+        api.dubbing,
+    ):
+        assert "prompt_influence" not in inspect.signature(tool).parameters
+
+
+@respx.mock
+async def test_v2v_music_sends_prompt_influence_when_set(monkeypatch, output_dir):
+    api, submit = _v2v_music_stub(monkeypatch, output_dir)
+    await api.video_to_video_music(
+        video_url="https://example.com/c.mp4", prompt_influence=0.9
+    )
+    assert b"prompt_influence=0.9" in submit.calls.last.request.content
+
+
+@respx.mock
+async def test_v2v_music_sends_prompt_influence_zero(monkeypatch, output_dir):
+    """0.0 is a meaningful value — the `is not None` gate must send it; a
+    truthiness gate would drop it and hand back the API's 0.5 default."""
+    api, submit = _v2v_music_stub(monkeypatch, output_dir)
+    await api.video_to_video_music(
+        video_url="https://example.com/c.mp4", prompt_influence=0.0
+    )
+    assert b"prompt_influence=0.0" in submit.calls.last.request.content
+
+
+@respx.mock
+async def test_v2v_music_omits_prompt_influence_by_default(monkeypatch, output_dir):
+    """Unset means not on the wire at all: the API's own 0.5 default is the
+    long-standing behavior and stays the backend's call."""
+    api, submit = _v2v_music_stub(monkeypatch, output_dir)
+    await api.video_to_video_music(video_url="https://example.com/c.mp4")
+    assert b"prompt_influence" not in submit.calls.last.request.content
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5])
+async def test_v2v_music_rejects_out_of_range_prompt_influence(output_dir, bad):
+    from sonilo_mcp.api import video_to_video_music
+    with pytest.raises(Exception, match="prompt_influence must be between 0 and 1"):
+        await video_to_video_music(
+            video_url="https://example.com/c.mp4", prompt_influence=bad
+        )
 
 
 @respx.mock

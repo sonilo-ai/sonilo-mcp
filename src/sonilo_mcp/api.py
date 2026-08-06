@@ -266,6 +266,28 @@ def _validate_variants_num(variants_num: int) -> None:
         )
 
 
+_PROMPT_INFLUENCE_MIN = 0.0
+_PROMPT_INFLUENCE_MAX = 1.0
+
+
+def _validate_prompt_influence(prompt_influence: float | None) -> None:
+    """Range-check prompt_influence before it reaches the backend — same
+    fail-fast policy as _validate_variants_num, shared by the two music
+    tools that accept it (video_to_music, video_to_video_music).
+
+    None means "not set" and is always valid: the field is then never put
+    on the wire, leaving the backend/generator its own 0.5 default. 0.0 is
+    a meaningful value (the loosest prompt adherence), so callers must gate
+    on `is not None`, never truthiness.
+    """
+    if prompt_influence is None:
+        return
+    if not (_PROMPT_INFLUENCE_MIN <= prompt_influence <= _PROMPT_INFLUENCE_MAX):
+        raise Exception(
+            f"prompt_influence must be between 0 and 1 (got {prompt_influence})"
+        )
+
+
 def _read_capped(path: Path, max_mb: int, label: str) -> bytes:
     """Read a file for upload, enforcing the account's size cap on the bytes
     actually read.
@@ -1929,6 +1951,10 @@ async def _get_max_upload_size_mb() -> int:
         "scales linearly with N. Values above 1 are never covered by the "
         "free trial — even a trial account is billed for variants beyond "
         "the first.\n"
+        "    prompt_influence (float, optional): 0-1, API default 0.5. Sets "
+        "how strongly the generated music follows the prompt; omit it "
+        "unless the user asks for stricter or looser prompt adherence. "
+        "Free.\n"
         "    Any of preserve_speech/a non-m4a output_format/ducking/"
         "variants_num>1 makes this "
         "tool internally use the backend's async generation mode (submit + "
@@ -1961,9 +1987,11 @@ async def video_to_music(
     output_format: str | None = None,
     ducking: bool | None = None,
     variants_num: int = 1,
+    prompt_influence: float | None = None,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     _validate_variants_num(variants_num)
+    _validate_prompt_influence(prompt_influence)
     if (video_path and video_url) or (not video_path and not video_url):
         raise Exception(
             "Provide either video_path or video_url (exactly one, not both)"
@@ -1979,7 +2007,10 @@ async def video_to_music(
 
     # preserve_speech/ducking/output_format="wav"/variants_num>1 all require
     # mode=async on the backend (else a 400) — always send it together, no
-    # user-facing mode param.
+    # user-facing mode param. prompt_influence is deliberately NOT in this
+    # set: it is an upstream generation param the backend accepts on both
+    # the stream and async paths, so setting it alone keeps the plain
+    # streaming call.
     use_async = (
         preserve_speech
         or (output_format is not None and output_format != "m4a")
@@ -2010,6 +2041,10 @@ async def video_to_music(
             data["ducking"] = "true" if ducking else "false"
         if variants_num != 1:
             data["variants_num"] = variants_num
+        if prompt_influence is not None:
+            # `is not None`, never truthiness — 0.0 is a meaningful value.
+            # Unset stays off the wire so the API's own 0.5 default applies.
+            data["prompt_influence"] = prompt_influence
         if use_async:
             data["mode"] = "async"
         mime, _ = mimetypes.guess_type(resolved.name)
@@ -2046,6 +2081,10 @@ async def video_to_music(
         form["output_format"] = output_format
     if variants_num != 1:
         form["variants_num"] = variants_num
+    if prompt_influence is not None:
+        # `is not None`, never truthiness — 0.0 is a meaningful value.
+        # Unset stays off the wire so the API's own 0.5 default applies.
+        form["prompt_influence"] = prompt_influence
     if use_async:
         form["mode"] = "async"
         task_id = await _post_task_submit("/v1/video-to-music", data=form)
@@ -2264,6 +2303,10 @@ async def video_to_sfx(
         "own creative direction. Cost scales linearly with N. Values above "
         "1 are never covered by the free trial — even a trial account is "
         "billed for variants beyond the first.\n"
+        "    prompt_influence (float, optional): 0-1, API default 0.5. Sets "
+        "how strongly the generated music follows the prompt; omit it "
+        "unless the user asks for stricter or looser prompt adherence. "
+        "Free.\n"
         "    output_directory (str, optional): Where to save the result. "
         "Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Exactly one of video_path and video_url must be provided.\n\n"
@@ -2283,9 +2326,11 @@ async def video_to_video_music(
     ducking: bool = False,
     preserve_speech: bool = False,
     variants_num: int = 1,
+    prompt_influence: float | None = None,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     _validate_variants_num(variants_num)
+    _validate_prompt_influence(prompt_influence)
     if (video_path and video_url) or (not video_path and not video_url):
         raise Exception(
             "Provide either video_path or video_url (exactly one, not both)"
@@ -2317,6 +2362,10 @@ async def video_to_video_music(
         form["preserve_speech"] = "true"
     if variants_num != 1:
         form["variants_num"] = variants_num
+    if prompt_influence is not None:
+        # `is not None`, never truthiness — 0.0 is a meaningful value.
+        # Unset stays off the wire so the API's own 0.5 default applies.
+        form["prompt_influence"] = prompt_influence
 
     if video_path:
         resolved = _resolve_input_file(

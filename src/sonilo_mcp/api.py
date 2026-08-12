@@ -22,6 +22,8 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 
+from .credentials import read_api_key
+
 mcp = FastMCP("Sonilo")
 
 try:
@@ -72,9 +74,16 @@ def _get_config() -> dict:
     The cost is one os.getenv per tool call — negligible.
     """
     base_default = str(Path.home() / "Desktop")
+    api_url = os.getenv("SONILO_API_URL", "https://api.sonilo.com")
+    # Env var first: any host config that already sets SONILO_API_KEY must keep
+    # resolving to the same account after an upgrade. The credential file
+    # written by `sonilo login` is the fallback that lets a config carry no
+    # secret at all. Keyed by api_url so a staging server never picks up a
+    # production credential.
+    api_key = os.getenv("SONILO_API_KEY") or read_api_key(api_url.rstrip("/"))
     return {
-        "api_key": os.getenv("SONILO_API_KEY"),
-        "api_url": os.getenv("SONILO_API_URL", "https://api.sonilo.com"),
+        "api_key": api_key,
+        "api_url": api_url,
         "base_path": os.getenv("SONILO_MCP_BASE_PATH", base_default),
         # Default aligns with the backend's generation read timeout (600s): a
         # long generation can keep running—and charging—on the backend up to
@@ -434,6 +443,21 @@ _BILLING_URL = "https://platform.sonilo.com/dashboard/billing"
 _API_KEYS_URL = "https://platform.sonilo.com/dashboard/api-keys"
 
 
+def _require_api_key(cfg: dict) -> str:
+    """The key from cfg, or an error naming both ways to provide one.
+
+    Shared by all three request helpers so a user who is signed out gets the
+    same remediation whichever tool they happened to call.
+    """
+    api_key = cfg["api_key"]
+    if not api_key:
+        raise Exception(
+            "SONILO_API_KEY not set and no stored credential found — run "
+            f"`sonilo login`, or create a key at {_API_KEYS_URL}"
+        )
+    return api_key
+
+
 class SoniloHTTPError(Exception):
     """A backend HTTP error, carrying the status code.
 
@@ -561,10 +585,9 @@ async def _http_get_json(path: str, params: dict | None = None) -> dict:
     endpoints (would risk double-charging on transient 5xx).
     """
     cfg = _get_config()
-    if not cfg["api_key"]:
-        raise Exception(f"SONILO_API_KEY not set — see {_API_KEYS_URL}")
+    api_key = _require_api_key(cfg)
     url = cfg["api_url"].rstrip("/") + path
-    headers = {"Authorization": f"Bearer {cfg['api_key']}", **_CLIENT_HEADERS, **_host_headers()}
+    headers = {"Authorization": f"Bearer {api_key}", **_CLIENT_HEADERS, **_host_headers()}
 
     for attempt in (1, 2):
         try:
@@ -669,10 +692,9 @@ async def _post_streaming_generation(
     No retry — generation endpoints are non-idempotent and could double-charge.
     """
     cfg = _get_config()
-    if not cfg["api_key"]:
-        raise Exception(f"SONILO_API_KEY not set — see {_API_KEYS_URL}")
+    api_key = _require_api_key(cfg)
     url = cfg["api_url"].rstrip("/") + path
-    headers = {"Authorization": f"Bearer {cfg['api_key']}", **_CLIENT_HEADERS, **_host_headers()}
+    headers = {"Authorization": f"Bearer {api_key}", **_CLIENT_HEADERS, **_host_headers()}
 
     try:
         async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:
@@ -727,10 +749,9 @@ async def _post_task_submit(
     _post_streaming_generation. Uses cfg["timeout"] (video uploads are slow).
     """
     cfg = _get_config()
-    if not cfg["api_key"]:
-        raise Exception(f"SONILO_API_KEY not set — see {_API_KEYS_URL}")
+    api_key = _require_api_key(cfg)
     url = cfg["api_url"].rstrip("/") + path
-    headers = {"Authorization": f"Bearer {cfg['api_key']}", **_CLIENT_HEADERS, **_host_headers()}
+    headers = {"Authorization": f"Bearer {api_key}", **_CLIENT_HEADERS, **_host_headers()}
     try:
         async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:
             r = await client.post(url, headers=headers, data=data, files=files)

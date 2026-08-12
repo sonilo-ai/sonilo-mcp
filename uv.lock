@@ -1225,7 +1225,7 @@ wheels = [
 
 [[package]]
 name = "sonilo-mcp"
-version = "0.10.0"
+version = "0.15.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -1246,7 +1246,7 @@ dev = [
 requires-dist = [
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.2" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.6.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.6.0,<2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "respx", marker = "extra == 'dev'", specifier = ">=0.21" },

@@ -12,11 +12,20 @@ For sound design, **`video_to_sfx`** watches your video and generates matching s
 
 ## Quickstart with Claude Code
 
+Sign in once with the CLI, then add the server with no secret in the config:
+
 ```bash
-claude mcp add sonilo --env SONILO_API_KEY=sks_... -- uvx sonilo-mcp
+npm install -g sonilo-cli && sonilo login
+claude mcp add sonilo -- uvx sonilo-mcp
 ```
 
-Get your API key from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys?utm_source=sonilo_mcp&utm_medium=readme&utm_campaign=mcp_quickstart), then start a session and ask, e.g. *"Make background music that matches this video: `~/Desktop/promo.mp4`."*
+Or hold an API key yourself — get one from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys?utm_source=sonilo_mcp&utm_medium=readme&utm_campaign=mcp_quickstart):
+
+```bash
+claude mcp add sonilo --env SONILO_API_KEY=sk-... -- uvx sonilo-mcp
+```
+
+Then start a session and ask, e.g. *"Make background music that matches this video: `~/Desktop/promo.mp4`."*
 
 ## Why Sonilo
 
@@ -40,7 +49,10 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
 
 ## Quickstart with Claude Desktop
 
-1. **Get your API key** from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys?utm_source=sonilo_mcp&utm_medium=readme&utm_campaign=mcp_quickstart).
+1. **Authenticate**, either way round:
+
+   - Sign in with the CLI — `npm install -g sonilo-cli && sonilo login` — and leave `"env": {}` below. Nothing secret goes in the config file.
+   - Or **get an API key** from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys?utm_source=sonilo_mcp&utm_medium=readme&utm_campaign=mcp_quickstart) and put it in `"env"`.
 
 2. **Install the `uv` package manager** (provides `uvx`):
 
@@ -58,13 +70,20 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
        "sonilo": {
          "command": "uvx",
          "args": ["sonilo-mcp"],
-         "env": {
-           "SONILO_API_KEY": "sks_...",
-           "SONILO_API_URL": "https://api.sonilo.com",
-           "TIME_OUT_SECONDS": "600"
-         }
+         "env": {}
        }
      }
+   }
+   ```
+
+   That is the whole config when you have signed in with `sonilo login`. To
+   hold a key instead, or to change the defaults:
+
+   ```json
+   "env": {
+     "SONILO_API_KEY": "sk-...",
+     "SONILO_API_URL": "https://api.sonilo.com",
+     "TIME_OUT_SECONDS": "600"
    }
    ```
 
@@ -72,7 +91,22 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
 
 ## Quickstart with Codex
 
-1. **Get your API key** from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys?utm_source=sonilo_mcp&utm_medium=readme&utm_campaign=mcp_quickstart).
+Signed in with the CLI (`npm install -g sonilo-cli && sonilo login`), the whole
+setup is one command:
+
+```bash
+codex mcp add sonilo -- uvx sonilo-mcp
+```
+
+Or, holding a key yourself:
+
+```bash
+codex mcp add sonilo --env SONILO_API_KEY=sk-... -- uvx sonilo-mcp
+```
+
+To configure it by hand instead:
+
+1. **Get your API key** from the [Sonilo dashboard](https://platform.sonilo.com/dashboard/api-keys?utm_source=sonilo_mcp&utm_medium=readme&utm_campaign=mcp_quickstart) — or skip this step if you signed in with `sonilo login`.
 
 2. **Install the `uv` package manager** (provides `uvx`):
 
@@ -92,8 +126,9 @@ The `play_audio` tool requires PortAudio at runtime (for `sounddevice`). On macO
    command = "uvx"
    args = ["sonilo-mcp"]
 
+   # Omit this whole block when you have signed in with `sonilo login`.
    [mcp_servers.sonilo.env]
-   SONILO_API_KEY = "sk_..."
+   SONILO_API_KEY = "sk-..."
    SONILO_API_URL = "https://api.sonilo.com"
    TIME_OUT_SECONDS = "600"
    ```
@@ -117,11 +152,24 @@ The assistant will call the matching tool (`text_to_music`, `video_to_music`, `t
 
 ## Configuration
 
+### Authentication
+
+The server takes its key from `SONILO_API_KEY` if that is set, and otherwise
+from the credential written by `sonilo login`
+(`~/.config/sonilo/credentials.json`, or `$XDG_CONFIG_HOME/sonilo/`). The
+environment variable wins on purpose, so any config that already sets it keeps
+resolving to the same account after an upgrade.
+
+The credential is looked up by the server's own `SONILO_API_URL`, so a staging
+server never picks up a production sign-in. This server only ever **reads** the
+file: run `sonilo login` again to renew it (keys from a sign-in expire after 90
+days) and `sonilo logout` to revoke it.
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `SONILO_API_KEY` | _(required)_ | Bearer token. |
+| `SONILO_API_KEY` | _(from `sonilo login`)_ | Bearer token. Required only if you have not signed in with the CLI. |
 | `SONILO_API_URL` | `https://api.sonilo.com` | Public API base URL. |
 | `SONILO_MCP_BASE_PATH` | `~/Desktop` | Default output directory and base for relative input paths. Also the confinement boundary (see below). |
 | `SONILO_MCP_ALLOW_ANY_PATH` | `false` | Set to `true` to let tools read/write files outside `SONILO_MCP_BASE_PATH`. |
@@ -189,7 +237,8 @@ File names come from the prompt (slugified, truncated to 80 characters). When th
 
 | Message | What to do |
 |---|---|
-| `Invalid SONILO_API_KEY` | Verify the key at <https://platform.sonilo.com/dashboard/api-keys>. |
+| `SONILO_API_KEY not set and no stored credential found` | Run `sonilo login`, or set `SONILO_API_KEY` in the server's config. |
+| `Invalid SONILO_API_KEY` | Verify the key at <https://platform.sonilo.com/dashboard/api-keys>. If you signed in with the CLI, the key may have expired (90 days) or been revoked — run `sonilo login` again. |
 | `Insufficient minutes` / `Credit limit exceeded` | Top up at <https://platform.sonilo.com/dashboard/billing>. |
 | `You've used your N free trial calls for <service>` | That service's free trial is spent. Add a payment method at <https://platform.sonilo.com/dashboard/billing> — retrying can't help. `get_account_services` shows what is left on the other services. |
 | `Rate limit exceeded: your account allows N requests per minute` | Calls are going out too fast. The counter runs on a fixed 60-second window and rejected calls count toward it too, so wait the window out instead of retrying inside it. `get_account_services` reports your `rpm_limit`; email <info@sonilo.com> to raise it. |

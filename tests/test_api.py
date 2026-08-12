@@ -5764,3 +5764,125 @@ def test_video_to_video_sound_never_exposes_output_format():
     assert (
         "output_format" not in inspect.signature(api.video_to_video_sound).parameters
     )
+
+
+# ---------- Authenticating from the `sonilo login` credential ----------
+
+def _write_credentials(path, *, api_key: str, api_base: str = "https://api.sonilo.com"):
+    """Write the shared credential file the CLIs produce (see credentials.py)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credentials": {
+                    api_base: {
+                        "api_key": api_key,
+                        "key_id": "key-1",
+                        "account_id": "acct-1",
+                        "account_name": "Acme",
+                        "expires_at": "2026-11-09T04:12:00Z",
+                        "created_at": "2026-08-11T04:12:00Z",
+                        "created_by": "sonilo-cli/0.12.0",
+                    }
+                },
+            }
+        )
+    )
+
+
+def test_get_config_prefers_the_env_var_over_the_stored_credential(tmp_path, monkeypatch):
+    """The compatibility guarantee: an existing host config keeps working."""
+    monkeypatch.setenv("SONILO_API_KEY", "sk-from-env")
+    from sonilo_mcp.credentials import credentials_path
+    _write_credentials(credentials_path(), api_key="sk-from-file")
+
+    from sonilo_mcp.api import _get_config
+    assert _get_config()["api_key"] == "sk-from-env"
+
+
+def test_get_config_falls_back_to_the_stored_credential(tmp_path):
+    from sonilo_mcp.credentials import credentials_path
+    _write_credentials(credentials_path(), api_key="sk-from-file")
+
+    from sonilo_mcp.api import _get_config
+    assert _get_config()["api_key"] == "sk-from-file"
+
+
+def test_get_config_matches_the_credential_to_the_configured_api_url(tmp_path, monkeypatch):
+    monkeypatch.setenv("SONILO_API_URL", "https://api.staging.sonilo.com")
+    from sonilo_mcp.credentials import credentials_path
+    _write_credentials(credentials_path(), api_key="sk-prod")  # written for prod
+
+    from sonilo_mcp.api import _get_config
+    assert _get_config()["api_key"] is None
+
+
+def test_get_config_tolerates_a_trailing_slash_on_the_api_url(tmp_path, monkeypatch):
+    """The CLIs strip trailing slashes before keying the store, so the server
+    must too or a `SONILO_API_URL=…/` config would never find its credential."""
+    monkeypatch.setenv("SONILO_API_URL", "https://api.sonilo.com/")
+    from sonilo_mcp.credentials import credentials_path
+    _write_credentials(credentials_path(), api_key="sk-from-file")
+
+    from sonilo_mcp.api import _get_config
+    assert _get_config()["api_key"] == "sk-from-file"
+
+
+@respx.mock
+async def test_requests_use_the_stored_credential(tmp_path):
+    from sonilo_mcp.credentials import credentials_path
+    _write_credentials(credentials_path(), api_key="sk-from-file")
+
+    route = respx.get("https://api.sonilo.com/v1/account/usage").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    from sonilo_mcp.api import _http_get_json
+    await _http_get_json("/v1/account/usage")
+    assert route.calls.last.request.headers["authorization"] == "Bearer sk-from-file"
+
+
+@respx.mock
+async def test_missing_key_message_mentions_both_ways_in(tmp_path):
+    from sonilo_mcp.api import _http_get_json
+    with pytest.raises(Exception, match="SONILO_API_KEY"):
+        await _http_get_json("/v1/account/usage")
+    with pytest.raises(Exception, match="sonilo login"):
+        await _http_get_json("/v1/account/usage")
+
+
+@respx.mock
+async def test_task_submit_uses_the_stored_credential(tmp_path):
+    """The gate is duplicated across three helpers; a missed one would leave
+    one tool family unable to use a sign-in."""
+    from sonilo_mcp.credentials import credentials_path
+    _write_credentials(credentials_path(), api_key="sk-from-file")
+
+    route = respx.post("https://api.sonilo.com/v1/text-to-sfx").mock(
+        return_value=httpx.Response(202, json={"task_id": "t1"})
+    )
+    from sonilo_mcp.api import _post_task_submit
+    assert await _post_task_submit("/v1/text-to-sfx", data={"prompt": "x"}) == "t1"
+    assert route.calls.last.request.headers["authorization"] == "Bearer sk-from-file"
+
+
+@respx.mock
+async def test_streaming_generation_uses_the_stored_credential(output_dir):
+    from sonilo_mcp.credentials import credentials_path
+    _write_credentials(credentials_path(), api_key="sk-from-file")
+
+    ndjson = (
+        json.dumps({
+            "type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+            "data": base64.b64encode(b"x").decode(),
+        }) + "\n"
+        + json.dumps({"type": "complete"}) + "\n"
+    ).encode()
+    route = respx.post("https://api.sonilo.com/v1/text-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import _post_streaming_generation
+    await _post_streaming_generation(
+        "/v1/text-to-music", output_dir, data={"prompt": "p", "duration": 5}
+    )
+    assert route.calls.last.request.headers["authorization"] == "Bearer sk-from-file"

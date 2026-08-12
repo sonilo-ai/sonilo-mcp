@@ -5,7 +5,7 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def reset_env(monkeypatch):
+def reset_env(monkeypatch, tmp_path):
     """Clear Sonilo env vars before each test so tests must set what they need."""
     for key in (
         "SONILO_API_KEY",
@@ -14,6 +14,15 @@ def reset_env(monkeypatch):
         "TIME_OUT_SECONDS",
     ):
         monkeypatch.delenv(key, raising=False)
+
+    # The credential reader looks under $XDG_CONFIG_HOME / $HOME. Without this,
+    # the suite would read the developer's real ~/.config/sonilo/credentials.json,
+    # so results would depend on whether they happen to be signed in.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from sonilo_mcp import credentials
+
+    credentials.clear_cache()
 
 
 @pytest.fixture

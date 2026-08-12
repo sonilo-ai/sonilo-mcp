@@ -19,8 +19,8 @@
       "environmentVariables": [
         {
           "name": "SONILO_API_KEY",
-          "description": "Sonilo API key from platform.sonilo.com/dashboard/api-keys",
-          "isRequired": true,
+          "description": "Sonilo API key from platform.sonilo.com/dashboard/api-keys. Optional: leave it unset to use the credential written by `sonilo login`.",
+          "isRequired": false,
           "format": "string",
           "isSecret": true
         },

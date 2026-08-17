@@ -2114,6 +2114,369 @@ async def test_video_to_music_ducked_stems_saved(monkeypatch, output_dir):
     assert any("ducked" in t.lower() and "duck-test-ducked.m4a" in t for t in texts)
 
 
+def _stem_asset(name: str) -> dict:
+    return {
+        "url": f"https://r2.test/{name}.m4a",
+        "content_type": "audio/mp4",
+        "file_size": 1,
+    }
+
+
+def _mock_stem_downloads() -> None:
+    for name in ("drums", "bass", "vocals", "other"):
+        respx.get(f"https://r2.test/{name}.m4a").mock(
+            return_value=httpx.Response(200, content=name.encode())
+        )
+
+
+@respx.mock
+async def test_text_to_music_stems_forces_async_and_saves_stem_files(
+    monkeypatch, output_dir
+):
+    # stems=True requires mode=async on the backend (separation runs at
+    # finalize time) — must be sent automatically, same as
+    # output_format='wav', together with the stems form field.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "st-1", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/st-1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "st-1", "type": "text_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+            "stems": [{
+                "stream_index": 0,
+                "drums": _stem_asset("drums"), "bass": _stem_asset("bass"),
+                "vocals": _stem_asset("vocals"), "other": _stem_asset("other"),
+            }],
+        })
+    )
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"a")
+    )
+    _mock_stem_downloads()
+
+    result = await api.text_to_music(prompt="lofi beat", duration=20, stems=True)
+
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["mode"] == ["async"]
+    assert sent["stems"] == ["true"]
+    assert (output_dir / "lofi-beat.m4a").read_bytes() == b"a"
+    for name in ("drums", "bass", "vocals", "other"):
+        assert (
+            output_dir / f"lofi-beat-stems-{name}.m4a"
+        ).read_bytes() == name.encode()
+    texts = [t.text for t in result]
+    for name in ("drums", "bass", "vocals", "other"):
+        assert any(
+            f"stem — {name}" in t and f"lofi-beat-stems-{name}.m4a" in t
+            for t in texts
+        )
+
+
+@respx.mock
+async def test_text_to_music_stems_unset_still_streams(monkeypatch, output_dir):
+    # Default stems=False must keep streaming behavior UNCHANGED — no
+    # mode/stems fields sent, no task_id round trip.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    ndjson = _ndjson_bytes([
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(b"x").decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import text_to_music
+    await text_to_music(prompt="lofi", duration=10)
+    from urllib.parse import parse_qs
+    sent = parse_qs(route.calls.last.request.content.decode())
+    assert "mode" not in sent
+    assert "stems" not in sent
+
+
+@respx.mock
+async def test_video_to_music_stems_url_mode_submits_async_fields(
+    monkeypatch, output_dir
+):
+    # stems=True must route through the task submit+poll path (mode async),
+    # sending both mode and stems as form fields, instead of the plain
+    # streaming POST — same as preserve_speech.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "st-2", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/st-2").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "st-2", "type": "video_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+            "stems": [{
+                "stream_index": 0,
+                "drums": _stem_asset("drums"), "bass": _stem_asset("bass"),
+                "vocals": _stem_asset("vocals"), "other": _stem_asset("other"),
+            }],
+        })
+    )
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"a")
+    )
+    _mock_stem_downloads()
+
+    result = await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", prompt="Score", stems=True
+    )
+
+    from urllib.parse import parse_qs
+    sent = parse_qs(submit.calls.last.request.content.decode())
+    assert sent["mode"] == ["async"]
+    assert sent["stems"] == ["true"]
+    assert (output_dir / "score.m4a").read_bytes() == b"a"
+    for name in ("drums", "bass", "vocals", "other"):
+        assert (
+            output_dir / f"score-stems-{name}.m4a"
+        ).read_bytes() == name.encode()
+    texts = [t.text for t in result]
+    assert any("stem — drums" in t for t in texts)
+
+
+@respx.mock
+async def test_video_to_music_stems_unset_still_streams(monkeypatch, output_dir):
+    # Default stems=False must keep streaming behavior UNCHANGED — no
+    # mode/stems fields sent, no task_id round trip.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    ndjson = _ndjson_bytes([
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(b"x").decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import video_to_music
+    await video_to_music(video_url="https://cdn.example.com/v.mp4")
+    from urllib.parse import parse_qs
+    sent = parse_qs(route.calls.last.request.content.decode())
+    assert "mode" not in sent
+    assert "stems" not in sent
+
+
+@respx.mock
+async def test_video_to_music_stems_path_mode_multipart(
+    monkeypatch, output_dir, tmp_path
+):
+    # Local-file (multipart) submission must also carry mode/stems as form
+    # fields alongside the uploaded video.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={"max_upload_size_mb": 300})
+    )
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"FAKE-MP4")
+    submit = respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "st-3", "status": "processing"}
+        )
+    )
+    respx.get("https://api.test.local/v1/tasks/st-3").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "st-3", "type": "video_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        })
+    )
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"a")
+    )
+    api._reset_services_cache()
+    result = await api.video_to_music(video_path=str(video), stems=True)
+    sent = submit.calls.last.request
+    assert sent.headers["content-type"].startswith("multipart/form-data")
+    assert b"FAKE-MP4" in sent.content
+    assert b'name="mode"' in sent.content and b"async" in sent.content
+    assert b'name="stems"' in sent.content
+    assert len(result) == 1
+    assert (output_dir / "music-st-3.m4a").exists()
+
+
+@respx.mock
+async def test_text_to_music_stems_polls_for_at_least_forty_minutes(
+    monkeypatch, output_dir
+):
+    """TIME_OUT_SECONDS defaults to 600, but the backend gives the free
+    separation alone up to 1800s on top of the generation. Giving up at 10
+    minutes would routinely abandon a result the caller already paid for —
+    same rationale as dubbing's two-hour floor."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    monkeypatch.setenv("TIME_OUT_SECONDS", "600")
+    from sonilo_mcp import api
+    respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "st-4", "status": "processing"}
+        )
+    )
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"a")
+    )
+    seen: dict = {}
+
+    async def fake_poll(task_id, timeout):
+        seen["timeout"] = timeout
+        return {
+            "task_id": task_id, "type": "text_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        }
+
+    monkeypatch.setattr(api, "_poll_task", fake_poll)
+    await api.text_to_music(prompt="lofi", duration=10, stems=True)
+    assert seen["timeout"] == 2400.0
+
+
+@respx.mock
+async def test_video_to_music_stems_polls_for_at_least_forty_minutes(
+    monkeypatch, output_dir
+):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    monkeypatch.setenv("TIME_OUT_SECONDS", "600")
+    from sonilo_mcp import api
+    respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "st-5", "status": "processing"}
+        )
+    )
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"a")
+    )
+    seen: dict = {}
+
+    async def fake_poll(task_id, timeout):
+        seen["timeout"] = timeout
+        return {
+            "task_id": task_id, "type": "video_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        }
+
+    monkeypatch.setattr(api, "_poll_task", fake_poll)
+    await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", stems=True
+    )
+    assert seen["timeout"] == 2400.0
+
+
+@respx.mock
+async def test_text_to_music_stems_honours_a_larger_operator_timeout(
+    monkeypatch, output_dir
+):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    monkeypatch.setenv("TIME_OUT_SECONDS", "3600")
+    from sonilo_mcp import api
+    respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "st-6", "status": "processing"}
+        )
+    )
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"a")
+    )
+    seen: dict = {}
+
+    async def fake_poll(task_id, timeout):
+        seen["timeout"] = timeout
+        return {
+            "task_id": task_id, "type": "text_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        }
+
+    monkeypatch.setattr(api, "_poll_task", fake_poll)
+    await api.text_to_music(prompt="lofi", duration=10, stems=True)
+    assert seen["timeout"] == 3600.0
+
+
+@respx.mock
+async def test_video_to_music_stems_without_floor_when_unset(
+    monkeypatch, output_dir
+):
+    # A stems-less async call (here: ducking) must keep the plain operator
+    # timeout — the 40-minute floor is a stems-only concession.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    monkeypatch.setenv("TIME_OUT_SECONDS", "600")
+    from sonilo_mcp import api
+    respx.post("https://api.test.local/v1/video-to-music").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "st-7", "status": "processing"}
+        )
+    )
+    respx.get("https://r2.test/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"a")
+    )
+    seen: dict = {}
+
+    async def fake_poll(task_id, timeout):
+        seen["timeout"] = timeout
+        return {
+            "task_id": task_id, "type": "video_to_music", "status": "succeeded",
+            "audio": [{
+                "stream_index": 0, "url": "https://r2.test/a.m4a",
+                "content_type": "audio/mp4", "file_size": 1,
+            }],
+        }
+
+    monkeypatch.setattr(api, "_poll_task", fake_poll)
+    await api.video_to_music(
+        video_url="https://cdn.example.com/v.mp4", ducking=True
+    )
+    assert seen["timeout"] == 600.0
+
+
 @respx.mock
 async def test_text_to_music_output_format_wav_uses_async_path(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
@@ -3000,6 +3363,156 @@ async def test_save_music_task_artifacts_saves_ducked_stems(monkeypatch, tmp_pat
     ducked_texts = [t for t in texts if "score-ducked-0.m4a" in t or "score-ducked-1.m4a" in t]
     assert len(ducked_texts) == 2
     assert all("ducked" in t.lower() for t in ducked_texts)
+
+
+def _stems_entry(idx: int, prefix: str) -> dict:
+    return {
+        "stream_index": idx,
+        **{
+            name: {
+                "url": f"https://r2.test/{prefix}-{name}.m4a",
+                "content_type": "audio/mp4",
+                "file_size": 1,
+            }
+            for name in ("drums", "bass", "vocals", "other")
+        },
+    }
+
+
+def _mock_stems_entry_downloads(prefix: str) -> None:
+    for name in ("drums", "bass", "vocals", "other"):
+        respx.get(f"https://r2.test/{prefix}-{name}.m4a").mock(
+            return_value=httpx.Response(200, content=f"{prefix}-{name}".encode())
+        )
+
+
+@respx.mock
+async def test_save_music_task_artifacts_saves_stems_per_variant(
+    monkeypatch, tmp_path
+):
+    # Multi-variant audio with stems for every stream: each stem file must
+    # carry its variant index (score-stems-<idx>-<name>) and its own label.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/a0.m4a").mock(return_value=httpx.Response(200, content=b"a0"))
+    respx.get("https://r2.test/a1.m4a").mock(return_value=httpx.Response(200, content=b"a1"))
+    _mock_stems_entry_downloads("s0")
+    _mock_stems_entry_downloads("s1")
+    from sonilo_mcp.api import _save_music_task_artifacts
+    body = {
+        "task_id": "m-stems-1", "type": "video_to_music", "status": "succeeded",
+        "audio": [
+            {"stream_index": 0, "url": "https://r2.test/a0.m4a",
+             "content_type": "audio/mp4", "file_size": 2},
+            {"stream_index": 1, "url": "https://r2.test/a1.m4a",
+             "content_type": "audio/mp4", "file_size": 2},
+        ],
+        "stems": [_stems_entry(0, "s0"), _stems_entry(1, "s1")],
+    }
+    result = await _save_music_task_artifacts(body, tmp_path, "score", "m-stems-1")
+    for idx, prefix in ((0, "s0"), (1, "s1")):
+        for name in ("drums", "bass", "vocals", "other"):
+            assert (
+                tmp_path / f"score-stems-{idx}-{name}.m4a"
+            ).read_bytes() == f"{prefix}-{name}".encode()
+    texts = [t.text for t in result]
+    assert any("stem — bass" in t and "score-stems-1-bass.m4a" in t for t in texts)
+    # No stems_error on a fully-successful separation — no note either.
+    assert not any("separation" in t for t in texts)
+
+
+@respx.mock
+async def test_save_music_task_artifacts_partial_stems_keep_variant_index(
+    monkeypatch, tmp_path
+):
+    # The stems list may be SHORTER than audio (per-variant separation
+    # failures), and then arrives alongside stems_error. The surviving
+    # entry must keep its variant index in the filename — the multi/single
+    # decision follows the audio list, not the stems list — and the error
+    # must come back as a note that does not fail the save.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/a0.m4a").mock(return_value=httpx.Response(200, content=b"a0"))
+    respx.get("https://r2.test/a1.m4a").mock(return_value=httpx.Response(200, content=b"a1"))
+    _mock_stems_entry_downloads("s1")
+    from sonilo_mcp.api import _save_music_task_artifacts
+    body = {
+        "task_id": "m-stems-2", "type": "video_to_music", "status": "succeeded",
+        "audio": [
+            {"stream_index": 0, "url": "https://r2.test/a0.m4a",
+             "content_type": "audio/mp4", "file_size": 2},
+            {"stream_index": 1, "url": "https://r2.test/a1.m4a",
+             "content_type": "audio/mp4", "file_size": 2},
+        ],
+        "stems": [_stems_entry(1, "s1")],
+        "stems_error": "Stem separation failed for stream(s) 0.",
+    }
+    result = await _save_music_task_artifacts(body, tmp_path, "score", "m-stems-2")
+    assert (tmp_path / "score-stems-1-drums.m4a").read_bytes() == b"s1-drums"
+    assert not (tmp_path / "score-stems-drums.m4a").exists()
+    texts = [t.text for t in result]
+    note = [t for t in texts if "Stem separation failed for stream(s) 0." in t]
+    assert len(note) == 1
+    assert "missing extra" in note[0]
+    assert "not as a failed generation" in note[0]
+
+
+@respx.mock
+async def test_save_music_task_artifacts_stems_error_alone_is_a_note(
+    monkeypatch, tmp_path
+):
+    # A wholly-failed (or skipped) separation returns stems_error with no
+    # stems at all. The audio is still the complete paid result: it must
+    # save normally, with the error passed through as a trailing note.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/a.m4a").mock(return_value=httpx.Response(200, content=b"a"))
+    from sonilo_mcp.api import _save_music_task_artifacts
+    body = {
+        "task_id": "m-stems-3", "type": "text_to_music", "status": "succeeded",
+        "audio": [
+            {"stream_index": 0, "url": "https://r2.test/a.m4a",
+             "content_type": "audio/mp4", "file_size": 1},
+        ],
+        "stems_error": (
+            "Stem separation was skipped for this task. The generated audio "
+            "is unaffected."
+        ),
+    }
+    result = await _save_music_task_artifacts(body, tmp_path, "score", "m-stems-3")
+    assert (tmp_path / "score.m4a").read_bytes() == b"a"
+    texts = [t.text for t in result]
+    assert any(
+        "Stem separation was skipped for this task." in t
+        and "missing extra" in t
+        for t in texts
+    )
+
+
+@respx.mock
+async def test_save_music_task_artifacts_stems_vocals_never_collides_with_speech(
+    monkeypatch, tmp_path
+):
+    # preserve_speech's speech stem is saved as <base>-vocals; the stems
+    # vocals track must land elsewhere (<base>-stems-vocals) so a
+    # preserve_speech+stems result keeps both files intact.
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    respx.get("https://r2.test/a.m4a").mock(return_value=httpx.Response(200, content=b"a"))
+    respx.get("https://r2.test/speech.m4a").mock(
+        return_value=httpx.Response(200, content=b"speech")
+    )
+    _mock_stems_entry_downloads("s0")
+    from sonilo_mcp.api import _save_music_task_artifacts
+    body = {
+        "task_id": "m-stems-4", "type": "video_to_music", "status": "succeeded",
+        "audio": [
+            {"stream_index": 0, "url": "https://r2.test/a.m4a",
+             "content_type": "audio/mp4", "file_size": 1},
+        ],
+        "vocals": {"url": "https://r2.test/speech.m4a",
+                   "content_type": "audio/mp4", "file_size": 6},
+        "stems": [_stems_entry(0, "s0")],
+    }
+    await _save_music_task_artifacts(body, tmp_path, "score", "m-stems-4")
+    assert (tmp_path / "score-vocals.m4a").read_bytes() == b"speech"
+    assert (tmp_path / "score-stems-vocals.m4a").read_bytes() == b"s0-vocals"
 
 
 @respx.mock
@@ -5664,6 +6177,52 @@ def test_prompt_influence_only_on_the_two_video_music_tools():
         api.dubbing,
     ):
         assert "prompt_influence" not in inspect.signature(tool).parameters
+
+
+def test_stems_only_on_the_two_music_tools():
+    """stems is accepted only by /v1/text-to-music and /v1/video-to-music.
+    Asserted on the signatures so adding it by reflex to a tool whose
+    backend endpoint silently drops (or 422s on) the field fails here
+    first — the mirror of the prompt_influence exposure test above."""
+    import inspect
+
+    from sonilo_mcp import api
+
+    assert "stems" in inspect.signature(api.text_to_music).parameters
+    assert "stems" in inspect.signature(api.video_to_music).parameters
+    for tool in (
+        api.text_to_sfx,
+        api.video_to_sfx,
+        api.video_to_video_music,
+        api.video_to_video_sfx,
+        api.video_to_sound,
+        api.video_to_video_sound,
+        api.dubbing,
+        api.analyze_video,
+        api.audio_ducking,
+    ):
+        assert "stems" not in inspect.signature(tool).parameters
+
+
+async def test_stems_descriptions_carry_the_stems_error_guidance():
+    """An agent that gets audio plus a bare stems_error string would
+    otherwise report the whole generation as broken — the descriptions must
+    teach that stems_error means only the free separation failed or was
+    skipped. Asserted on the REGISTERED tool descriptions (what the MCP
+    client actually sees), not on any docstring."""
+    from sonilo_mcp import api
+
+    tools = {t.name: t for t in await api.mcp.list_tools()}
+    for name in ("text_to_music", "video_to_music"):
+        desc = tools[name].description
+        assert "stems_error" in desc
+        assert "missing extra, not as a failed generation" in desc
+        assert "drums, bass, vocals and other" in desc
+        assert "no extra charge" in desc
+    # video_to_music must additionally say WHAT gets split: the generated
+    # music, never the video's own audio.
+    assert "never the video's own audio" in tools["video_to_music"].description
+    assert "never the video's own audio" not in tools["text_to_music"].description
 
 
 @respx.mock

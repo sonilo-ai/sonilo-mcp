@@ -334,6 +334,14 @@ _ANALYSIS_MAX_VIDEO_DURATION_SECONDS = 600  # 10 minutes — /v1/video-analysis
 # its pipeline for up to 7200s, so giving up any earlier abandons a job the
 # caller has already been charged for. TIME_OUT_SECONDS defaults to 600.
 _DUBBING_MIN_POLL_TIMEOUT_SECONDS = 7200.0
+# Floor for polling a music task created with stems=true — same pattern as
+# dubbing's floor above. Stem separation typically adds 2-6 minutes, but the
+# backend gives the separation alone up to 1800s before giving up, on top of
+# the generation itself; 2400s = that separation ceiling plus the default
+# 600s generation budget. The task is charged (for the music — separation is
+# free) the moment it is submitted, so giving up at the plain 600s default
+# would routinely abandon results the caller has already paid for.
+_STEMS_MIN_POLL_TIMEOUT_SECONDS = 2400.0
 
 
 async def _check_media_duration(
@@ -1616,12 +1624,19 @@ async def _save_music_task_artifacts(
 
     succeeded -> download every entry in the `audio` list, then the single
     `vocals` object if present, then every entry in the `mux` list if
-    present, then every entry in the `ducked` list if present — one
-    TextContent per saved file, each labeled so the caller can tell audio/
-    vocals/mux/ducked apart. The mux files (vocals+music already mixed) are
-    called out as the ready-to-use combined result; `ducked` files are the
-    generated music lowered under the source voice (free, best-effort —
-    present only when the backend's `ducking` option ran).
+    present, then every entry in the `ducked` list if present, then every
+    stem in the `stems` list if present — one TextContent per saved file,
+    each labeled so the caller can tell audio/vocals/mux/ducked/stems
+    apart. The mux files (vocals+music already mixed) are called out as
+    the ready-to-use combined result; `ducked` files are the generated
+    music lowered under the source voice (free, best-effort — present only
+    when the backend's `ducking` option ran); `stems` entries (present
+    only when the task was created with stems=true) each carry four
+    separated instrument tracks (drums/bass/vocals/other) of one generated
+    stream. A `stems_error` string — the separation failed wholly or in
+    part, or was skipped; it can appear alongside a partial `stems` list —
+    is passed through as a trailing note that says only the free
+    separation was affected, never the paid music itself.
 
     When `variants_num > 1` was sent, `audio` has one entry per variant
     (indexed by `stream_index`, same as any other multi-stream result) and
@@ -1635,7 +1650,13 @@ async def _save_music_task_artifacts(
     `vocals` is saved as `{base}-vocals.{ext}`; `mux` and `ducked` follow
     the same single/multi-stream pattern as audio: `{base}-mux.{ext}` or
     `{base}-mux-{idx}.{ext}`, and likewise `{base}-ducked.{ext}` /
-    `{base}-ducked-{idx}.{ext}`.
+    `{base}-ducked-{idx}.{ext}`. Stems are saved as
+    `{base}-stems-{name}.{ext}` (single audio stream) or
+    `{base}-stems-{idx}-{name}.{ext}` — the "stems-" infix keeps the stems
+    vocals track from colliding with preserve_speech's `{base}-vocals`
+    file, and the multi/single decision follows the AUDIO list (not the
+    stems list, which the contract allows to be shorter), so a partial
+    stems result still says which variant each file belongs to.
 
     task_id must be the caller's own known-good id (from _post_task_submit),
     same rule as _save_task_artifacts — the terminal body is not a
@@ -1720,6 +1741,39 @@ async def _save_music_task_artifacts(
             f"{base_name}-ducked{suffix}",
             "ducked — music lowered under the source voice",
         )
+
+    stems = body.get("stems")
+    valid_stems = (
+        [s for s in stems if isinstance(s, dict)] if isinstance(stems, list) else []
+    )
+    for entry in sorted(valid_stems, key=lambda s: s.get("stream_index") or 0):
+        idx = entry.get("stream_index") or 0
+        # Suffix per the AUDIO list, not the stems list: stems can be a
+        # partial subset of the variants (see docstring), and the suffix's
+        # job is to say which variant a stem belongs to.
+        suffix = f"-{idx}" if multi_audio else ""
+        for name in ("drums", "bass", "vocals", "other"):
+            stem = entry.get(name)
+            if _has_artifact(stem):
+                await _save_one(
+                    stem,
+                    f"{base_name}-stems{suffix}-{name}",
+                    f"stem — {name}",
+                )
+
+    stems_error = body.get("stems_error")
+    if isinstance(stems_error, str) and stems_error:
+        saved.append(TextContent(
+            type="text",
+            text=(
+                f"Note on stems: {_end_sentence(stems_error)} Only the "
+                "stem separation failed or was skipped — the music itself "
+                "generated fine, the saved audio files above are the "
+                "complete paid result, and separation is free, so nothing "
+                "was charged for it. Report this as a missing extra, not "
+                "as a failed generation."
+            ),
+        ))
 
     return saved
 
@@ -1925,6 +1979,18 @@ async def _save_dubbing_artifacts(
         "async generation mode (handled automatically, same as "
         "output_format='wav') and are never covered by the free trial — "
         "even a trial account is billed for variants beyond the first.\n"
+        "    stems (bool, optional): Default false. Pass stems=true to "
+        "also get the track split into four separate instrument tracks — "
+        "drums, bass, vocals and other — at no extra charge; it adds a "
+        "few minutes to the wait (this tool then waits up to 40 minutes), "
+        "so set it only when the user asks for stems or separated tracks. "
+        "Uses the backend's async generation mode (handled automatically, "
+        "same as output_format='wav'). If a stems result comes back with "
+        "stems_error instead of (or alongside a partial) stems — surfaced "
+        "here as a note in the returned text — only the separation failed "
+        "or was skipped: the music itself generated fine, the saved audio "
+        "files are valid, and the user was not charged for the separation "
+        "— report it as a missing extra, not as a failed generation.\n"
         "    output_directory (str, optional): Absolute path, or relative "
         "to SONILO_MCP_BASE_PATH. Defaults to SONILO_MCP_BASE_PATH "
         "(~/Desktop unless overridden).\n\n"
@@ -1933,7 +1999,10 @@ async def _save_dubbing_artifacts(
         "the absolute path of the saved audio file (.m4a by default, "
         ".wav when output_format='wav'). At variants_num > 1, one entry "
         "per variant (suffixed -0, -1, ...), each labeled with its title "
-        "when the backend provides one."
+        "when the backend provides one. stems=True: also one TextContent "
+        "per saved stem file (drums/bass/vocals/other, per stream), or a "
+        "note carrying stems_error when the free separation failed or was "
+        "skipped."
     )
 )
 async def text_to_music(
@@ -1941,6 +2010,7 @@ async def text_to_music(
     duration: int,
     output_format: str | None = None,
     variants_num: int = 1,
+    stems: bool = False,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     _validate_variants_num(variants_num)
@@ -1952,17 +2022,30 @@ async def text_to_music(
     if variants_num != 1:
         data["variants_num"] = variants_num
     # Any container other than the m4a default is a finalize-time transcode
-    # and needs mode=async on the backend (else a 400), as does
-    # variants_num > 1 — always send mode together with whichever triggered
-    # it, no user-facing mode param (mirrors video_to_music's
-    # preserve_speech/ducking handling). Testing != 'm4a' rather than
-    # == 'wav' keeps this correct as formats are added.
-    if (output_format is not None and output_format != "m4a") or variants_num > 1:
+    # and needs mode=async on the backend (else a 400), as do
+    # variants_num > 1 and stems (separation runs at finalize time too) —
+    # always send mode together with whichever triggered it, no user-facing
+    # mode param (mirrors video_to_music's preserve_speech/ducking
+    # handling). Testing != 'm4a' rather than == 'wav' keeps this correct
+    # as formats are added.
+    if (
+        (output_format is not None and output_format != "m4a")
+        or variants_num > 1
+        or stems
+    ):
         data["mode"] = "async"
+        if stems:
+            data["stems"] = "true"
         if output_format:
             data["output_format"] = output_format
         task_id = await _post_task_submit("/v1/text-to-music", data=data)
-        body = await _poll_task(task_id, _get_config()["timeout"])
+        timeout = _get_config()["timeout"]
+        if stems:
+            # Separation alone may take up to 30 minutes on the backend —
+            # floor the poll the same way dubbing floors its own (while
+            # still honouring a larger operator-set timeout).
+            timeout = max(timeout, _STEMS_MIN_POLL_TIMEOUT_SECONDS)
+        body = await _poll_task(task_id, timeout)
         base = _slugify(prompt) if prompt else f"music-{task_id[:8]}"
         return await _save_music_task_artifacts(body, out_path, base, task_id)
     if output_format:
@@ -2044,8 +2127,20 @@ async def _get_max_upload_size_mb() -> int:
         "how strongly the generated music follows the prompt; omit it "
         "unless the user asks for stricter or looser prompt adherence. "
         "Free.\n"
+        "    stems (bool, optional): Default false. Pass stems=true to "
+        "also get the generated music split into four separate instrument "
+        "tracks — drums, bass, vocals and other — at no extra charge; it "
+        "adds a few minutes to the wait (this tool then waits up to 40 "
+        "minutes), so set it only when the user asks for stems or "
+        "separated tracks. It splits the generated music, never the "
+        "video's own audio. If a stems result comes back with stems_error "
+        "instead of (or alongside a partial) stems — surfaced here as a "
+        "note in the returned text — only the separation failed or was "
+        "skipped: the music itself generated fine, the saved audio files "
+        "are valid, and the user was not charged for the separation — "
+        "report it as a missing extra, not as a failed generation.\n"
         "    Any of preserve_speech/a non-m4a output_format/ducking/"
-        "variants_num>1 makes this "
+        "variants_num>1/stems makes this "
         "tool internally use the backend's async generation mode (submit + "
         "poll) instead of streaming — the call takes longer but the tool "
         "still waits for completion. Subject to the same 360-second video "
@@ -2065,6 +2160,9 @@ async def _get_max_upload_size_mb() -> int:
         "    variants_num > 1: one audio TextContent per variant (suffixed "
         "-0, -1, ...), each labeled with its title when the backend "
         "provides one.\n"
+        "    stems=True: also one TextContent per saved stem file "
+        "(drums/bass/vocals/other, per stream), or a note carrying "
+        "stems_error when the free separation failed or was skipped.\n"
         "    Each TextContent's label says which kind of file it is."
     )
 )
@@ -2077,6 +2175,7 @@ async def video_to_music(
     ducking: bool | None = None,
     variants_num: int = 1,
     prompt_influence: float | None = None,
+    stems: bool = False,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     _validate_variants_num(variants_num)
@@ -2094,17 +2193,26 @@ async def video_to_music(
     out_path = _make_output_path(output_directory)
     cfg = _get_config()
 
-    # preserve_speech/ducking/output_format="wav"/variants_num>1 all require
-    # mode=async on the backend (else a 400) — always send it together, no
-    # user-facing mode param. prompt_influence is deliberately NOT in this
-    # set: it is an upstream generation param the backend accepts on both
-    # the stream and async paths, so setting it alone keeps the plain
-    # streaming call.
+    # preserve_speech/ducking/output_format="wav"/variants_num>1/stems all
+    # require mode=async on the backend (else a 400) — always send it
+    # together, no user-facing mode param. prompt_influence is deliberately
+    # NOT in this set: it is an upstream generation param the backend
+    # accepts on both the stream and async paths, so setting it alone keeps
+    # the plain streaming call.
     use_async = (
         preserve_speech
         or (output_format is not None and output_format != "m4a")
         or ducking is not None
         or variants_num > 1
+        or stems
+    )
+    # Separation alone may take up to 30 minutes on the backend — floor the
+    # poll the same way dubbing floors its own (while still honouring a
+    # larger operator-set timeout).
+    poll_timeout = (
+        max(cfg["timeout"], _STEMS_MIN_POLL_TIMEOUT_SECONDS)
+        if stems
+        else cfg["timeout"]
     )
 
     if video_path:
@@ -2134,6 +2242,8 @@ async def video_to_music(
             # `is not None`, never truthiness — 0.0 is a meaningful value.
             # Unset stays off the wire so the API's own 0.5 default applies.
             data["prompt_influence"] = prompt_influence
+        if stems:
+            data["stems"] = "true"
         if use_async:
             data["mode"] = "async"
         mime, _ = mimetypes.guess_type(resolved.name)
@@ -2143,7 +2253,7 @@ async def video_to_music(
             task_id = await _post_task_submit(
                 "/v1/video-to-music", data=data, files=files
             )
-            body = await _poll_task(task_id, cfg["timeout"])
+            body = await _poll_task(task_id, poll_timeout)
             base = _slugify(prompt) if prompt else f"music-{task_id[:8]}"
             return await _save_music_task_artifacts(body, out_path, base, task_id)
         return await _post_streaming_generation(
@@ -2174,10 +2284,12 @@ async def video_to_music(
         # `is not None`, never truthiness — 0.0 is a meaningful value.
         # Unset stays off the wire so the API's own 0.5 default applies.
         form["prompt_influence"] = prompt_influence
+    if stems:
+        form["stems"] = "true"
     if use_async:
         form["mode"] = "async"
         task_id = await _post_task_submit("/v1/video-to-music", data=form)
-        body = await _poll_task(task_id, cfg["timeout"])
+        body = await _poll_task(task_id, poll_timeout)
         base = _slugify(prompt) if prompt else f"music-{task_id[:8]}"
         return await _save_music_task_artifacts(body, out_path, base, task_id)
     # Use `data` for form fields without files; httpx will use

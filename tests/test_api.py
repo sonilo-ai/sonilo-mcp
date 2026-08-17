@@ -5886,3 +5886,175 @@ async def test_streaming_generation_uses_the_stored_credential(output_dir):
         "/v1/text-to-music", output_dir, data={"prompt": "p", "duration": 5}
     )
     assert route.calls.last.request.headers["authorization"] == "Bearer sk-from-file"
+
+
+# ---------- video analysis ----------
+
+ANALYSIS_BODY = {
+    "task_id": "va-1",
+    "type": "video_analysis",
+    "status": "succeeded",
+    "variants_num": 2,
+    "segments": [
+        {"start": 0, "end": 12, "label": "intro", "prompt": "sparse piano"},
+        {"start": 12, "end": 30, "label": "none", "prompt": "full strings"},
+    ],
+    "variations": [
+        {"prompt": "cinematic strings, 90bpm"},
+        {"prompt": "lo-fi hip hop, warm keys"},
+    ],
+    "duration_seconds": 30.0,
+}
+
+
+def test_is_analysis_envelope_recognizes_the_brief():
+    from sonilo_mcp import api
+    assert api._is_analysis_envelope(ANALYSIS_BODY) is True
+    assert api._is_analysis_envelope({"task_id": "x", "status": "succeeded"}) is False
+    # An explicit, different type is authoritative and short-circuits, exactly
+    # as _is_dubbing_envelope does — a task carrying a `variations`-shaped
+    # field must not get misrouted to this envelope's renderer.
+    assert api._is_analysis_envelope(
+        {"type": "video_to_sfx", "variations": [{"prompt": "p"}]}
+    ) is False
+    # No `type` at all -> fall back to sniffing the shape.
+    assert api._is_analysis_envelope({"variations": [{"prompt": "p"}]}) is True
+    assert api._is_analysis_envelope({"variations": []}) is False
+    assert api._is_analysis_envelope({"variations": [{"no_prompt": 1}]}) is False
+
+
+@respx.mock
+async def test_analyze_video_returns_the_brief_inline(monkeypatch, output_dir):
+    """The result is a brief, not media: it comes back as text and nothing is
+    written to SONILO_MCP_BASE_PATH."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=30.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    respx.post("https://api.test.local/v1/video-analysis").mock(
+        return_value=httpx.Response(202, json={"task_id": "va-1", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/va-1").mock(
+        return_value=httpx.Response(200, json=ANALYSIS_BODY)
+    )
+
+    result = await api.analyze_video(video_url="https://example.com/clip.mp4")
+
+    assert len(result) == 1
+    brief = json.loads(result[0].text)
+    assert brief["task_id"] == "va-1"
+    assert brief["segments"][0] == {
+        "start": 0, "end": 12, "label": "intro", "prompt": "sparse piano",
+    }
+    assert [v["prompt"] for v in brief["variations"]] == [
+        "cinematic strings, 90bpm", "lo-fi hip hop, warm keys",
+    ]
+    assert list(output_dir.iterdir()) == []
+
+
+@respx.mock
+async def test_analyze_video_sends_prompt_and_variants(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=30.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-analysis").mock(
+        return_value=httpx.Response(202, json={"task_id": "va-1", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/va-1").mock(
+        return_value=httpx.Response(200, json=ANALYSIS_BODY)
+    )
+
+    await api.analyze_video(
+        video_url="https://example.com/clip.mp4",
+        prompt="focus on the chase",
+        variants_num=2,
+    )
+
+    from urllib.parse import unquote_plus
+    sent = unquote_plus(submit.calls.last.request.content.decode())
+    assert "prompt=focus on the chase" in sent
+    assert "variants_num=2" in sent
+
+
+@respx.mock
+async def test_analyze_video_omits_unset_optionals(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=30.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-analysis").mock(
+        return_value=httpx.Response(202, json={"task_id": "va-1", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/va-1").mock(
+        return_value=httpx.Response(200, json=ANALYSIS_BODY)
+    )
+
+    await api.analyze_video(video_url="https://example.com/clip.mp4")
+
+    sent = submit.calls.last.request.content.decode()
+    assert "prompt" not in sent
+    assert "variants_num" not in sent
+
+
+async def test_analyze_video_requires_exactly_one_input(output_dir):
+    from sonilo_mcp import api
+    with pytest.raises(Exception, match="exactly one"):
+        await api.analyze_video()
+    with pytest.raises(Exception, match="exactly one"):
+        await api.analyze_video(video_path="clip.mp4", video_url="https://x/c.mp4")
+
+
+async def test_analyze_video_rejects_variants_outside_1_to_5(output_dir):
+    """This endpoint caps variants at 5, unlike the music endpoints' 10 — so
+    the shared _validate_variants_num cannot be reused here."""
+    from sonilo_mcp import api
+    with pytest.raises(Exception, match="between 1 and 5"):
+        await api.analyze_video(video_url="https://x/c.mp4", variants_num=6)
+    with pytest.raises(Exception, match="between 1 and 5"):
+        await api.analyze_video(video_url="https://x/c.mp4", variants_num=0)
+
+
+async def test_analyze_video_rejects_an_over_long_video(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=700.0)
+    with pytest.raises(Exception, match="600"):
+        await api.analyze_video(video_url="https://example.com/clip.mp4")
+
+
+@respx.mock
+async def test_get_sfx_task_recovers_an_analysis_task(monkeypatch, output_dir):
+    """A video-analysis task has no artifact at all — without its own branch
+    the recovery tool would report a missing artifact for a task that was
+    charged and whose brief is sitting right there in the body."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    respx.get("https://api.test.local/v1/tasks/va-1").mock(
+        return_value=httpx.Response(200, json=ANALYSIS_BODY)
+    )
+
+    result = await api.get_sfx_task("va-1")
+
+    brief = json.loads(result[0].text)
+    assert [v["prompt"] for v in brief["variations"]] == [
+        "cinematic strings, 90bpm", "lo-fi hip hop, warm keys",
+    ]
+    assert list(output_dir.iterdir()) == []

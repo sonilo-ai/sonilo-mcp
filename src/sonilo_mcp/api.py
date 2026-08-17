@@ -261,6 +261,10 @@ def _require_http_url(url: str, label: str) -> None:
 
 _VARIANTS_NUM_MIN = 1
 _VARIANTS_NUM_MAX = 10
+# /v1/video-analysis caps variants at 5, not 10 — it bills one creative brief
+# per variant rather than one rendered track, and the backend rejects 6+. The
+# shared _validate_variants_num above would let those through to a paid 422.
+_ANALYSIS_VARIANTS_MAX = 5
 
 
 def _validate_variants_num(variants_num: int) -> None:
@@ -325,6 +329,7 @@ _SFX_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sfx
 _SOUND_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sound*
 _DUCKING_MAX_DURATION_SECONDS = 360  # 6 minutes — /v1/audio-ducking, per input
 _DUBBING_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/dubbing
+_ANALYSIS_MAX_VIDEO_DURATION_SECONDS = 600  # 10 minutes — /v1/video-analysis
 # Floor for the dubbing poll, matched to the backend's own ceiling: it polls
 # its pipeline for up to 7200s, so giving up any earlier abandons a job the
 # caller has already been charged for. TIME_OUT_SECONDS defaults to 600.
@@ -1747,6 +1752,69 @@ def _is_dubbing_envelope(body: dict) -> bool:
     return all(isinstance(url, str) and url for url in outputs.values())
 
 
+def _is_analysis_envelope(body: dict) -> bool:
+    """Whether a terminal /v1/tasks/{id} body is a video-analysis brief.
+
+    Prefers the backend `type` field and falls back to shape-sniffing only
+    for bodies that omit `type` entirely — the same rule (and the same
+    short-circuit on an explicit, different type) as _is_dubbing_envelope, so
+    a task that happens to carry a `variations`-shaped field is never
+    misrouted here.
+
+    Sniffing requires at least one variation carrying a non-empty prompt: an
+    empty list means the brief the caller paid for is not actually present,
+    and routing that to the renderer would hand back an empty document
+    instead of the missing-artifact error that includes their task_id.
+    """
+    t = body.get("type")
+    if isinstance(t, str) and t:
+        return t == "video_analysis"
+    variations = body.get("variations")
+    if not isinstance(variations, list) or not variations:
+        return False
+    return any(
+        isinstance(v, dict) and isinstance(v.get("prompt"), str) and v["prompt"].strip()
+        for v in variations
+    )
+
+
+def _analysis_brief(body: dict) -> list[TextContent]:
+    """Render a video-analysis body as the brief itself, inline.
+
+    Unlike every other _save_*_artifacts layer this writes nothing to disk:
+    video-analysis produces no media, and its whole value is text the caller
+    is about to feed into a generation call. Forcing a file round-trip would
+    only add a read step between the analysis and the call that uses it.
+
+    Re-emits the wire shape rather than passing the body through, so the
+    output stays stable if the poll envelope later grows fields that are
+    none of the caller's business.
+    """
+    brief = {
+        "task_id": body.get("task_id"),
+        "status": body.get("status"),
+        "segments": [
+            {
+                "start": seg.get("start"),
+                "end": seg.get("end"),
+                "label": seg.get("label", "none"),
+                "prompt": seg.get("prompt"),
+            }
+            for seg in body.get("segments") or []
+            if isinstance(seg, dict)
+        ],
+        "variations": [
+            {"prompt": var.get("prompt")}
+            for var in body.get("variations") or []
+            if isinstance(var, dict)
+        ],
+    }
+    for key in ("variants_num", "duration_seconds", "cost"):
+        if body.get(key) is not None:
+            brief[key] = body[key]
+    return [TextContent(type="text", text=json.dumps(brief, indent=2))]
+
+
 async def _save_dubbing_artifacts(
     body: dict,
     output_path: Path,
@@ -2524,6 +2592,7 @@ async def _stage_video_input(
     video_url: str | None,
     base_path: str | None,
     max_seconds: int,
+    exts: frozenset[str] = _SFX_VIDEO_EXTS,
 ) -> tuple[dict | None, dict[str, str]]:
     """Validate one video input and prepare it for _post_task_submit.
 
@@ -2546,7 +2615,7 @@ async def _stage_video_input(
     """
     if video_path:
         resolved = _resolve_input_file(
-            video_path, base_path, _SFX_VIDEO_EXTS, "video"
+            video_path, base_path, exts, "video"
         )
         max_mb = await _get_max_upload_size_mb()
         size_mb = resolved.stat().st_size / (1024 * 1024)
@@ -3025,6 +3094,12 @@ async def get_sfx_task(
     out_path = _make_output_path(output_directory)
     # No prompt available on recovery — name by task id; extension comes
     # from the envelope's content_type.
+    if _is_analysis_envelope(body):
+        # A video-analysis task has no artifact at all: _save_task_artifacts
+        # would report a missing artifact for a task that was charged and
+        # whose brief is right there in the body. Nothing is written to
+        # out_path, so this branch ignores it entirely.
+        return _analysis_brief(body)
     if _is_dubbing_envelope(body):
         # A dubbing task renders one video per language under `outputs` —
         # _save_task_artifacts only understands audio/video slots and would
@@ -3052,6 +3127,84 @@ async def get_sfx_task(
     return await _save_task_artifacts(
         body, out_path, f"sfx-{task_id[:8]}", task_id, reuse_existing=True
     )
+
+
+# ---------- Tools: video analysis ----------
+
+@mcp.tool(
+    description=(
+        "Analyze a video and return a CREATIVE BRIEF for scoring it: a "
+        "time-aligned section plan plus one ready-to-use generation prompt "
+        "per variation, derived from the footage itself. Generates NOTHING — "
+        "no audio, no video, no file is written. Use it when the user does "
+        "not know what music or sound effects the video should get, then "
+        "feed a variation's prompt into video_to_music, video_to_sfx, "
+        "video_to_sound or their video-to-video counterparts.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges. Only use when explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    video_path (str, optional): Absolute local path, or relative to "
+        "SONILO_MCP_BASE_PATH. Subject to the account upload cap.\n"
+        "    video_url (str, optional): HTTP(S) URL to a video file.\n"
+        "    prompt (str, optional): Guidance for the analysis, e.g. 'focus "
+        "on the chase'. At most 2000 characters.\n"
+        "    variants_num (int, optional): 1-5, default 1. How many "
+        "independent briefs to author for the same video. Billed per "
+        "brief.\n\n"
+        "Exactly one of video_path and video_url must be provided. Maximum "
+        "video duration is 600 seconds (10 minutes); billing has a "
+        "10-second floor, so a very short clip costs the same as a "
+        "10-second one.\n\n"
+        "Returns:\n"
+        "    TextContent holding the brief as JSON: `segments` (start, end, "
+        "label, prompt) and `variations` (one prompt each). No file path is "
+        "returned because no file is written. On timeout the error message "
+        "includes the task_id — recover the brief with get_sfx_task."
+    )
+)
+async def analyze_video(
+    video_path: str | None = None,
+    video_url: str | None = None,
+    prompt: str | None = None,
+    variants_num: int = 1,
+) -> list[TextContent]:
+    if (video_path and video_url) or (not video_path and not video_url):
+        raise Exception(
+            "Provide either video_path or video_url (exactly one, not both)"
+        )
+    if not 1 <= variants_num <= _ANALYSIS_VARIANTS_MAX:
+        raise Exception(
+            f"variants_num must be between 1 and {_ANALYSIS_VARIANTS_MAX}"
+        )
+    if prompt is not None and len(prompt) > 2000:
+        raise Exception("prompt must be at most 2000 characters")
+    if video_url:
+        _require_http_url(video_url, "video")
+
+    cfg = _get_config()
+    form: dict = {}
+    if prompt and prompt.strip():
+        form["prompt"] = prompt
+    # Omitted at the default so a single-brief request looks byte-identical
+    # to what it sent before variants existed.
+    if variants_num > 1:
+        form["variants_num"] = str(variants_num)
+
+    # The analysis worker transcodes the source itself rather than copying
+    # the picture stream, so the accepted container set is the broad
+    # _VIDEO_EXTS one, not video-to-video's narrower _SFX_VIDEO_EXTS.
+    files, extra = await _stage_video_input(
+        video_path, video_url, cfg["base_path"],
+        _ANALYSIS_MAX_VIDEO_DURATION_SECONDS,
+        exts=_VIDEO_EXTS,
+    )
+    form.update(extra)
+    task_id = await _post_task_submit(
+        "/v1/video-analysis", data=form or None, files=files
+    )
+    body = await _poll_task(task_id, cfg["timeout"])
+    _raise_if_task_not_succeeded(body, task_id)
+    return _analysis_brief(body)
 
 
 # ---------- Tools: audio ducking ----------

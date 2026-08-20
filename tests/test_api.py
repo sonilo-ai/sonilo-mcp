@@ -6639,9 +6639,59 @@ async def test_analyze_video_rejects_variants_outside_1_to_5(output_dir):
 async def test_analyze_video_rejects_an_over_long_video(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     from sonilo_mcp import api
-    _patch_ffprobe(monkeypatch, duration=700.0)
-    with pytest.raises(Exception, match="600"):
+    _patch_ffprobe(monkeypatch, duration=400.0)
+    with pytest.raises(Exception, match="360"):
         await api.analyze_video(video_url="https://example.com/clip.mp4")
+
+
+@respx.mock
+async def test_analyze_video_sends_a_video_at_the_cap_to_the_backend(
+    monkeypatch, output_dir
+):
+    """The pre-check's only failure mode that costs the caller anything is
+    rejecting what the API would have taken. 360s is exactly the length
+    /v1/video-analysis accepts; the submit 500s on purpose, because reaching
+    the network at all is the proof."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=360.0)
+    submit = respx.post("https://api.test.local/v1/video-analysis").mock(
+        return_value=httpx.Response(500, json={"message": "upstream is down"})
+    )
+    with pytest.raises(Exception):
+        await api.analyze_video(video_url="https://example.com/clip.mp4")
+    assert submit.called
+
+
+def test_analysis_cap_matches_the_backend():
+    """A literal, not a re-export: this pre-check is right exactly when it
+    equals the number the backend enforces. Set it too low and we reject
+    videos the API accepts -- the caller cannot appeal a rejection that never
+    left their machine. Note the backend cannot raise this above 360 without
+    first raising its own shared ffprobe ceiling, which sits at 360 too."""
+    from sonilo_mcp import api
+    assert api._ANALYSIS_MAX_VIDEO_DURATION_SECONDS == 360
+
+
+def test_documented_analysis_cap_matches_the_code():
+    """README and context7.json both state the cap in prose, and an agent
+    reading either will refuse a video rather than send it. Prose drifts from
+    constants silently."""
+    from pathlib import Path
+    from sonilo_mcp import api
+
+    cap = api._ANALYSIS_MAX_VIDEO_DURATION_SECONDS
+    root = Path(__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    context7 = (root / "context7.json").read_text(encoding="utf-8")
+
+    analyze_line = next(
+        line for line in readme.splitlines()
+        if line.startswith("| `analyze_video(")
+    )
+    assert f"{cap}s" in analyze_line, analyze_line
+    assert f"{cap}s for analyze_video" in context7
 
 
 @respx.mock

@@ -329,7 +329,7 @@ _SFX_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sfx
 _SOUND_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sound*
 _DUCKING_MAX_DURATION_SECONDS = 360  # 6 minutes — /v1/audio-ducking, per input
 _DUBBING_MAX_VIDEO_DURATION_SECONDS = 300  # 5 minutes — /v1/dubbing
-_ANALYSIS_MAX_VIDEO_DURATION_SECONDS = 600  # 10 minutes — /v1/video-analysis
+_ANALYSIS_MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — /v1/video-analysis
 # Floor for the dubbing poll, matched to the backend's own ceiling: it polls
 # its pipeline for up to 7200s, so giving up any earlier abandons a job the
 # caller has already been charged for. TIME_OUT_SECONDS defaults to 600.
@@ -3264,7 +3264,7 @@ async def get_sfx_task(
         "independent briefs to author for the same video. Billed per "
         "brief.\n\n"
         "Exactly one of video_path and video_url must be provided. Maximum "
-        "video duration is 600 seconds (10 minutes); billing has a "
+        "video duration is 360 seconds (6 minutes); billing has a "
         "10-second floor, so a very short clip costs the same as a "
         "10-second one.\n\n"
         "Returns:\n"

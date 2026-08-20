@@ -24,7 +24,7 @@
     "If a call times out, the job is still running and already charged \u2014 recover it with get_sfx_task(task_id). Never retry a timed-out generation.",
     "dubbing has zero free runs and bills video duration \u00d7 number of languages. Confirm the language list with the user before calling it.",
     "Use video_to_music when there is a video (the score matches the cut); use text_to_music only when there is none. The video_to_video_* variants return a new .mp4 with the audio already muxed in.",
-    "Video duration caps differ per tool: 600s for analyze_video; 360s for video_to_music, video_to_video_music and audio_ducking; 180s for the SFX and video_to_sound tools; 300s for dubbing.",
+    "Video duration caps differ per tool: 360s for analyze_video, video_to_music, video_to_video_music and audio_ducking; 180s for the SFX and video_to_sound tools; 300s for dubbing.",
     "File paths are confined to SONILO_MCP_BASE_PATH (default ~/Desktop) unless SONILO_MCP_ALLOW_ANY_PATH=true.",
     "analyze_video returns a creative BRIEF, not media: it generates nothing, writes no file, and hands back segments plus one prompt per variation inline. Feed a variation's prompt to video_to_music / video_to_sfx / video_to_sound.",
     "Reach for analyze_video when the user does not know what the video should sound like. It is still a paid call: variants_num is 1-5 and is billed per brief, with a 10-second billing floor."

@@ -5966,16 +5966,63 @@ async def test_dubbing_rejects_a_non_https_url(monkeypatch, output_dir):
 
 
 @respx.mock
-async def test_dubbing_rejects_a_video_over_180_seconds(monkeypatch, output_dir):
+async def test_dubbing_rejects_a_video_over_300_seconds(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     from sonilo_mcp import api
-    _patch_ffprobe(monkeypatch, duration=200.0)
+    _patch_ffprobe(monkeypatch, duration=301.0)
     submit = respx.post("https://api.test.local/v1/dubbing")
     with pytest.raises(Exception):
         await api.dubbing(video_url="https://example.com/clip.mp4")
     # Nothing may be submitted, so nothing is charged.
     assert not submit.called
+
+
+@respx.mock
+async def test_dubbing_sends_a_video_at_the_cap_to_the_backend(monkeypatch, output_dir):
+    """The local pre-check exists to save a wasted upload, so its only failure
+    mode that costs the caller anything is rejecting what the API would have
+    taken. 300s is exactly the length dubbing was raised to accept; the submit
+    below 500s on purpose, because reaching the network at all is the proof."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=300.0)
+    submit = respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(500, json={"message": "upstream is down"})
+    )
+    with pytest.raises(Exception):
+        await api.dubbing(video_url="https://example.com/clip.mp4")
+    assert submit.called
+
+
+def test_dubbing_cap_matches_the_backend():
+    """A literal, not a re-export of anything: this pre-check exists only to
+    save a wasted upload, so it is right exactly when it equals the number the
+    backend enforces. Set it too low and we reject videos the API accepts --
+    the caller cannot appeal a rejection that never left their machine."""
+    from sonilo_mcp import api
+    assert api._DUBBING_MAX_VIDEO_DURATION_SECONDS == 300
+
+
+def test_documented_dubbing_cap_matches_the_code():
+    """README and context7.json both state the cap in prose, and an agent
+    reading either will refuse a video rather than send it. Prose drifts from
+    constants silently -- nothing else in this repo compares the two."""
+    from pathlib import Path
+    from sonilo_mcp import api
+
+    cap = api._DUBBING_MAX_VIDEO_DURATION_SECONDS
+    root = Path(__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    context7 = (root / "context7.json").read_text(encoding="utf-8")
+
+    dubbing_line = next(
+        line for line in readme.splitlines()
+        if line.startswith("| `dubbing(")
+    )
+    assert f"{cap}s" in dubbing_line, dubbing_line
+    assert f"{cap}s for dubbing" in context7
 
 
 @respx.mock

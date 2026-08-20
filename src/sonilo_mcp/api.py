@@ -328,7 +328,7 @@ _MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — music endpoints
 _SFX_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sfx
 _SOUND_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sound*
 _DUCKING_MAX_DURATION_SECONDS = 360  # 6 minutes — /v1/audio-ducking, per input
-_DUBBING_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/dubbing
+_DUBBING_MAX_VIDEO_DURATION_SECONDS = 300  # 5 minutes — /v1/dubbing
 _ANALYSIS_MAX_VIDEO_DURATION_SECONDS = 600  # 10 minutes — /v1/video-analysis
 # Floor for the dubbing poll, matched to the backend's own ceiling: it polls
 # its pipeline for up to 7200s, so giving up any earlier abandons a job the

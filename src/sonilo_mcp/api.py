@@ -3054,10 +3054,11 @@ async def video_to_video_sound(
         "itself and rejects plain http.\n"
         "    languages (list, optional): Target language codes, e.g. "
         '["es", "fr"]. Supported: en, zh_cn, ja, ko, pt, pt_br, es, '
-        'es_419, de, fr, it, ru, th. pt_br is Brazilian Portuguese and '
-        'es_419 Latin American Spanish; plain pt and es give unqualified '
-        'Portuguese and Spanish, so pick the regional code when the region '
-        'matters. Omit to get the default ["zh_cn", "es", "fr"].\n'
+        'es_419, de, fr, it, ru, th, ar, tr, vi, id. pt_br is Brazilian '
+        'Portuguese and es_419 Latin American Spanish; plain pt and es give '
+        'unqualified Portuguese and Spanish, so pick the regional code when '
+        'the region matters. ar is likewise unqualified Arabic, not a '
+        'country dialect. Omit to get the default ["zh_cn", "es", "fr"].\n'
         "    ducking (bool, optional): Duck the background music/effects "
         "bed under the dubbed voice while it speaks. Off by default: the "
         "bed is always kept, at a constant level unless this is true. "

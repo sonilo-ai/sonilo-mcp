@@ -58,3 +58,82 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true
+
+  # Lives here, and not in a workflow of its own, because the MCP Registry
+  # refuses a server whose declared PyPI version it cannot find:
+  #
+  #   registry validation failed for package 0 (sonilo-mcp): PyPI package
+  #   'sonilo-mcp' exists, but version 'X' was not found (status: 404)
+  #
+  # It used to be publish-mcp.yml, triggered by the same tag push as this
+  # workflow. Two workflow files cannot express an ordering — `needs:` is
+  # intra-workflow only — so GitHub started both at once, and the registry
+  # job, which runs no tests, reached the registry in ~6 seconds while this
+  # workflow was still running pytest. PyPI did not receive the upload until
+  # ~60 seconds in. The registry never won that race: every release from
+  # v0.18.0 through v0.20.2 failed on attempt 1 and was rescued by a manual
+  # re-run, which made a deterministic ordering bug look like flakiness.
+  #
+  # `needs:` fixes the ordering. The wait loop below fixes what `needs:`
+  # alone cannot: gh-action-pypi-publish returning success means the upload
+  # was accepted, not that PyPI's JSON API — the thing the registry actually
+  # queries — is already serving the new version.
+  publish-registry:
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC authentication to the MCP Registry
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      # Pinned, not the runner default: the version read below uses tomllib,
+      # which is 3.11+, and the runner image's default Python has been 3.10
+      # on some ubuntu-latest generations.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # pyproject.toml rather than the tag name: build-and-publish has
+      # already refused to publish unless the two agree, so on the tag path
+      # they are the same string, and this one also holds for a
+      # workflow_dispatch run, where GITHUB_REF_NAME is a branch.
+      - name: Read the version being released
+        id: version
+        run: |
+          V=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "value=$V" >> "$GITHUB_OUTPUT"
+          echo "Releasing $V"
+
+      - name: Wait for PyPI to serve the version
+        run: |
+          V='${{ steps.version.outputs.value }}'
+          URL="https://pypi.org/pypi/sonilo-mcp/$V/json"
+          # 40 x 15s = 10 minutes. Indexing is normally seconds; the ceiling
+          # is here so a PyPI outage fails this job with a clear message
+          # instead of hanging until the workflow's own timeout.
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$URL" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "sonilo-mcp $V is live on PyPI after $((i*15))s"
+              exit 0
+            fi
+            echo "attempt $i: PyPI returned $code, waiting..."
+            sleep 15
+          done
+          echo "::error::sonilo-mcp $V never appeared on PyPI; not publishing to the MCP Registry"
+          exit 1
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Sync server.json version
+        run: |
+          V='${{ steps.version.outputs.value }}'
+          jq --arg v "$V" '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json
+
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server to MCP Registry
+        run: ./mcp-publisher publish

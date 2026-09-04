@@ -1427,9 +1427,9 @@ async def test_check_media_duration_fails_open_on_nul_byte_source(monkeypatch):
     await _check_media_duration("https://e.com/a\x00.mp4")  # must not raise
 
 
-async def test_check_media_duration_sfx_cap_rejects_200s(monkeypatch):
+async def test_check_media_duration_sfx_cap_rejects_over_the_cap(monkeypatch):
     from sonilo_mcp.api import _check_media_duration, _SFX_MAX_VIDEO_DURATION_SECONDS
-    _patch_ffprobe(monkeypatch, duration=200.0)
+    _patch_ffprobe(monkeypatch, duration=500.0)
     with pytest.raises(Exception, match="exceeds the maximum"):
         await _check_media_duration(
             "/tmp/clip.mp4", max_seconds=_SFX_MAX_VIDEO_DURATION_SECONDS
@@ -4259,12 +4259,14 @@ async def test_video_to_sfx_rejects_non_http_url(monkeypatch, output_dir, bad_ur
 
 
 @respx.mock
-async def test_video_to_sfx_rejects_video_over_180s(monkeypatch, output_dir):
+async def test_video_to_sfx_rejects_video_over_the_cap(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     from sonilo_mcp.api import video_to_sfx
-    # 200s passes the music cap (360) but must fail the SFX cap (180).
-    _patch_ffprobe(monkeypatch, duration=200.0)
+    # 500s is past the SFX cap (480). Deliberately also past the music cap
+    # (360), so a regression that reverted this gate to the music constant
+    # would still be caught here.
+    _patch_ffprobe(monkeypatch, duration=500.0)
     submit_route = respx.post("https://api.test.local/v1/video-to-sfx").mock(
         return_value=httpx.Response(202, json={"task_id": "t-should-not-charge"})
     )
@@ -4523,12 +4525,13 @@ async def test_video_to_video_sfx_url_mode_segments_passthrough(monkeypatch, out
 
 
 @respx.mock
-async def test_video_to_video_sfx_rejects_video_over_180s(monkeypatch, output_dir):
+async def test_video_to_video_sfx_rejects_video_over_the_cap(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     from sonilo_mcp.api import video_to_video_sfx
-    # 200s passes the music cap (360) but must fail the SFX/v2v-sfx cap (180).
-    _patch_ffprobe(monkeypatch, duration=200.0)
+    # 500s is past the SFX cap (480), and past the music cap too so a
+    # regression to the music constant would still fail here.
+    _patch_ffprobe(monkeypatch, duration=500.0)
     submit_route = respx.post("https://api.test.local/v1/video-to-video-sfx").mock(
         return_value=httpx.Response(202, json={"task_id": "t-should-not-charge"})
     )
@@ -6714,3 +6717,59 @@ async def test_get_sfx_task_recovers_an_analysis_task(monkeypatch, output_dir):
         "cinematic strings, 90bpm", "lo-fi hip hop, warm keys",
     ]
     assert list(output_dir.iterdir()) == []
+
+
+def test_sfx_and_sound_caps_match_the_backend():
+    """These two gate locally, BEFORE any request leaves the machine, so a
+    stale constant refuses a video the API would have accepted and the caller
+    cannot appeal a rejection that never reached us. The backend raised both
+    from 180 to 480 sec (api-dashboard PR #328)."""
+    from sonilo_mcp import api
+    assert api._SFX_MAX_VIDEO_DURATION_SECONDS == 480
+    assert api._SOUND_MAX_VIDEO_DURATION_SECONDS == 480
+
+
+def test_documented_sfx_and_sound_caps_match_the_code():
+    """Same drift risk the dubbing guard covers: an agent reads the README row
+    or the context7 sentence and refuses a video rather than sending it."""
+    from pathlib import Path
+    from sonilo_mcp import api
+
+    cap = api._SFX_MAX_VIDEO_DURATION_SECONDS
+    assert api._SOUND_MAX_VIDEO_DURATION_SECONDS == cap
+    root = Path(__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    context7 = (root / "context7.json").read_text(encoding="utf-8")
+
+    for tool in (
+        "video_to_sfx(", "video_to_video_sfx(",
+        "video_to_sound(", "video_to_video_sound(",
+    ):
+        line = next(
+            l for l in readme.splitlines() if l.startswith(f"| `{tool}")
+        )
+        assert f"{cap}s" in line, line
+    assert f"{cap}s for video_to_sfx" in context7
+
+
+async def test_tool_descriptions_state_each_cap_as_enforced():
+    """The description is what an agent reads before deciding whether to even
+    try, so it drifting from the enforced constant is a real failure mode:
+    dubbing's said 180 sec while its own constant enforced 300, and an agent
+    reading it would trim a 4-minute video for no reason.
+
+    Read off the FastMCP registry, not the function — @mcp.tool keeps the
+    description on the registered tool, not as an attribute of the callable."""
+    from sonilo_mcp import api
+
+    expected = {
+        "video_to_sfx": api._SFX_MAX_VIDEO_DURATION_SECONDS,
+        "video_to_video_sfx": api._SFX_MAX_VIDEO_DURATION_SECONDS,
+        "video_to_sound": api._SOUND_MAX_VIDEO_DURATION_SECONDS,
+        "video_to_video_sound": api._SOUND_MAX_VIDEO_DURATION_SECONDS,
+        "dubbing": api._DUBBING_MAX_VIDEO_DURATION_SECONDS,
+    }
+    by_name = {t.name: (t.description or "") for t in await api.mcp.list_tools()}
+    for name, cap in expected.items():
+        assert name in by_name, name
+        assert f"Maximum video duration is {cap} seconds" in by_name[name], name

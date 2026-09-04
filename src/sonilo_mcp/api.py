@@ -325,8 +325,8 @@ def _read_capped(path: Path, max_mb: int, label: str) -> bytes:
 # The backend rejects videos longer than this, so we pre-check locally to fail
 # fast and skip a wasted upload. Keep in sync with the backend's limit.
 _MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — music endpoints
-_SFX_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sfx
-_SOUND_MAX_VIDEO_DURATION_SECONDS = 180  # 3 minutes — /v1/video-to-sound*
+_SFX_MAX_VIDEO_DURATION_SECONDS = 480  # 8 minutes — /v1/video-to-sfx
+_SOUND_MAX_VIDEO_DURATION_SECONDS = 480  # 8 minutes — /v1/video-to-sound*
 _DUCKING_MAX_DURATION_SECONDS = 360  # 6 minutes — /v1/audio-ducking, per input
 _DUBBING_MAX_VIDEO_DURATION_SECONDS = 300  # 5 minutes — /v1/dubbing
 _ANALYSIS_MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — /v1/video-analysis
@@ -2356,8 +2356,8 @@ async def text_to_sfx(
         "    video_path (str, optional): Absolute local path, or relative "
         "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.webm/.m4v/.gif "
         "(gif must be animated). Subject to the account's max upload size "
-        "(typically 300 MB). Maximum video duration is 180 seconds "
-        "(3 minutes).\n"
+        "(typically 300 MB). Maximum video duration is 480 seconds "
+        "(8 minutes).\n"
         "    video_url (str, optional): HTTPS URL to a video file.\n"
         "    prompt (str, optional): Overall description of the desired "
         "sound effects (max 2000 chars).\n"
@@ -2614,8 +2614,8 @@ async def video_to_video_music(
         "    video_path (str, optional): Absolute local path, or relative "
         "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.webm/.m4v/.gif (gif "
         "must be animated). Subject to the account's max upload size "
-        "(typically 300 MB). Maximum video duration is 180 seconds "
-        "(3 minutes).\n"
+        "(typically 300 MB). Maximum video duration is 480 seconds "
+        "(8 minutes).\n"
         "    video_url (str, optional): HTTPS URL to a video file.\n"
         "    prompt (str, optional): Overall description of the desired "
         "sound effects (max 2000 chars).\n"
@@ -2862,8 +2862,8 @@ async def _submit_video_to_sound(
         "    video_path (str, optional): Absolute local path, or relative "
         "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.webm/.m4v/.gif (gif "
         "must be animated). Subject to the account's max upload size "
-        "(typically 300 MB). Maximum video duration is 180 seconds "
-        "(3 minutes).\n"
+        "(typically 300 MB). Maximum video duration is 480 seconds "
+        "(8 minutes).\n"
         "    video_url (str, optional): HTTPS URL to a video file.\n"
         "    music_prompt (str, optional): Style hint for the music bed "
         "(max 2000 chars).\n"
@@ -2949,8 +2949,8 @@ async def video_to_sound(
         "    video_path (str, optional): Absolute local path, or relative "
         "to SONILO_MCP_BASE_PATH. Supports .mp4/.mov/.webm/.m4v/.gif (gif "
         "must be animated). Subject to the account's max upload size "
-        "(typically 300 MB). Maximum video duration is 180 seconds "
-        "(3 minutes).\n"
+        "(typically 300 MB). Maximum video duration is 480 seconds "
+        "(8 minutes).\n"
         "    video_url (str, optional): HTTPS URL to a video file.\n"
         "    music_prompt (str, optional): Style hint for the music bed "
         "(max 2000 chars).\n"

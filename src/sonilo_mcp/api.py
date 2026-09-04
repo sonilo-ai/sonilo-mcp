@@ -3063,6 +3063,15 @@ async def video_to_video_sound(
         "bed under the dubbed voice while it speaks. Off by default: the "
         "bed is always kept, at a constant level unless this is true. "
         "Free.\n"
+        "    lipsync (bool, optional): Whether the speaker's mouth is "
+        "re-rendered to match the dubbed speech. On by default. Set false "
+        "to leave the picture completely untouched instead — the video "
+        "comes back at its original resolution and frame rate rather than "
+        "re-rendered, and only the audio is replaced, so the mouths keep "
+        "moving to the original language. Use it for footage with no "
+        "on-camera speaker, or when preserving the exact original picture "
+        "matters more than matching lip movement. The background bed is "
+        "rebuilt either way, so ducking is unaffected.\n"
         "    output_directory (str, optional): Where to save the results. "
         "Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Exactly one of video_path and video_url must be provided.\n\n"
@@ -3078,6 +3087,7 @@ async def dubbing(
     video_url: str | None = None,
     languages: list[str] | None = None,
     ducking: bool | None = None,
+    lipsync: bool | None = None,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     if (video_path and video_url) or (not video_path and not video_url):
@@ -3112,6 +3122,11 @@ async def dubbing(
     # when unset so the server default applies.
     if ducking is not None:
         form["ducking"] = "true" if ducking else "false"
+    # Default-ON server-side, unlike ducking — the useful direction here is
+    # turning it off. Omitted when unset all the same, so the server keeps
+    # owning the default.
+    if lipsync is not None:
+        form["lipsync"] = "true" if lipsync else "false"
 
     files, extra_form = await _stage_video_input(
         video_path, video_url, cfg["base_path"], _DUBBING_MAX_VIDEO_DURATION_SECONDS

@@ -5952,6 +5952,41 @@ async def test_dubbing_sends_ducking_when_set(monkeypatch, output_dir):
         b"ducking=true" in submit.calls.last.request.content
 
 
+@respx.mock
+async def test_dubbing_sends_lipsync_only_when_set(monkeypatch, output_dir):
+    """The mirror of ducking, with the default the other way up: absent must
+    mean lip sync ON, which is what every dubbing call did before the
+    parameter existed."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-4", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/db-4").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "db-4", "type": "dubbing", "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4"},
+        })
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+
+    await api.dubbing(video_url="https://example.com/clip.mp4", lipsync=False)
+    body = submit.calls.last.request.content
+    assert b'name="lipsync"\r\n\r\nfalse' in body or b"lipsync=false" in body
+
+    await api.dubbing(video_url="https://example.com/clip.mp4")
+    assert b"lipsync" not in submit.calls.last.request.content
+
+
 async def test_dubbing_rejects_both_inputs(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     from sonilo_mcp import api

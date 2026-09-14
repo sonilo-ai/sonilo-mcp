@@ -1869,6 +1869,68 @@ def _analysis_brief(body: dict) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(brief, indent=2))]
 
 
+def _as_number(value: object) -> float | None:
+    """Read a numeric field that may arrive as a string.
+
+    The dubbing pipeline stores its subtitle numbers in DynamoDB, which hands
+    them back as strings on a finished task ("0.6305176995017312"), while the
+    same fields are real numbers on the acceptance response. Returns None for
+    anything that is not a number in either form, so a surprising shape
+    degrades to "not reported" instead of raising on a task already paid for.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _subtitle_export_note(export: object) -> str:
+    """Render one language's subtitle_export entry as short prose, e.g.
+    "blocked, issues: TIMING_DRIFT, report: https://...".
+
+    Carries everything the entry offers — status, alignment loss, issues,
+    error and the report URL — because the caller of a BLOCKED export is told
+    nothing else about why: "blocked" alone gives them no code, no reason and
+    no link to the report they could read.
+
+    Every field is read defensively: these come from the pipeline, and a
+    missing or wrongly-typed one must degrade to "not reported" rather than
+    raise while saving a result that has already been charged.
+
+    Empty when the entry says nothing usable; callers decide what to say
+    instead, since the three of them read differently.
+    """
+    if not isinstance(export, dict):
+        return ""
+    parts: list[str] = []
+    status = export.get("status")
+    if isinstance(status, str) and status:
+        parts.append(status)
+    loss = _as_number(export.get("alignment_loss"))
+    if loss is not None:
+        parts.append(f"alignment loss {loss:.3f}")
+    issues = export.get("issues")
+    if isinstance(issues, (list, tuple)):
+        codes = [str(i) for i in issues if isinstance(i, (str, int, float)) and str(i)]
+        if codes:
+            parts.append("issues: " + ", ".join(codes))
+    elif isinstance(issues, str) and issues:
+        parts.append(f"issues: {issues}")
+    error = export.get("error")
+    if isinstance(error, str) and error.strip():
+        parts.append(f"error: {error.strip()}")
+    report_url = export.get("report_url")
+    if isinstance(report_url, str) and report_url:
+        parts.append(f"report: {report_url}")
+    return ", ".join(parts)
+
+
 async def _save_dubbing_artifacts(
     body: dict,
     output_path: Path,
@@ -1876,7 +1938,8 @@ async def _save_dubbing_artifacts(
     task_id: str,
 ) -> list[TextContent]:
     """Turn a terminal /v1/tasks/{id} body from a dubbing task into saved
-    local files — one `.mp4` per requested language.
+    local files — one `.mp4` per requested language, plus one `.srt` per
+    language when the call asked for re-timed subtitles.
 
     failed/unexpected status -> see _raise_if_task_not_succeeded (shared with
     _save_task_artifacts; that part is envelope-agnostic).
@@ -1884,7 +1947,22 @@ async def _save_dubbing_artifacts(
     succeeded -> download every entry in `outputs`, named
     `{base_name}.{language}.mp4`, in sorted language order so the reported
     order is stable across runs. One TextContent per saved file, each naming
-    its language.
+    its language. EVERY video is downloaded before the first subtitle: a
+    subtitle is never worth losing a video over, and interleaving them means
+    one bad script URL strands the languages queued behind it — including
+    through get_sfx_task, which re-enters here and would hit the same URL.
+
+    Then every `subtitles` entry (export_srt was on) is saved next to its
+    video as `{base_name}.{language}.srt`, reported with that language's
+    export status, alignment loss and — when the export was blocked — its
+    issue codes and report URL. Iterated over the subtitle map itself, not
+    over the videos, so a script for a language whose video URL came back
+    blank is still delivered rather than silently dropped.
+
+    NOTHING about a subtitle raises: a blocked export, a language the
+    pipeline exported no file for, and a failed script download are all
+    notes. The videos were produced and charged; raising over a missing
+    script would strand them.
 
     Languages are saved sequentially rather than concurrently: _artifact_dest
     reserves each name with an exclusive create, and a serial loop keeps the
@@ -1916,12 +1994,31 @@ async def _save_dubbing_artifacts(
             f"{task_id}."
         )
 
+    subs = body.get("subtitles")
+    subtitle_urls = (
+        {
+            language: url
+            for language, url in subs.items()
+            if isinstance(url, str) and url
+        }
+        if isinstance(subs, dict)
+        else {}
+    )
+    exports = body.get("subtitle_export")
+    exports = exports if isinstance(exports, dict) else {}
+
     saved: list[TextContent] = []
     saved_paths: list[Path] = []
+
+    async def fetch(url: str, language: str, ext: str) -> Path:
+        dest = _artifact_dest(output_path, f"{base_name}.{language}", ext)
+        await _download_artifact(url, dest)
+        saved_paths.append(dest)
+        return dest
+
     for language in sorted(valid):
         try:
-            dest = _artifact_dest(output_path, f"{base_name}.{language}", ".mp4")
-            await _download_artifact(valid[language], dest)
+            dest = await fetch(valid[language], language, ".mp4")
         except Exception as e:
             already = (
                 " Already saved: " + ", ".join(str(p) for p in saved_paths) + "."
@@ -1933,9 +2030,45 @@ async def _save_dubbing_artifacts(
                 f"on the backend — task id: {task_id}. Call "
                 f'get_sfx_task("{task_id}") to retry the download.{already}'
             ) from e
-        saved_paths.append(dest)
         saved.append(TextContent(
             type="text", text=f"Success ({language}). File saved as: {dest}",
+        ))
+
+    # Videos are all on disk by now, so every branch below can afford to be a
+    # note. Union of the two maps: a language may have a script without an
+    # export entry, or an export entry (blocked) without a script.
+    for language in sorted(set(subtitle_urls) | set(exports)):
+        note = _subtitle_export_note(exports.get(language))
+        srt_url = subtitle_urls.get(language)
+        if not srt_url:
+            saved.append(TextContent(
+                type="text",
+                text=(
+                    f"Note ({language}): no subtitle file was returned — "
+                    f"{note or 'no status reported'}. The dubbed video is "
+                    "unaffected."
+                ),
+            ))
+            continue
+        try:
+            srt_dest = await fetch(srt_url, language, ".srt")
+        except Exception as e:
+            saved.append(TextContent(
+                type="text",
+                text=(
+                    f"Note ({language}): the subtitle file could not be "
+                    f"downloaded. {_end_sentence(e)} The dubbed video is "
+                    f'unaffected; call get_sfx_task("{task_id}") to retry '
+                    "the download."
+                ),
+            ))
+            continue
+        saved.append(TextContent(
+            type="text",
+            text=(
+                f"Success ({language} subtitles"
+                f"{', ' + note if note else ''}). File saved as: {srt_dest}"
+            ),
         ))
 
     dropped = sorted(set(outputs) - set(valid)) if isinstance(outputs, dict) else []
@@ -2749,6 +2882,70 @@ async def _stage_video_input(
     return None, {"video_url": video_url}
 
 
+_SUBTITLE_EXTS = frozenset({".srt", ".vtt"})
+
+
+async def _stage_subtitles(
+    subtitles: dict[str, str],
+    base_path: str | None,
+) -> tuple[dict, dict[str, str]]:
+    """Turn {language: script} into the multipart parts /v1/dubbing parses.
+
+    Returns `(files, form_fields)`, both keyed `subtitles[<language>]` — the
+    bracketed field name the backend requires. A value starting with
+    `https://` rides as a text field; anything else is a local path, read and
+    uploaded as a file part. That split is unambiguous (a real path cannot
+    start with `https://`) and matches how `video` already accepts a path.
+
+    This server runs on the caller's own machine and already uploads their
+    video, so a path is the natural way to hand over a script — unlike the
+    hosted server, which can only take URLs.
+
+    Only the two checks the server cannot make on the caller's behalf happen
+    here: the suffix (a `.txt` script is a guaranteed 422 after an upload)
+    and, via _resolve_input_file, that the file exists inside the allowed
+    base directory. The language set, the supported codes and the per-file
+    size cap are all the server's to enforce — a copy here would reject a
+    language added later, or drift from the cap.
+
+    The READ is still bounded, by the account's own upload cap via
+    _read_capped, exactly as the video is: not a second copy of the server's
+    per-script limit, just the refusal to pull an unbounded file into this
+    process because somebody renamed it `.srt`. The cap is fetched lazily, so
+    a caller passing only https scripts never pays for the extra request.
+    """
+    files: dict = {}
+    form: dict[str, str] = {}
+    max_mb: int | None = None
+    for language, value in subtitles.items():
+        field = f"subtitles[{language}]"
+        if not isinstance(value, str) or not value.strip():
+            raise Exception(
+                f"{field} must be an https:// URL or a path to a local "
+                ".srt/.vtt file"
+            )
+        if value.lower().startswith("https://"):
+            form[field] = value
+            continue
+        # Checked before _resolve_input_file so a wrongly-typed script is
+        # named as such, rather than reported as a missing file when the
+        # caller also got the path wrong.
+        if Path(os.path.expanduser(value)).suffix.lower() not in _SUBTITLE_EXTS:
+            raise Exception(
+                f"Subtitle file ({value}) must be a .srt or .vtt file"
+            )
+        resolved = _resolve_input_file(value, base_path, _SUBTITLE_EXTS, "subtitle")
+        if max_mb is None:
+            max_mb = await _get_max_upload_size_mb()
+        mime, _ = mimetypes.guess_type(resolved.name)
+        files[field] = (
+            resolved.name,
+            _read_capped(resolved, max_mb, "Subtitle"),
+            mime or "application/octet-stream",
+        )
+    return files, form
+
+
 async def _submit_video_to_sound(
     *,
     path: str,
@@ -3072,14 +3269,31 @@ async def video_to_video_sound(
         "on-camera speaker, or when preserving the exact original picture "
         "matters more than matching lip movement. The background bed is "
         "rebuilt either way, so ducking is unaffected.\n"
+        "    subtitles (dict, optional): One script per target language, "
+        'e.g. {"es": "/path/es.srt", "fr": "https://example.com/fr.vtt"}. '
+        "Each value is either a local .srt/.vtt path (absolute, or relative "
+        "to SONILO_MCP_BASE_PATH) or an https URL. These are "
+        "TARGET-language scripts carrying the lines to be spoken in that "
+        "language — not a transcript of the source — and they replace the "
+        "pipeline's own translation. The keys must match the languages "
+        "being dubbed exactly; the backend rejects a missing or extra "
+        "one.\n"
+        "    export_srt (bool, optional): After the dub, align each "
+        "language's final audio against its script and also return a "
+        "re-timed .srt keeping those lines verbatim. Requires subtitles. "
+        "Off by default.\n"
         "    output_directory (str, optional): Where to save the results. "
         "Defaults to SONILO_MCP_BASE_PATH.\n\n"
         "Exactly one of video_path and video_url must be provided.\n\n"
         "Returns:\n"
         "    One TextContent per saved file, named "
-        "dubbing-<first 8 chars of the task id>.<language>.mp4. On timeout "
-        "the error message includes the task_id — recover with "
-        "get_sfx_task."
+        "dubbing-<first 8 chars of the task id>.<language>.mp4, plus "
+        "dubbing-<first 8 chars of the task id>.<language>.srt when "
+        "export_srt was used — each reported with that language's export "
+        "status and alignment loss. A language whose export was blocked "
+        "still gets its dubbed video and is reported as a note, not a "
+        "failure. On timeout the error message includes the task_id — "
+        "recover with get_sfx_task."
     )
 )
 async def dubbing(
@@ -3088,11 +3302,24 @@ async def dubbing(
     languages: list[str] | None = None,
     ducking: bool | None = None,
     lipsync: bool | None = None,
+    subtitles: dict[str, str] | None = None,
+    export_srt: bool | None = None,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     if (video_path and video_url) or (not video_path and not video_url):
         raise Exception(
             "Provide either video_path or video_url (exactly one, not both)"
+        )
+
+    if export_srt and not subtitles:
+        # A guaranteed 422 — the backend has nothing to align the audio
+        # against — so refuse it here rather than after the upload. Only the
+        # TRUE case: export_srt=false without scripts is an ordinary dub, and
+        # an agent that fills in every parameter explicitly sends exactly
+        # that.
+        raise Exception(
+            "export_srt requires subtitles: pass one script per target "
+            "language, or drop export_srt."
         )
 
     if video_url:
@@ -3127,11 +3354,24 @@ async def dubbing(
     # owning the default.
     if lipsync is not None:
         form["lipsync"] = "true" if lipsync else "false"
+    if export_srt is not None:
+        form["export_srt"] = "true" if export_srt else "false"
+
+    # Staged before the video: it is the cheap check of the two, so a bad
+    # script path fails without first reading a few hundred MB of video.
+    subtitle_files, subtitle_form = (
+        await _stage_subtitles(subtitles, cfg["base_path"])
+        if subtitles
+        else ({}, {})
+    )
+    form.update(subtitle_form)
 
     files, extra_form = await _stage_video_input(
         video_path, video_url, cfg["base_path"], _DUBBING_MAX_VIDEO_DURATION_SECONDS
     )
     form.update(extra_form)
+    if subtitle_files:
+        files = {**(files or {}), **subtitle_files}
     task_id = await _post_task_submit("/v1/dubbing", data=form, files=files)
 
     # TIME_OUT_SECONDS defaults to 600 (10 min), but the dubbing backend polls

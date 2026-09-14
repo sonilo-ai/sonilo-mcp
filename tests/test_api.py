@@ -5806,6 +5806,105 @@ async def test_save_dubbing_artifacts_raises_when_outputs_is_empty(tmp_path):
     assert "db-1" in str(exc.value)
 
 
+@respx.mock
+async def test_save_dubbing_artifacts_saves_the_exported_srts(tmp_path):
+    """export_srt adds one .srt per language, named to match the video it
+    belongs to. The pipeline returns its numbers as STRINGS on a finished
+    task, so alignment_loss arrives as "0.6305176995017312" and must still be
+    reported rather than crashing a save of videos already paid for."""
+    from sonilo_mcp import api
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/fr.mp4").mock(
+        return_value=httpx.Response(200, content=b"fr-bytes")
+    )
+    respx.get("https://r2.test/es.srt").mock(
+        return_value=httpx.Response(200, content=b"es-cues")
+    )
+    respx.get("https://r2.test/fr.srt").mock(
+        return_value=httpx.Response(200, content=b"fr-cues")
+    )
+    result = await api._save_dubbing_artifacts(
+        {
+            **DUBBING_BODY,
+            "subtitles": {
+                "es": "https://r2.test/es.srt",
+                "fr": "https://r2.test/fr.srt",
+            },
+            "subtitle_export": {
+                "es": {"status": "exported", "alignment_loss": 0.42},
+                # A string, as the finished task hands it back.
+                "fr": {
+                    "status": "exported_review_required",
+                    "alignment_loss": "0.6305176995017312",
+                },
+            },
+        },
+        tmp_path,
+        "dubbing-db-1",
+        "db-1",
+    )
+    assert (tmp_path / "dubbing-db-1.es.srt").read_bytes() == b"es-cues"
+    assert (tmp_path / "dubbing-db-1.fr.srt").read_bytes() == b"fr-cues"
+    # Video then subtitles, per language, in sorted language order.
+    assert len(result) == 4
+    assert "dubbing-db-1.es.mp4" in result[0].text
+    assert "dubbing-db-1.es.srt" in result[1].text
+    assert "exported" in result[1].text
+    assert "alignment loss 0.420" in result[1].text
+    assert "dubbing-db-1.fr.srt" in result[3].text
+    assert "alignment loss 0.631" in result[3].text
+
+
+@respx.mock
+async def test_save_dubbing_artifacts_reports_a_blocked_export_as_a_note(tmp_path):
+    """A blocked export is not a failed task: the dubbed video is delivered
+    and charged, and only that language's script is missing."""
+    from sonilo_mcp import api
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/fr.mp4").mock(
+        return_value=httpx.Response(200, content=b"fr-bytes")
+    )
+    respx.get("https://r2.test/es.srt").mock(
+        return_value=httpx.Response(200, content=b"es-cues")
+    )
+    result = await api._save_dubbing_artifacts(
+        {
+            **DUBBING_BODY,
+            "subtitles": {"es": "https://r2.test/es.srt"},
+            "subtitle_export": {
+                "es": {"status": "exported", "alignment_loss": "0.1"},
+                "fr": {"status": "blocked", "issues": ["ALIGNMENT_FAILED"]},
+            },
+        },
+        tmp_path,
+        "dubbing-db-1",
+        "db-1",
+    )
+    assert (tmp_path / "dubbing-db-1.fr.mp4").read_bytes() == b"fr-bytes"
+    assert not (tmp_path / "dubbing-db-1.fr.srt").exists()
+    note = result[3].text
+    assert note.startswith("Note (fr)")
+    assert "blocked" in note
+    assert "unaffected" in note
+
+
+async def test_as_number_tolerates_both_wire_shapes():
+    """The acceptance response carries real numbers, the finished task the
+    same fields as strings. Anything else must degrade to "not reported"
+    instead of raising on a result the caller has already paid for."""
+    from sonilo_mcp import api
+    assert api._as_number(0.42) == 0.42
+    assert api._as_number("0.6305176995017312") == 0.6305176995017312
+    assert api._as_number("5") == 5.0
+    assert api._as_number(None) is None
+    assert api._as_number("n/a") is None
+    assert api._as_number(True) is None
+
+
 async def test_stage_video_input_returns_form_fields_for_a_url(monkeypatch, tmp_path):
     from sonilo_mcp import api
     _patch_ffprobe(monkeypatch, duration=60.0)
@@ -5950,6 +6049,161 @@ async def test_dubbing_sends_ducking_when_set(monkeypatch, output_dir):
     await api.dubbing(video_url="https://example.com/clip.mp4", ducking=True)
     assert b'name="ducking"\r\n\r\ntrue' in submit.calls.last.request.content or \
         b"ducking=true" in submit.calls.last.request.content
+
+
+def test_stage_subtitles_sends_an_https_value_as_a_form_field(tmp_path):
+    """An https script is a text field; nothing is read from disk for it."""
+    from sonilo_mcp import api
+    files, form = api._stage_subtitles(
+        {"es": "https://example.com/es.srt"}, str(tmp_path)
+    )
+    assert files == {}
+    assert form == {"subtitles[es]": "https://example.com/es.srt"}
+
+
+def test_stage_subtitles_uploads_a_local_path_as_a_file_part(tmp_path):
+    """Anything that is not an https URL is a local path — this server runs
+    on the caller's own machine and already uploads their video, so a script
+    path is uploaded the same way. The field name is bracketed either way."""
+    from sonilo_mcp import api
+    script = tmp_path / "es.srt"
+    script.write_bytes(b"1\n00:00:00,000 --> 00:00:01,000\nhola\n")
+    files, form = api._stage_subtitles({"es": "es.srt"}, str(tmp_path))
+    assert form == {}
+    assert files["subtitles[es]"][0] == "es.srt"
+    assert files["subtitles[es]"][1] == script.read_bytes()
+
+
+def test_stage_subtitles_rejects_a_non_subtitle_suffix(tmp_path):
+    """A .txt script is a guaranteed 422 after a full video upload, so it is
+    refused here — and named, even when the file exists."""
+    from sonilo_mcp import api
+    (tmp_path / "es.txt").write_text("hola")
+    with pytest.raises(Exception, match=r"\.srt or \.vtt"):
+        api._stage_subtitles({"es": "es.txt"}, str(tmp_path))
+    with pytest.raises(Exception, match="es.txt"):
+        api._stage_subtitles({"es": "es.txt"}, str(tmp_path))
+
+
+def test_stage_subtitles_does_not_check_the_language_codes(tmp_path):
+    """The backend owns the supported list and the languages-must-match rule;
+    a copy here would reject a language added later, or a caller relying on
+    the server's own default language set."""
+    from sonilo_mcp import api
+    _, form = api._stage_subtitles(
+        {"xx_yy": "https://example.com/xx.vtt"}, str(tmp_path)
+    )
+    assert form == {"subtitles[xx_yy]": "https://example.com/xx.vtt"}
+
+
+@respx.mock
+async def test_dubbing_sends_subtitle_parts_and_export_srt(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    (output_dir / "es.srt").write_bytes(b"es-script")
+    submit = respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-5", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/db-5").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "db-5", "type": "dubbing", "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4"},
+            "subtitles": {"es": "https://r2.test/es.srt"},
+            "subtitle_export": {
+                "es": {"status": "exported", "alignment_loss": "0.25"},
+            },
+        })
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/es.srt").mock(
+        return_value=httpx.Response(200, content=b"es-cues")
+    )
+    result = await api.dubbing(
+        video_url="https://example.com/clip.mp4",
+        languages=["es", "fr"],
+        subtitles={"es": "es.srt", "fr": "https://example.com/fr.vtt"},
+        export_srt=True,
+    )
+    sent = submit.calls.last.request.content
+    # The local path rides as a file part, the https value as a text field —
+    # both under the bracketed field name the backend parses.
+    assert b'name="subtitles[es]"; filename="es.srt"' in sent
+    assert b"es-script" in sent
+    assert b'name="subtitles[fr]"\r\n\r\nhttps://example.com/fr.vtt' in sent
+    assert b'name="export_srt"\r\n\r\ntrue' in sent
+    assert (output_dir / "dubbing-db-5.es.srt").read_bytes() == b"es-cues"
+    assert "alignment loss 0.250" in result[1].text
+
+
+@respx.mock
+async def test_dubbing_sends_lipsync_only_when_set(monkeypatch, output_dir):
+    """lipsync defaults to ON — the behaviour every dubbing task had before
+    the parameter existed — so an unset value must not reach the wire as
+    false."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-6", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/db-6").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "db-6", "type": "dubbing", "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4"},
+        })
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    await api.dubbing(video_url="https://example.com/clip.mp4")
+    assert b"lipsync" not in submit.calls.last.request.content
+    assert b"export_srt" not in submit.calls.last.request.content
+    assert b"subtitles" not in submit.calls.last.request.content
+
+    await api.dubbing(video_url="https://example.com/clip.mp4", lipsync=False)
+    assert b"lipsync=false" in submit.calls.last.request.content
+
+
+async def test_dubbing_rejects_export_srt_without_subtitles(monkeypatch, output_dir):
+    """A guaranteed 422 — there is nothing to align against — so it never
+    leaves the machine."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp import api
+    with pytest.raises(Exception, match="export_srt"):
+        await api.dubbing(
+            video_url="https://example.com/clip.mp4", export_srt=True
+        )
+
+
+async def test_dubbing_description_documents_the_subtitle_parameters():
+    """Read off the FastMCP registry, not the function — @mcp.tool keeps the
+    description on the registered tool, not as an attribute of the callable.
+    An agent that cannot see these parameters will never offer them."""
+    from sonilo_mcp import api
+
+    desc = {t.name: (t.description or "") for t in await api.mcp.list_tools()}["dubbing"]
+    assert "subtitles (dict, optional)" in desc
+    assert "export_srt (bool, optional)" in desc
+    assert "lipsync (bool, optional)" in desc
+    # The scripts are target-language, and lipsync's default must be stated:
+    # both are what an agent would otherwise guess wrong.
+    assert "TARGET-language" in desc
+    assert "ON by default" in desc
 
 
 async def test_dubbing_rejects_both_inputs(monkeypatch, output_dir):

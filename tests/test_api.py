@@ -5847,14 +5847,87 @@ async def test_save_dubbing_artifacts_saves_the_exported_srts(tmp_path):
     )
     assert (tmp_path / "dubbing-db-1.es.srt").read_bytes() == b"es-cues"
     assert (tmp_path / "dubbing-db-1.fr.srt").read_bytes() == b"fr-cues"
-    # Video then subtitles, per language, in sorted language order.
+    # Every video first, then the subtitles — both in sorted language order.
     assert len(result) == 4
     assert "dubbing-db-1.es.mp4" in result[0].text
-    assert "dubbing-db-1.es.srt" in result[1].text
-    assert "exported" in result[1].text
-    assert "alignment loss 0.420" in result[1].text
+    assert "dubbing-db-1.fr.mp4" in result[1].text
+    assert "dubbing-db-1.es.srt" in result[2].text
+    assert "exported" in result[2].text
+    assert "alignment loss 0.420" in result[2].text
     assert "dubbing-db-1.fr.srt" in result[3].text
     assert "alignment loss 0.631" in result[3].text
+
+
+@respx.mock
+async def test_save_dubbing_artifacts_downloads_every_video_before_any_srt(tmp_path):
+    """A bad script URL must not cost the caller a video. Interleaved, a 500
+    on the first language's .srt abandons the second language's .mp4 — and
+    the advertised recovery (get_sfx_task) re-enters this function and dies
+    at the same URL, so a delivered, charged video would be unreachable for
+    as long as that one script URL stays broken."""
+    from sonilo_mcp import api
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/fr.mp4").mock(
+        return_value=httpx.Response(200, content=b"fr-bytes")
+    )
+    respx.get("https://r2.test/es.srt").mock(return_value=httpx.Response(500))
+    respx.get("https://r2.test/fr.srt").mock(
+        return_value=httpx.Response(200, content=b"fr-cues")
+    )
+    result = await api._save_dubbing_artifacts(
+        {
+            **DUBBING_BODY,
+            "subtitles": {
+                "es": "https://r2.test/es.srt",
+                "fr": "https://r2.test/fr.srt",
+            },
+        },
+        tmp_path,
+        "dubbing-db-1",
+        "db-1",
+    )
+    # Both videos, and the one good script, are on disk.
+    assert (tmp_path / "dubbing-db-1.es.mp4").read_bytes() == b"es-bytes"
+    assert (tmp_path / "dubbing-db-1.fr.mp4").read_bytes() == b"fr-bytes"
+    assert (tmp_path / "dubbing-db-1.fr.srt").read_bytes() == b"fr-cues"
+    assert not (tmp_path / "dubbing-db-1.es.srt").exists()
+    assert len(result) == 4
+    failed = result[2].text
+    assert failed.startswith("Note (es)")
+    assert "unaffected" in failed
+    assert "db-1" in failed
+
+
+@respx.mock
+async def test_save_dubbing_artifacts_saves_an_srt_for_a_language_with_no_video(tmp_path):
+    """The script exists and was paid for, so it is delivered even though
+    that language's video URL came back blank — iterating the subtitle map
+    rather than the video map is what makes that possible."""
+    from sonilo_mcp import api
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    respx.get("https://r2.test/fr.srt").mock(
+        return_value=httpx.Response(200, content=b"fr-cues")
+    )
+    result = await api._save_dubbing_artifacts(
+        {
+            "task_id": "db-1",
+            "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4", "fr": ""},
+            "subtitles": {"fr": "https://r2.test/fr.srt"},
+        },
+        tmp_path,
+        "dubbing-db-1",
+        "db-1",
+    )
+    assert (tmp_path / "dubbing-db-1.fr.srt").read_bytes() == b"fr-cues"
+    # The missing-video warning still fires, and is last.
+    assert len(result) == 3
+    assert "dubbing-db-1.fr.srt" in result[1].text
+    assert result[2].text.startswith("Warning")
 
 
 @respx.mock
@@ -5877,7 +5950,11 @@ async def test_save_dubbing_artifacts_reports_a_blocked_export_as_a_note(tmp_pat
             "subtitles": {"es": "https://r2.test/es.srt"},
             "subtitle_export": {
                 "es": {"status": "exported", "alignment_loss": "0.1"},
-                "fr": {"status": "blocked", "issues": ["ALIGNMENT_FAILED"]},
+                "fr": {
+                    "status": "blocked",
+                    "issues": ["ALIGNMENT_FAILED"],
+                    "report_url": "https://r2.test/fr-report.json",
+                },
             },
         },
         tmp_path,
@@ -5890,6 +5967,9 @@ async def test_save_dubbing_artifacts_reports_a_blocked_export_as_a_note(tmp_pat
     assert note.startswith("Note (fr)")
     assert "blocked" in note
     assert "unaffected" in note
+    # "blocked" alone leaves the user with no reason and nothing to read.
+    assert "ALIGNMENT_FAILED" in note
+    assert "https://r2.test/fr-report.json" in note
 
 
 async def test_as_number_tolerates_both_wire_shapes():
@@ -5903,6 +5983,39 @@ async def test_as_number_tolerates_both_wire_shapes():
     assert api._as_number(None) is None
     assert api._as_number("n/a") is None
     assert api._as_number(True) is None
+
+
+def test_subtitle_export_note_carries_every_field_it_is_given():
+    """status, alignment loss, issues, error and the report link — a blocked
+    export is the one case where the user has nothing else to go on."""
+    from sonilo_mcp import api
+    note = api._subtitle_export_note({
+        "status": "blocked",
+        "alignment_loss": "1.66",
+        "issues": ["LOSS_TOO_HIGH", "SHORT_CUES"],
+        "error": "alignment did not converge",
+        "report_url": "https://r2.test/report.json",
+    })
+    assert "blocked" in note
+    assert "alignment loss 1.660" in note
+    assert "LOSS_TOO_HIGH" in note and "SHORT_CUES" in note
+    assert "alignment did not converge" in note
+    assert "https://r2.test/report.json" in note
+
+
+def test_subtitle_export_note_survives_junk_fields():
+    """These come off the wire: a wrongly-typed field must drop out of the
+    note, never raise while saving a result already charged for."""
+    from sonilo_mcp import api
+    assert api._subtitle_export_note(None) == ""
+    assert api._subtitle_export_note({}) == ""
+    assert api._subtitle_export_note(
+        {"status": 7, "alignment_loss": "n/a", "issues": {"a": 1},
+         "error": "", "report_url": 3}
+    ) == ""
+    assert api._subtitle_export_note({"issues": "LOSS_TOO_HIGH"}) == (
+        "issues: LOSS_TOO_HIGH"
+    )
 
 
 async def test_stage_video_input_returns_form_fields_for_a_url(monkeypatch, tmp_path):
@@ -6051,49 +6164,125 @@ async def test_dubbing_sends_ducking_when_set(monkeypatch, output_dir):
         b"ducking=true" in submit.calls.last.request.content
 
 
-def test_stage_subtitles_sends_an_https_value_as_a_form_field(tmp_path):
-    """An https script is a text field; nothing is read from disk for it."""
+def _mock_upload_cap(api, mb: int = 300) -> None:
+    """Wire up the cached /v1/account/services read that backs
+    _get_max_upload_size_mb — the established pattern for anything that
+    uploads a local file (see test_video_to_sfx_path_mode_uploads_multipart).
+    """
+    respx.get("https://api.test.local/v1/account/services").mock(
+        return_value=httpx.Response(200, json={"max_upload_size_mb": mb})
+    )
+    api._reset_services_cache()
+
+
+async def test_stage_subtitles_sends_an_https_value_as_a_form_field(tmp_path):
+    """An https script is a text field; nothing is read from disk for it —
+    and no upload cap is fetched, since nothing is being uploaded."""
     from sonilo_mcp import api
-    files, form = api._stage_subtitles(
+    files, form = await api._stage_subtitles(
         {"es": "https://example.com/es.srt"}, str(tmp_path)
     )
     assert files == {}
     assert form == {"subtitles[es]": "https://example.com/es.srt"}
 
 
-def test_stage_subtitles_uploads_a_local_path_as_a_file_part(tmp_path):
+@respx.mock
+async def test_stage_subtitles_uploads_a_local_path_as_a_file_part(
+    monkeypatch, tmp_path
+):
     """Anything that is not an https URL is a local path — this server runs
     on the caller's own machine and already uploads their video, so a script
     path is uploaded the same way. The field name is bracketed either way."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     from sonilo_mcp import api
+    _mock_upload_cap(api)
     script = tmp_path / "es.srt"
     script.write_bytes(b"1\n00:00:00,000 --> 00:00:01,000\nhola\n")
-    files, form = api._stage_subtitles({"es": "es.srt"}, str(tmp_path))
+    files, form = await api._stage_subtitles({"es": "es.srt"}, str(tmp_path))
     assert form == {}
     assert files["subtitles[es]"][0] == "es.srt"
     assert files["subtitles[es]"][1] == script.read_bytes()
 
 
-def test_stage_subtitles_rejects_a_non_subtitle_suffix(tmp_path):
+@respx.mock
+async def test_stage_subtitles_bounds_the_read_at_the_account_cap(
+    monkeypatch, tmp_path
+):
+    """Not a copy of the server's own per-script limit — just the refusal to
+    pull an unbounded file into memory (and up the wire) because somebody
+    renamed it .srt. _read_capped is the single copy of that rule, and every
+    tool that uploads a local file goes through it."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _mock_upload_cap(api, mb=1)
+    (tmp_path / "es.srt").write_bytes(b"x" * (1024 * 1024 + 1))
+    with pytest.raises(Exception, match="too large"):
+        await api._stage_subtitles({"es": "es.srt"}, str(tmp_path))
+
+
+async def test_stage_subtitles_rejects_a_non_subtitle_suffix(tmp_path):
     """A .txt script is a guaranteed 422 after a full video upload, so it is
     refused here — and named, even when the file exists."""
     from sonilo_mcp import api
     (tmp_path / "es.txt").write_text("hola")
     with pytest.raises(Exception, match=r"\.srt or \.vtt"):
-        api._stage_subtitles({"es": "es.txt"}, str(tmp_path))
+        await api._stage_subtitles({"es": "es.txt"}, str(tmp_path))
     with pytest.raises(Exception, match="es.txt"):
-        api._stage_subtitles({"es": "es.txt"}, str(tmp_path))
+        await api._stage_subtitles({"es": "es.txt"}, str(tmp_path))
 
 
-def test_stage_subtitles_does_not_check_the_language_codes(tmp_path):
+async def test_stage_subtitles_does_not_check_the_language_codes(tmp_path):
     """The backend owns the supported list and the languages-must-match rule;
     a copy here would reject a language added later, or a caller relying on
     the server's own default language set."""
     from sonilo_mcp import api
-    _, form = api._stage_subtitles(
+    _, form = await api._stage_subtitles(
         {"xx_yy": "https://example.com/xx.vtt"}, str(tmp_path)
     )
     assert form == {"subtitles[xx_yy]": "https://example.com/xx.vtt"}
+
+
+async def test_stage_subtitles_refuses_a_path_outside_the_base_directory(tmp_path):
+    """A script path is the one new surface here that reads the user's own
+    files, so it is confined like every other input: SONILO_MCP_BASE_PATH is
+    the boundary, and neither ../ nor a symlink pointing out of it escapes
+    (_is_within_base resolves both sides before comparing)."""
+    from sonilo_mcp import api
+    base = tmp_path / "base"
+    base.mkdir()
+    secret = tmp_path / "secret.srt"
+    secret.write_text("private")
+
+    # Traversal: an existing file reached by climbing out of the base.
+    with pytest.raises(Exception, match="outside the allowed base"):
+        await api._stage_subtitles({"es": "../secret.srt"}, str(base))
+    with pytest.raises(Exception, match="outside the allowed base"):
+        await api._stage_subtitles({"es": str(secret)}, str(base))
+
+    # Symlink: a link INSIDE the base pointing at the same file outside it.
+    link = base / "link.srt"
+    link.symlink_to(secret)
+    with pytest.raises(Exception, match="outside the allowed base"):
+        await api._stage_subtitles({"es": "link.srt"}, str(base))
+
+
+@respx.mock
+async def test_stage_subtitles_honours_the_any_path_optout(monkeypatch, tmp_path):
+    """The same documented escape hatch every other input has — otherwise a
+    subtitle would be confined more tightly than the video it belongs to."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    monkeypatch.setenv("SONILO_MCP_ALLOW_ANY_PATH", "true")
+    from sonilo_mcp import api
+    _mock_upload_cap(api)
+    base = tmp_path / "base"
+    base.mkdir()
+    outside = tmp_path / "es.srt"
+    outside.write_bytes(b"cues")
+    files, _ = await api._stage_subtitles({"es": str(outside)}, str(base))
+    assert files["subtitles[es]"][1] == b"cues"
 
 
 @respx.mock
@@ -6107,6 +6296,7 @@ async def test_dubbing_sends_subtitle_parts_and_export_srt(monkeypatch, output_d
         pass
 
     monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    _mock_upload_cap(api)
     (output_dir / "es.srt").write_bytes(b"es-script")
     submit = respx.post("https://api.test.local/v1/dubbing").mock(
         return_value=httpx.Response(202, json={"task_id": "db-5", "status": "processing"})
@@ -6142,6 +6332,9 @@ async def test_dubbing_sends_subtitle_parts_and_export_srt(monkeypatch, output_d
     assert b'name="export_srt"\r\n\r\ntrue' in sent
     assert (output_dir / "dubbing-db-5.es.srt").read_bytes() == b"es-cues"
     assert "alignment loss 0.250" in result[1].text
+    # The submit response is not the finished task: no preflight is surfaced
+    # here, only what the terminal body reports.
+    assert len(result) == 2
 
 
 @respx.mock
@@ -6179,15 +6372,62 @@ async def test_dubbing_sends_lipsync_only_when_set(monkeypatch, output_dir):
     assert b"lipsync=false" in submit.calls.last.request.content
 
 
-async def test_dubbing_rejects_export_srt_without_subtitles(monkeypatch, output_dir):
+async def test_dubbing_rejects_export_srt_true_without_subtitles(
+    monkeypatch, output_dir
+):
     """A guaranteed 422 — there is nothing to align against — so it never
-    leaves the machine."""
+    leaves the machine.
+
+    Matched on the message, not merely on the word "export_srt": a bare
+    `match="export_srt"` is satisfied by TypeError: unexpected keyword
+    argument, so the test would pass against a build that never had the
+    parameter at all."""
     monkeypatch.setenv("SONILO_API_KEY", "k")
     from sonilo_mcp import api
-    with pytest.raises(Exception, match="export_srt"):
+    with pytest.raises(Exception, match="export_srt requires subtitles") as exc:
         await api.dubbing(
             video_url="https://example.com/clip.mp4", export_srt=True
         )
+    assert not isinstance(exc.value, TypeError)
+
+
+@respx.mock
+async def test_dubbing_allows_export_srt_false_without_subtitles(
+    monkeypatch, output_dir
+):
+    """export_srt=false without scripts is an ordinary dub — the backend
+    reads it as a plain boolean — and an agent that fills in every parameter
+    explicitly sends exactly that. Refusing it would block a legal call."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-7", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/db-7").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "db-7", "type": "dubbing", "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4"},
+        })
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    result = await api.dubbing(
+        video_url="https://example.com/clip.mp4",
+        languages=["es"],
+        ducking=False,
+        lipsync=True,
+        export_srt=False,
+    )
+    assert b"export_srt=false" in submit.calls.last.request.content
+    assert len(result) == 1
 
 
 async def test_dubbing_description_documents_the_subtitle_parameters():

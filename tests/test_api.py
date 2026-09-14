@@ -6339,9 +6339,43 @@ async def test_dubbing_sends_subtitle_parts_and_export_srt(monkeypatch, output_d
 
 @respx.mock
 async def test_dubbing_sends_lipsync_only_when_set(monkeypatch, output_dir):
-    """lipsync defaults to ON — the behaviour every dubbing task had before
-    the parameter existed — so an unset value must not reach the wire as
-    false."""
+    """The mirror of ducking, with the default the other way up: absent must
+    mean lip sync ON, which is what every dubbing call did before the
+    parameter existed."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/dubbing").mock(
+        return_value=httpx.Response(202, json={"task_id": "db-4", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/db-4").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "db-4", "type": "dubbing", "status": "succeeded",
+            "outputs": {"es": "https://r2.test/es.mp4"},
+        })
+    )
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+
+    await api.dubbing(video_url="https://example.com/clip.mp4", lipsync=False)
+    body = submit.calls.last.request.content
+    assert b'name="lipsync"\r\n\r\nfalse' in body or b"lipsync=false" in body
+
+    await api.dubbing(video_url="https://example.com/clip.mp4")
+    assert b"lipsync" not in submit.calls.last.request.content
+
+
+@respx.mock
+async def test_dubbing_omits_the_subtitle_fields_when_unset(monkeypatch, output_dir):
+    """Unset means not on the wire at all, so a plain dub is byte-for-byte
+    the request it was before these parameters existed."""
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     from sonilo_mcp import api
@@ -6364,12 +6398,8 @@ async def test_dubbing_sends_lipsync_only_when_set(monkeypatch, output_dir):
         return_value=httpx.Response(200, content=b"es-bytes")
     )
     await api.dubbing(video_url="https://example.com/clip.mp4")
-    assert b"lipsync" not in submit.calls.last.request.content
     assert b"export_srt" not in submit.calls.last.request.content
     assert b"subtitles" not in submit.calls.last.request.content
-
-    await api.dubbing(video_url="https://example.com/clip.mp4", lipsync=False)
-    assert b"lipsync=false" in submit.calls.last.request.content
 
 
 async def test_dubbing_rejects_export_srt_true_without_subtitles(
@@ -6423,7 +6453,6 @@ async def test_dubbing_allows_export_srt_false_without_subtitles(
         video_url="https://example.com/clip.mp4",
         languages=["es"],
         ducking=False,
-        lipsync=True,
         export_srt=False,
     )
     assert b"export_srt=false" in submit.calls.last.request.content
@@ -6439,11 +6468,10 @@ async def test_dubbing_description_documents_the_subtitle_parameters():
     desc = {t.name: (t.description or "") for t in await api.mcp.list_tools()}["dubbing"]
     assert "subtitles (dict, optional)" in desc
     assert "export_srt (bool, optional)" in desc
-    assert "lipsync (bool, optional)" in desc
-    # The scripts are target-language, and lipsync's default must be stated:
-    # both are what an agent would otherwise guess wrong.
+    # The scripts are TARGET-language, and export_srt needs them: both are
+    # what an agent would otherwise guess wrong.
     assert "TARGET-language" in desc
-    assert "ON by default" in desc
+    assert "Requires subtitles" in desc
 
 
 async def test_dubbing_rejects_both_inputs(monkeypatch, output_dir):

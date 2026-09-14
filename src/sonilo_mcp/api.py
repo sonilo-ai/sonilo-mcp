@@ -3260,11 +3260,15 @@ async def video_to_video_sound(
         "bed under the dubbed voice while it speaks. Off by default: the "
         "bed is always kept, at a constant level unless this is true. "
         "Free.\n"
-        "    lipsync (bool, optional): Re-render the speaker's mouth to "
-        "match the dubbed speech. ON by default. Pass false to replace the "
-        "audio only: the deliverable then keeps the source's own frames, "
-        "resolution and frame rate. Omit it unless the caller asked, so the "
-        "default applies.\n"
+        "    lipsync (bool, optional): Whether the speaker's mouth is "
+        "re-rendered to match the dubbed speech. On by default. Set false "
+        "to leave the picture completely untouched instead — the video "
+        "comes back at its original resolution and frame rate rather than "
+        "re-rendered, and only the audio is replaced, so the mouths keep "
+        "moving to the original language. Use it for footage with no "
+        "on-camera speaker, or when preserving the exact original picture "
+        "matters more than matching lip movement. The background bed is "
+        "rebuilt either way, so ducking is unaffected.\n"
         "    subtitles (dict, optional): One script per target language, "
         'e.g. {"es": "/path/es.srt", "fr": "https://example.com/fr.vtt"}. '
         "Each value is either a local .srt/.vtt path (absolute, or relative "
@@ -3345,9 +3349,9 @@ async def dubbing(
     # when unset so the server default applies.
     if ducking is not None:
         form["ducking"] = "true" if ducking else "false"
-    # lipsync defaults to ON, which is what every dubbing task did before the
-    # parameter existed — so absent must keep meaning true and the field goes
-    # on the wire only when the caller actually chose.
+    # Default-ON server-side, unlike ducking — the useful direction here is
+    # turning it off. Omitted when unset all the same, so the server keeps
+    # owning the default.
     if lipsync is not None:
         form["lipsync"] = "true" if lipsync else "false"
     if export_srt is not None:

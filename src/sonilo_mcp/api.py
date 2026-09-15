@@ -2099,7 +2099,8 @@ async def _save_dubbing_artifacts(
         "Args:\n"
         "    prompt (str): Description of the music to generate "
         "(1–1000 chars).\n"
-        "    duration (int): Length in seconds (1–360).\n"
+        "    duration (int, optional): Length in seconds (5–360). Omit it "
+        "and Sonilo picks a length that suits the prompt.\n"
         "    output_format (str, optional): 'm4a' (default), 'wav', or "
         "'mp3' (320 kbps). Anything but 'm4a' requires the backend's "
         "async generation mode (submit + "
@@ -2140,7 +2141,7 @@ async def _save_dubbing_artifacts(
 )
 async def text_to_music(
     prompt: str,
-    duration: int,
+    duration: int | None = None,
     output_format: str | None = None,
     variants_num: int = 1,
     stems: bool = False,
@@ -2151,7 +2152,11 @@ async def text_to_music(
     # The backend's text-to-music endpoint expects form fields, not a JSON
     # body (same as video-to-music). Sending JSON yields a 422
     # "Field required" for prompt/duration.
-    data: dict = {"prompt": prompt, "duration": duration}
+    data: dict = {"prompt": prompt}
+    # Omitted, not defaulted: the API picks the length from the prompt itself,
+    # and any stand-in sent from here would silently override that.
+    if duration is not None:
+        data["duration"] = duration
     if variants_num != 1:
         data["variants_num"] = variants_num
     # Any container other than the m4a default is a finalize-time transcode
@@ -2448,7 +2453,8 @@ async def video_to_music(
         "Args:\n"
         "    prompt (str): Description of the sound effect "
         "(1–2000 chars).\n"
-        "    duration (int): Length in seconds (1–180).\n"
+        "    duration (float, optional): Length in seconds (0.5–180). Omit "
+        "it for Sonilo's own default length.\n"
         "    audio_format (str, optional): One of wav, mp3, aac, flac. "
         "Defaults to aac (.m4a file).\n"
         "    output_directory (str, optional): Absolute path, or relative "
@@ -2462,12 +2468,16 @@ async def video_to_music(
 )
 async def text_to_sfx(
     prompt: str,
-    duration: int,
+    duration: float | None = None,
     audio_format: str | None = None,
     output_directory: str | None = None,
 ) -> list[TextContent]:
     out_path = _make_output_path(output_directory)
-    data: dict = {"prompt": prompt, "duration": duration}
+    data: dict = {"prompt": prompt}
+    # Omitted, not defaulted: the API has its own default length, and pinning
+    # one here would freeze a number that belongs to the service.
+    if duration is not None:
+        data["duration"] = duration
     if audio_format:
         data["audio_format"] = audio_format
     task_id = await _post_task_submit("/v1/text-to-sfx", data=data)

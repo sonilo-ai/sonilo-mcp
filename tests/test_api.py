@@ -7295,3 +7295,75 @@ async def test_tool_descriptions_state_each_cap_as_enforced():
     for name, cap in expected.items():
         assert name in by_name, name
         assert f"Maximum video duration is {cap} seconds" in by_name[name], name
+
+
+# --- optional duration ------------------------------------------------------
+# The API resolves an omitted duration itself (text-to-music from the prompt,
+# text-to-sfx with its own default), so the tool must leave the field out
+# rather than send a stand-in.
+
+@respx.mock
+async def test_text_to_music_omits_an_absent_duration(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    audio = b"\x00\x01\x02fake-mp3-bytes"
+    ndjson = _ndjson_bytes([
+        {"type": "title", "title": "Happy Tune"},
+        {"type": "audio_chunk", "stream_index": 0, "num_streams": 1,
+         "data": base64.b64encode(audio).decode()},
+        {"type": "complete"},
+    ])
+    route = respx.post("https://api.test.local/v1/text-to-music").mock(
+        return_value=httpx.Response(200, content=ndjson)
+    )
+    from sonilo_mcp.api import text_to_music
+    await text_to_music(prompt="happy")
+
+    assert b"duration" not in route.calls.last.request.content
+
+
+@respx.mock
+async def test_text_to_sfx_omits_an_absent_duration(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    route = respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        return_value=httpx.Response(202, json={"task_id": "t1", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/t1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t1", "status": "succeeded",
+            "audio": {"url": "https://cdn.test.local/a.m4a",
+                      "content_type": "audio/mp4"},
+        })
+    )
+    respx.get("https://cdn.test.local/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"sfxbytes")
+    )
+    from sonilo_mcp.api import text_to_sfx
+    await text_to_sfx(prompt="a door latch")
+
+    assert b"duration" not in route.calls.last.request.content
+
+
+@respx.mock
+async def test_text_to_sfx_sends_a_fractional_duration(monkeypatch, output_dir):
+    """The API's floor is 0.5 sec, so this is a number, not an integer."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    route = respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        return_value=httpx.Response(202, json={"task_id": "t1", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/t1").mock(
+        return_value=httpx.Response(200, json={
+            "task_id": "t1", "status": "succeeded",
+            "audio": {"url": "https://cdn.test.local/a.m4a",
+                      "content_type": "audio/mp4"},
+        })
+    )
+    respx.get("https://cdn.test.local/a.m4a").mock(
+        return_value=httpx.Response(200, content=b"sfxbytes")
+    )
+    from sonilo_mcp.api import text_to_sfx
+    await text_to_sfx(prompt="a door latch", duration=0.5)
+
+    assert b"duration=0.5" in route.calls.last.request.content

@@ -329,6 +329,7 @@ _SFX_MAX_VIDEO_DURATION_SECONDS = 480  # 8 minutes — /v1/video-to-sfx
 _SOUND_MAX_VIDEO_DURATION_SECONDS = 480  # 8 minutes — /v1/video-to-sound*
 _DUCKING_MAX_DURATION_SECONDS = 360  # 6 minutes — /v1/audio-ducking, per input
 _DUBBING_MAX_VIDEO_DURATION_SECONDS = 300  # 5 minutes — /v1/dubbing
+_PROOFREAD_MAX_VIDEO_DURATION_SECONDS = 300  # 5 minutes — /v1/proofread
 _ANALYSIS_MAX_VIDEO_DURATION_SECONDS = 480  # 8 minutes — /v1/video-analysis
 # Floor for the dubbing poll, matched to the backend's own ceiling: it polls
 # its pipeline for up to 7200s, so giving up any earlier abandons a job the
@@ -2102,6 +2103,184 @@ async def _save_dubbing_artifacts(
     return saved
 
 
+def _is_proofread_envelope(body: dict) -> bool:
+    """Whether a terminal /v1/tasks/{id} body is a proofread result: a
+    `subtitles` map of language code -> .srt URL, and no dubbed video.
+
+    Prefers the backend `type` field and falls back to shape-sniffing only
+    for bodies that omit `type` entirely — the same rule (and the same
+    short-circuit on an explicit, different type) as _is_dubbing_envelope.
+
+    The sniff additionally requires that no `outputs` key is present: a
+    dubbing task run with export_srt carries a `subtitles` map too, and
+    routing it here would save its scripts and silently drop the dubbed
+    videos the caller was actually billed for.
+    """
+    t = body.get("type")
+    if isinstance(t, str) and t:
+        return t == "proofread"
+    if body.get("outputs") is not None:
+        return False
+    subtitles = body.get("subtitles")
+    if not isinstance(subtitles, dict) or not subtitles:
+        return False
+    return all(isinstance(url, str) and url for url in subtitles.values())
+
+
+def _proofread_warning_note(language: str, issue: object) -> str:
+    """Render one entry of a proofread `warnings` list as short prose, e.g.
+    "Note (fr): cue 33, high_text_speed (warning), characters_per_second
+    26.92".
+
+    These are non-blocking: the scripts are delivered either way, and the
+    note exists so the caller can fix the flagged cue before dubbing it.
+    Every field is read defensively and unknown keys are carried through
+    verbatim, so a warning code added later still reaches the caller instead
+    of being dropped on a task that is already paid for.
+
+    Empty when the entry says nothing usable, so the caller can skip it.
+    """
+    if not isinstance(issue, dict):
+        return ""
+    parts: list[str] = []
+    cue = issue.get("cue")
+    if isinstance(cue, (int, float)) and not isinstance(cue, bool):
+        parts.append(f"cue {cue:g}")
+    code = issue.get("code")
+    severity = issue.get("severity")
+    if isinstance(code, str) and code:
+        if isinstance(severity, str) and severity:
+            parts.append(f"{code} ({severity})")
+        else:
+            parts.append(code)
+    elif isinstance(severity, str) and severity:
+        parts.append(severity)
+    for key in sorted(k for k in issue if k not in ("cue", "code", "severity")):
+        parts.append(f"{key} {issue[key]}")
+    if not parts:
+        return ""
+    return f"Note ({language}): " + ", ".join(parts)
+
+
+async def _save_proofread_artifacts(
+    body: dict,
+    output_path: Path,
+    base_name: str,
+    task_id: str,
+) -> list[TextContent]:
+    """Turn a terminal /v1/tasks/{id} body from a proofread task into saved
+    local files — one `.srt` per language in `subtitles`, which always
+    includes the detected source language alongside the requested targets.
+
+    failed/unexpected status -> see _raise_if_task_not_succeeded (shared with
+    every other save layer; that part is envelope-agnostic).
+
+    succeeded -> download every entry of `subtitles`, named
+    `{base_name}.{language}.srt`, in sorted language order so the reported
+    order is stable across runs. Then one summary line carrying the detected
+    `source_language` and `cue_count`, and one note per entry of `warnings`.
+
+    A failed download is a note, not a raise — the same rule
+    _save_dubbing_artifacts applies to its scripts. Six of seven languages
+    landing on disk is six languages the caller can use; raising would strand
+    them on a task that has already been charged. Every note carries the
+    task_id so the caller can retry the download with get_sfx_task.
+
+    Languages are saved sequentially rather than concurrently, for the same
+    reason as dubbing's: _artifact_dest reserves each name with an exclusive
+    create, and a serial loop keeps the reported order stable.
+
+    task_id must be the caller's own known-good id (from _post_task_submit),
+    same rule as every other save layer — the terminal body is not a
+    trustworthy source for the recovery id.
+    """
+    _raise_if_task_not_succeeded(body, task_id)
+
+    subtitles = body.get("subtitles")
+    valid = (
+        {
+            language: url
+            for language, url in subtitles.items()
+            if isinstance(url, str) and url
+        }
+        if isinstance(subtitles, dict)
+        else {}
+    )
+    if not valid:
+        raise Exception(
+            "Task succeeded but no subtitle file was returned. Task id: "
+            f"{task_id}."
+        )
+
+    saved: list[TextContent] = []
+    for language in sorted(valid):
+        dest = _artifact_dest(output_path, f"{base_name}.{language}", ".srt")
+        try:
+            await _download_artifact(valid[language], dest)
+        except Exception as e:
+            saved.append(TextContent(
+                type="text",
+                text=(
+                    f"Note ({language}): the subtitle file could not be "
+                    f"downloaded. {_end_sentence(e)} It is still stored on "
+                    f'the backend — call get_sfx_task("{task_id}") to retry '
+                    "the download."
+                ),
+            ))
+            continue
+        saved.append(TextContent(
+            type="text", text=f"Success ({language}). File saved as: {dest}",
+        ))
+
+    source_language = body.get("source_language")
+    source = (
+        source_language
+        if isinstance(source_language, str) and source_language
+        else "not reported"
+    )
+    cue_count = body.get("cue_count")
+    cues = (
+        f"{cue_count:g} cues"
+        if isinstance(cue_count, (int, float)) and not isinstance(cue_count, bool)
+        else "cue count not reported"
+    )
+    saved.append(TextContent(
+        type="text",
+        text=(
+            f"Source language: {source}. {cues} in the source script. "
+            "Review or correct the wording, then send the edited files to "
+            "the dubbing tool as `subtitles` so the dub speaks exactly the "
+            "approved wording — dropping the source-language entry, since "
+            "dubbing's subtitle keys must match the languages being dubbed."
+        ),
+    ))
+
+    warnings = body.get("warnings")
+    if isinstance(warnings, dict):
+        for language in sorted(warnings):
+            issues = warnings[language]
+            for issue in issues if isinstance(issues, (list, tuple)) else []:
+                note = _proofread_warning_note(language, issue)
+                if note:
+                    saved.append(TextContent(type="text", text=note))
+
+    dropped = (
+        sorted(set(subtitles) - set(valid)) if isinstance(subtitles, dict) else []
+    )
+    if dropped:
+        saved.append(TextContent(
+            type="text",
+            text=(
+                "Warning: no subtitle URL was returned for: "
+                f"{', '.join(dropped)}. Task id: {task_id} — you were "
+                f'billed for that language; call get_sfx_task("{task_id}") '
+                "to re-check."
+            ),
+        ))
+
+    return saved
+
+
 # ---------- Tools: generation ----------
 
 @mcp.tool(
@@ -3420,11 +3599,119 @@ async def dubbing(
 
 @mcp.tool(
     description=(
-        "Check a sound-effects, audio-ducking, video-to-video, dubbing, or "
+        "Transcribe a video and translate its script into the target dubbing "
+        "languages, returning one editable .srt per language plus the "
+        "source-language transcript, so the text can be read and corrected "
+        "BEFORE anything is dubbed. Nothing is spoken and no video is "
+        "produced — this is the step before the dubbing tool. Send the "
+        "edited files back as `subtitles` on the dubbing tool so the dub "
+        "speaks exactly the approved wording.\n\n"
+        "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
+        "incur charges, and you are billed PER LANGUAGE: video duration × "
+        "the number of target languages at $0.001/sec, with a 10-second "
+        "billing floor. A transcript-only request (no languages) counts as "
+        "one language. Self-serve accounts get 2 free-trial runs on it. "
+        "Only use when explicitly requested by the user.\n\n"
+        "Args:\n"
+        "    video_path (str, optional): Absolute local path, or relative "
+        "to SONILO_MCP_BASE_PATH. Subject to the account's max upload size "
+        "(typically 300 MB). Maximum video duration is 300 seconds "
+        "(5 minutes), and the video must have an audio track.\n"
+        "    video_url (str, optional): HTTPS URL to a video file. Must be "
+        "https specifically — the backend fetches the source itself and "
+        "rejects plain http.\n"
+        "    languages (list, optional): Target language codes to translate "
+        'the transcript into, e.g. ["ja", "zh_cn"]. These are the same '
+        "codes the dubbing tool takes (see its languages argument for the "
+        "list), so a proofread script can go straight into a dub. Omit it, "
+        "or pass an empty list, for the source-language transcript "
+        "alone.\n"
+        "    source_language (str, optional): Hint telling transcription "
+        "which language to expect, one of the same codes — it helps on "
+        "short, noisy or mixed-language audio. Omit it to have the language "
+        "detected; either way the result reports the language the "
+        "transcript is in.\n"
+        "    output_directory (str, optional): Where to save the results. "
+        "Defaults to SONILO_MCP_BASE_PATH.\n\n"
+        "Exactly one of video_path and video_url must be provided.\n\n"
+        "Returns:\n"
+        "    One TextContent per saved file, named "
+        "proofread-<first 8 chars of the task id>.<language>.srt — always "
+        "including the detected source language as well as every requested "
+        "target — then the detected source_language and cue_count, then one "
+        "note per non-blocking warning (e.g. a cue whose text runs too fast "
+        "to read). A warning never blocks the files. On timeout the error "
+        "message includes the task_id — recover with get_sfx_task."
+    )
+)
+async def proofread(
+    video_path: str | None = None,
+    video_url: str | None = None,
+    languages: list[str] | None = None,
+    source_language: str | None = None,
+    output_directory: str | None = None,
+) -> list[TextContent]:
+    if (video_path and video_url) or (not video_path and not video_url):
+        raise Exception(
+            "Provide either video_path or video_url (exactly one, not both)"
+        )
+
+    if video_url:
+        # Same scheme guard, and the same https-only rule, as dubbing: the
+        # backend fetches the source URL itself and rejects plain http, so a
+        # non-https URL is a guaranteed 422.
+        _require_http_url(video_url, "video")
+        if not video_url.lower().startswith("https://"):
+            raise Exception(
+                "video_url must use https — the proofread backend requires "
+                "an https URL."
+            )
+
+    out_path = _make_output_path(output_directory)
+    cfg = _get_config()
+
+    form: dict = {}
+    if languages is not None:
+        # One JSON-array form field, the shape the backend parses — the same
+        # wire shape as dubbing's `languages`. Codes are NOT checked here,
+        # for the same reason: the backend owns the supported list and
+        # rejects an unknown code with a 422 before charging, and a
+        # hardcoded copy would make this server reject codes added later.
+        form["languages"] = json.dumps(languages)
+    if source_language is not None:
+        form["source_language"] = source_language
+
+    files, extra_form = await _stage_video_input(
+        video_path, video_url, cfg["base_path"],
+        _PROOFREAD_MAX_VIDEO_DURATION_SECONDS,
+        # The backend transcodes the source itself rather than copying the
+        # picture stream, so the accepted container set is the broad
+        # _VIDEO_EXTS one, as it is for video-analysis.
+        exts=_VIDEO_EXTS,
+    )
+    form.update(extra_form)
+    task_id = await _post_task_submit("/v1/proofread", data=form or None, files=files)
+
+    # The ordinary timeout, unlike dubbing's two-hour floor: proofread runs
+    # transcription and translation only, and finishes in well under
+    # 90 seconds, so there is no long-running pipeline to outwait.
+    body = await _poll_task(task_id, cfg["timeout"])
+    # No prompt to slugify — a proofread call has no free text at all, so the
+    # task id is the only stable name available.
+    return await _save_proofread_artifacts(
+        body, out_path, f"proofread-{task_id[:8]}", task_id
+    )
+
+
+@mcp.tool(
+    description=(
+        "Check a sound-effects, audio-ducking, video-to-video, dubbing, "
+        "proofread, or "
         "async video-to-music generation task and, if finished, download its "
         "result file(s). Use this to recover a result when text_to_sfx, "
         "video_to_sfx, audio_ducking, video_to_video_music, "
         "video_to_video_sfx, video_to_sound, video_to_video_sound, dubbing, "
+        "proofread, "
         "or video_to_music(preserve_speech=true) timed "
         "out — their error message contains the task_id. Does not poll: a "
         "single status check per call. This tool itself never charges.\n\n"
@@ -3438,7 +3725,9 @@ async def dubbing(
         "video_to_sfx tasks; a single .wav or .mp4 for audio_ducking "
         "tasks; a single .mp4 for video_to_video_music/video_to_video_sfx/"
         "video_to_video_sound tasks; a single .wav for video_to_sound "
-        "tasks; one .mp4 per language for dubbing tasks; for a "
+        "tasks; one .mp4 per language for dubbing tasks; one .srt per "
+        "language, plus the detected source language and cue count, for "
+        "proofread tasks; for a "
         "video_to_music(preserve_speech=true) task, the audio "
         "stream(s) plus the preserved speech ('vocals') stem plus the mux "
         "(speech+music mixed — the ready-to-use combined result). If the "
@@ -3500,6 +3789,18 @@ async def get_sfx_task(
         # whose brief is right there in the body. Nothing is written to
         # out_path, so this branch ignores it entirely.
         return _analysis_brief(body)
+    if _is_proofread_envelope(body):
+        # A proofread task produces no media at all: its result is the
+        # `subtitles` map of .srt files, which _save_task_artifacts's
+        # audio/video slots cannot see — it would report a missing artifact
+        # for a task that was charged and whose scripts are still on the
+        # backend. Checked before the dubbing branch, since a dubbing task
+        # run with export_srt carries a `subtitles` map too. No
+        # reuse_existing, same as the dubbing and music branches: a second
+        # recovery call lands in -1/-2-suffixed files.
+        return await _save_proofread_artifacts(
+            body, out_path, f"proofread-{task_id[:8]}", task_id
+        )
     if _is_dubbing_envelope(body):
         # A dubbing task renders one video per language under `outputs` —
         # _save_task_artifacts only understands audio/video slots and would

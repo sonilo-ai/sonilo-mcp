@@ -7396,6 +7396,7 @@ async def test_tool_descriptions_state_each_cap_as_enforced():
         "video_to_sound": api._SOUND_MAX_VIDEO_DURATION_SECONDS,
         "video_to_video_sound": api._SOUND_MAX_VIDEO_DURATION_SECONDS,
         "dubbing": api._DUBBING_MAX_VIDEO_DURATION_SECONDS,
+        "proofread": api._PROOFREAD_MAX_VIDEO_DURATION_SECONDS,
     }
     by_name = {t.name: (t.description or "") for t in await api.mcp.list_tools()}
     for name, cap in expected.items():
@@ -7473,3 +7474,381 @@ async def test_text_to_sfx_sends_a_fractional_duration(monkeypatch, output_dir):
     await text_to_sfx(prompt="a door latch", duration=0.5)
 
     assert b"duration=0.5" in route.calls.last.request.content
+
+
+# ---------- proofread ----------
+
+# The exact finished-task envelope a real /v1/proofread task returned in
+# production (URLs shortened): 7 languages including the detected source
+# language, 65 cues, and one non-blocking warning. Copied verbatim rather
+# than hand-written so the save layer is exercised against the shape the
+# backend actually sends, not a shape convenient to test.
+_PROOFREAD_BODY = {
+    "task_id": "pr-1",
+    "type": "proofread",
+    "status": "succeeded",
+    "duration_seconds": 206.32,
+    "source_language": "en",
+    "subtitles": {
+        "en": "https://r2.test/en.srt",
+        "ko": "https://r2.test/ko.srt",
+        "fr": "https://r2.test/fr.srt",
+        "de": "https://r2.test/de.srt",
+        "ar": "https://r2.test/ar.srt",
+        "th": "https://r2.test/th.srt",
+        "ru": "https://r2.test/ru.srt",
+    },
+    "cue_count": 65,
+    "warnings": {
+        "fr": [
+            {
+                "cue": 33,
+                "code": "high_text_speed",
+                "severity": "warning",
+                "characters_per_second": 26.92,
+            }
+        ]
+    },
+}
+
+
+def _mock_proofread_srt_downloads(languages=None) -> None:
+    """Serve one .srt per language in the finished-task envelope."""
+    for language in languages or _PROOFREAD_BODY["subtitles"]:
+        respx.get(f"https://r2.test/{language}.srt").mock(
+            return_value=httpx.Response(200, content=f"{language}-cues".encode())
+        )
+
+
+def _proofread_stub(monkeypatch, body=None, task_id="pr-1"):
+    """Wire up the common respx/ffprobe stubs for a proofread call and return
+    (api, submit route)."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+
+    _patch_ffprobe(monkeypatch, duration=60.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/proofread").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": task_id, "status": "processing"}
+        )
+    )
+    respx.get(f"https://api.test.local/v1/tasks/{task_id}").mock(
+        return_value=httpx.Response(200, json=body or _PROOFREAD_BODY)
+    )
+    return api, submit
+
+
+@respx.mock
+async def test_proofread_url_mode_saves_every_language_and_reports_the_result(
+    monkeypatch, output_dir
+):
+    """The whole point of the tool is the files: one .srt per entry of
+    `subtitles`, which always includes the DETECTED source language on top of
+    the requested targets. The summary and the warning ride after them."""
+    api, submit = _proofread_stub(monkeypatch)
+    _mock_proofread_srt_downloads()
+
+    result = await api.proofread(
+        video_url="https://example.com/clip.mp4",
+        languages=["ko", "fr", "de", "ar", "th", "ru"],
+    )
+
+    # URL-only submissions ride as application/x-www-form-urlencoded, so the
+    # JSON array arrives percent-encoded — decode before checking it landed.
+    from urllib.parse import unquote_plus
+    sent = unquote_plus(submit.calls.last.request.content.decode())
+    assert '["ko", "fr", "de", "ar", "th", "ru"]' in sent
+    assert "video_url=https://example.com/clip.mp4" in sent
+
+    for language in _PROOFREAD_BODY["subtitles"]:
+        assert (output_dir / f"proofread-pr-1.{language}.srt").read_bytes() == \
+            f"{language}-cues".encode()
+    # 7 files + the summary + the one warning.
+    assert len(result) == 9
+    summary = result[7].text
+    assert "Source language: en" in summary
+    assert "65 cues" in summary
+    # The workflow an agent would otherwise have to guess at.
+    assert "dubbing" in summary and "subtitles" in summary
+    warning = result[8].text
+    assert "fr" in warning and "cue 33" in warning
+    assert "high_text_speed" in warning and "warning" in warning
+    # Unknown extras are carried through rather than dropped.
+    assert "characters_per_second 26.92" in warning
+
+
+@respx.mock
+async def test_proofread_path_mode_uploads_the_video(monkeypatch, output_dir):
+    """A local file rides as a multipart file part, with `languages` and
+    `source_language` as ordinary text fields beside it."""
+    api, submit = _proofread_stub(monkeypatch)
+    _mock_upload_cap(api)
+    _mock_proofread_srt_downloads()
+    (output_dir / "clip.mp4").write_bytes(b"video-bytes")
+
+    await api.proofread(
+        video_path="clip.mp4", languages=["ja"], source_language="en"
+    )
+
+    sent = submit.calls.last.request.content
+    assert b'name="video"; filename="clip.mp4"' in sent
+    assert b"video-bytes" in sent
+    assert b'name="languages"\r\n\r\n["ja"]' in sent
+    assert b'name="source_language"\r\n\r\nen' in sent
+
+
+@respx.mock
+async def test_proofread_omits_the_optional_fields_when_unset(
+    monkeypatch, output_dir
+):
+    """Unset means not on the wire at all, so the server's own defaults apply:
+    transcript only, and a detected source language."""
+    api, submit = _proofread_stub(monkeypatch)
+    _mock_proofread_srt_downloads()
+    await api.proofread(video_url="https://example.com/clip.mp4")
+    sent = submit.calls.last.request.content
+    assert b"languages" not in sent
+    assert b"source_language" not in sent
+
+
+@respx.mock
+async def test_proofread_sends_an_explicit_empty_language_list(
+    monkeypatch, output_dir
+):
+    """`[]` is a real request — the transcript alone — and must not collapse
+    into "not sent". Both mean transcript-only today, but the caller asked
+    for one of them explicitly and the backend reads them apart."""
+    api, submit = _proofread_stub(monkeypatch)
+    _mock_proofread_srt_downloads()
+    await api.proofread(video_url="https://example.com/clip.mp4", languages=[])
+    from urllib.parse import unquote_plus
+    assert "languages=[]" in unquote_plus(submit.calls.last.request.content.decode())
+
+
+@respx.mock
+async def test_proofread_does_not_check_the_language_codes(monkeypatch, output_dir):
+    """Same rule as dubbing: the backend owns the supported list and rejects
+    an unknown code with a 422 before charging. A hardcoded copy here would
+    reject a language added later."""
+    api, submit = _proofread_stub(monkeypatch)
+    _mock_proofread_srt_downloads()
+    await api.proofread(
+        video_url="https://example.com/clip.mp4",
+        languages=["xx_yy"],
+        source_language="xx_yy",
+    )
+    assert submit.called
+
+
+@respx.mock
+async def test_proofread_handles_a_body_without_warnings(monkeypatch, output_dir):
+    """`warnings` is empty or absent on a clean run — the common case — and
+    the files plus the summary must still come back."""
+    body = {k: v for k, v in _PROOFREAD_BODY.items() if k != "warnings"}
+    body["subtitles"] = {"en": "https://r2.test/en.srt"}
+    api, _ = _proofread_stub(monkeypatch, body=body)
+    _mock_proofread_srt_downloads(["en"])
+    result = await api.proofread(video_url="https://example.com/clip.mp4")
+    assert len(result) == 2
+    assert (output_dir / "proofread-pr-1.en.srt").read_bytes() == b"en-cues"
+    assert "Source language: en" in result[1].text
+
+
+@respx.mock
+async def test_proofread_reports_a_failed_download_as_a_note(
+    monkeypatch, output_dir
+):
+    """One bad URL must not strand the languages that downloaded fine — the
+    task is already charged, and the note carries the task id so the rest can
+    be retried."""
+    body = dict(_PROOFREAD_BODY)
+    body["subtitles"] = {
+        "en": "https://r2.test/en.srt",
+        "fr": "https://r2.test/fr.srt",
+    }
+    api, _ = _proofread_stub(monkeypatch, body=body)
+    respx.get("https://r2.test/en.srt").mock(
+        return_value=httpx.Response(200, content=b"en-cues")
+    )
+    respx.get("https://r2.test/fr.srt").mock(
+        return_value=httpx.Response(500, text="nope")
+    )
+    result = await api.proofread(video_url="https://example.com/clip.mp4")
+    assert (output_dir / "proofread-pr-1.en.srt").read_bytes() == b"en-cues"
+    note = next(c.text for c in result if c.text.startswith("Note (fr)"))
+    assert "could not be downloaded" in note
+    assert 'get_sfx_task("pr-1")' in note
+
+
+@respx.mock
+async def test_proofread_raises_when_no_subtitle_was_returned(
+    monkeypatch, output_dir
+):
+    """A succeeded task with nothing to download is the one case that raises:
+    there is no partial result to protect, and the caller needs their task
+    id."""
+    body = dict(_PROOFREAD_BODY)
+    body["subtitles"] = {}
+    api, _ = _proofread_stub(monkeypatch, body=body)
+    with pytest.raises(Exception, match="no subtitle file was returned"):
+        await api.proofread(video_url="https://example.com/clip.mp4")
+
+
+async def test_proofread_rejects_both_inputs(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp import api
+    with pytest.raises(Exception, match="exactly one"):
+        await api.proofread(
+            video_path="clip.mp4", video_url="https://example.com/clip.mp4"
+        )
+    with pytest.raises(Exception, match="exactly one"):
+        await api.proofread()
+
+
+async def test_proofread_rejects_a_non_https_url(monkeypatch, output_dir):
+    """Same rule as dubbing: the backend fetches the source itself and refuses
+    plain http, so an http URL is a guaranteed 422."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    from sonilo_mcp import api
+    with pytest.raises(Exception, match="must use https"):
+        await api.proofread(video_url="http://example.com/clip.mp4")
+
+
+@respx.mock
+async def test_proofread_rejects_a_video_over_300_seconds(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=301.0)
+    submit = respx.post("https://api.test.local/v1/proofread")
+    with pytest.raises(Exception):
+        await api.proofread(video_url="https://example.com/clip.mp4")
+    # Nothing may be submitted, so nothing is charged.
+    assert not submit.called
+
+
+@respx.mock
+async def test_proofread_sends_a_video_at_the_cap_to_the_backend(
+    monkeypatch, output_dir
+):
+    """The local pre-check exists to save a wasted upload, so its only failure
+    mode that costs the caller anything is rejecting what the API would have
+    taken. 300s is exactly the length /v1/proofread accepts; the submit fails
+    with a 500 on purpose, because reaching the network at all is the proof."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=300.0)
+    submit = respx.post("https://api.test.local/v1/proofread").mock(
+        return_value=httpx.Response(500, json={"message": "upstream is down"})
+    )
+    with pytest.raises(Exception):
+        await api.proofread(video_url="https://example.com/clip.mp4")
+    assert submit.called
+
+
+def test_proofread_cap_matches_the_backend():
+    """A literal, not a re-export of anything: this pre-check exists only to
+    save a wasted upload, so it is right exactly when it equals the number the
+    backend enforces."""
+    from sonilo_mcp import api
+    assert api._PROOFREAD_MAX_VIDEO_DURATION_SECONDS == 300
+
+
+@respx.mock
+async def test_proofread_uses_the_ordinary_timeout(monkeypatch, output_dir):
+    """Not dubbing's two-hour floor: proofread only transcribes and
+    translates, finishing in well under 90 seconds, so it polls on
+    TIME_OUT_SECONDS like every other ordinary task."""
+    monkeypatch.setenv("TIME_OUT_SECONDS", "600")
+    api, _ = _proofread_stub(monkeypatch)
+    _mock_proofread_srt_downloads()
+    seen: dict = {}
+
+    async def fake_poll(task_id, timeout):
+        seen["timeout"] = timeout
+        return _PROOFREAD_BODY
+
+    monkeypatch.setattr(api, "_poll_task", fake_poll)
+    await api.proofread(video_url="https://example.com/clip.mp4")
+    assert seen["timeout"] == 600.0
+
+
+@respx.mock
+async def test_get_sfx_task_recovers_a_proofread_task(monkeypatch, output_dir):
+    """A timed-out proofread is recovered the same way a dubbing task is —
+    the scripts are on the backend and the caller was already charged."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    body = dict(_PROOFREAD_BODY)
+    body["task_id"] = "pr-9"
+    respx.get("https://api.test.local/v1/tasks/pr-9").mock(
+        return_value=httpx.Response(200, json=body)
+    )
+    _mock_proofread_srt_downloads()
+    result = await api.get_sfx_task("pr-9")
+    assert len(result) == 9
+    assert (output_dir / "proofread-pr-9.en.srt").read_bytes() == b"en-cues"
+    assert (output_dir / "proofread-pr-9.ru.srt").read_bytes() == b"ru-cues"
+    assert "Source language: en" in result[7].text
+
+
+async def test_proofread_envelope_never_captures_a_dubbing_task():
+    """A dubbing task run with export_srt carries a `subtitles` map too.
+    Routing it here would save its scripts and silently drop the dubbed
+    videos it was billed for, so the sniff requires that no `outputs` key is
+    present — and an explicit type always wins."""
+    from sonilo_mcp import api
+    dubbed = {
+        "outputs": {"es": "https://r2.test/es.mp4"},
+        "subtitles": {"es": "https://r2.test/es.srt"},
+    }
+    assert not api._is_proofread_envelope(dubbed)
+    assert not api._is_proofread_envelope({**dubbed, "type": "dubbing"})
+    assert api._is_proofread_envelope({"subtitles": {"en": "https://r2.test/en.srt"}})
+    assert api._is_proofread_envelope({"type": "proofread", "subtitles": {}})
+
+
+async def test_proofread_description_documents_the_parameters():
+    """Read off the FastMCP registry, not the function — @mcp.tool keeps the
+    description on the registered tool, not as an attribute of the callable.
+    An agent that cannot see these parameters will never offer them."""
+    from sonilo_mcp import api
+
+    desc = {
+        t.name: (t.description or "") for t in await api.mcp.list_tools()
+    }["proofread"]
+    assert "languages (list, optional)" in desc
+    assert "source_language (str, optional)" in desc
+    assert "output_directory (str, optional)" in desc
+    # The three things an agent would otherwise get wrong: it bills per
+    # language, it has exactly 2 free runs, and the files are meant to go
+    # back into dubbing.
+    assert "PER LANGUAGE" in desc
+    assert "2 free-trial runs" in desc
+    assert "`subtitles` on the dubbing tool" in desc
+
+
+def test_documented_proofread_cap_matches_the_code():
+    """Same drift risk the dubbing guard covers: an agent reads the README row
+    or the context7 sentence and refuses a video rather than sending it."""
+    from pathlib import Path
+    from sonilo_mcp import api
+
+    cap = api._PROOFREAD_MAX_VIDEO_DURATION_SECONDS
+    root = Path(__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    context7 = (root / "context7.json").read_text(encoding="utf-8")
+
+    line = next(
+        l for l in readme.splitlines() if l.startswith("| `proofread(")
+    )
+    assert f"{cap}s" in line, line
+    assert "proofread" in _context7_cap_clause(context7, cap)

@@ -3,7 +3,7 @@
   "url": "https://context7.com/sonilo-ai/sonilo-mcp",
   "public_key": "pk_h4BOrwVwv5CF9NJ5BIwvC",
   "projectTitle": "Sonilo MCP Server",
-  "description": "MCP server exposing Sonilo's licensed music, sound-effects, dubbing and audio-ducking API to MCP clients",
+  "description": "MCP server exposing Sonilo's licensed music, sound-effects, dubbing, proofread and audio-ducking API to MCP clients",
   "folders": [],
   "excludeFolders": [
     "src",
@@ -23,8 +23,9 @@
     "Generation tools bill the user's account. Call get_account_services() first to see the remaining free-trial allowance, and only call a paid tool after the user explicitly asks for it.",
     "If a call times out, the job is still running and already charged \u2014 recover it with get_sfx_task(task_id). Never retry a timed-out generation.",
     "dubbing has zero free runs and bills video duration \u00d7 number of languages. Confirm the language list with the user before calling it.",
+    "proofread is the step before dubbing: it transcribes a video and returns one editable .srt per language plus the source-language transcript. The FILES are the point \u2014 correct the wording, then pass them to dubbing as subtitles[<language>] so the dub speaks exactly the approved text. It bills video duration \u00d7 number of target languages (a transcript-only request counts as one) and has 2 free runs.",
     "Use video_to_music when there is a video (the score matches the cut); use text_to_music only when there is none. The video_to_video_* variants return a new .mp4 with the audio already muxed in.",
-    "Video duration caps differ per tool: 480s for analyze_video, video_to_sfx, video_to_video_sfx, video_to_sound and video_to_video_sound; 360s for video_to_music, video_to_video_music and audio_ducking; 300s for dubbing.",
+    "Video duration caps differ per tool: 480s for analyze_video, video_to_sfx, video_to_video_sfx, video_to_sound and video_to_video_sound; 360s for video_to_music, video_to_video_music and audio_ducking; 300s for dubbing and proofread.",
     "File paths are confined to SONILO_MCP_BASE_PATH (default ~/Desktop) unless SONILO_MCP_ALLOW_ANY_PATH=true.",
     "analyze_video returns a creative BRIEF, not media: it generates nothing, writes no file, and hands the brief back inline. mode defaults to both: a music brief in segments/variations (one prompt per variation) plus a sound-design brief in sfx_segments/sfx_prompt (a single string); pass mode=music or mode=sfx for just one brief. Feed a variation's prompt to video_to_music / video_to_sfx / video_to_sound.",
     "Reach for analyze_video when the user does not know what the video should sound like. It is still a paid call: variants_num is 1-5 and is billed per brief, with a 10-second billing floor; all three modes cost the same."

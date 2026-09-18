@@ -2250,8 +2250,9 @@ async def _save_proofread_artifacts(
             f"Source language: {source}. {cues} in the source script. "
             "Review or correct the wording, then send the edited files to "
             "the dubbing tool as `subtitles` so the dub speaks exactly the "
-            "approved wording — dropping the source-language entry, since "
-            "dubbing's subtitle keys must match the languages being dubbed."
+            "approved wording. Dubbing's subtitle keys must match the "
+            "languages being dubbed, so leave out the source-language file "
+            "unless that language is itself a dubbing target."
         ),
     ))
 
@@ -3615,11 +3616,12 @@ async def dubbing(
         "Args:\n"
         "    video_path (str, optional): Absolute local path, or relative "
         "to SONILO_MCP_BASE_PATH. Subject to the account's max upload size "
-        "(typically 300 MB). Maximum video duration is 300 seconds "
-        "(5 minutes), and the video must have an audio track.\n"
+        "(typically 300 MB).\n"
         "    video_url (str, optional): HTTPS URL to a video file. Must be "
         "https specifically — the backend fetches the source itself and "
         "rejects plain http.\n"
+        "    Either way: Maximum video duration is 300 seconds (5 minutes), "
+        "and the video must have an audio track.\n"
         "    languages (list, optional): Target language codes to translate "
         'the transcript into, e.g. ["ja", "zh_cn"]. These are the same '
         "codes the dubbing tool takes (see its languages argument for the "
@@ -3684,10 +3686,10 @@ async def proofread(
     files, extra_form = await _stage_video_input(
         video_path, video_url, cfg["base_path"],
         _PROOFREAD_MAX_VIDEO_DURATION_SECONDS,
-        # The backend transcodes the source itself rather than copying the
-        # picture stream, so the accepted container set is the broad
-        # _VIDEO_EXTS one, as it is for video-analysis.
-        exts=_VIDEO_EXTS,
+        # The backend reads only the audio, so it takes every container the
+        # broad set does; .m4v and .gif are added so anything dubbing accepts
+        # can be proofread first (a silent .gif is refused by the backend).
+        exts=_VIDEO_EXTS | _SFX_VIDEO_EXTS,
     )
     form.update(extra_form)
     task_id = await _post_task_submit("/v1/proofread", data=form or None, files=files)

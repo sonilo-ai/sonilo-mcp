@@ -7143,6 +7143,99 @@ async def test_analyze_video_omits_unset_optionals(monkeypatch, output_dir):
     assert "variants_num" not in sent
 
 
+@respx.mock
+async def test_analyze_video_sends_mode_when_set(monkeypatch, output_dir):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=30.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-analysis").mock(
+        return_value=httpx.Response(202, json={"task_id": "va-1", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/va-1").mock(
+        return_value=httpx.Response(200, json=ANALYSIS_BODY)
+    )
+
+    await api.analyze_video(video_url="https://example.com/clip.mp4", mode="sfx")
+
+    from urllib.parse import unquote_plus
+    sent = unquote_plus(submit.calls.last.request.content.decode())
+    assert "mode=sfx" in sent
+
+
+@respx.mock
+async def test_analyze_video_omits_unset_mode(monkeypatch, output_dir):
+    """The server default (both) applies when the field is absent, and an
+    unset call stays byte-identical to what it sent before mode existed."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=30.0)
+
+    async def no_sleep(s):
+        pass
+
+    monkeypatch.setattr(api, "_poll_sleep", no_sleep)
+    submit = respx.post("https://api.test.local/v1/video-analysis").mock(
+        return_value=httpx.Response(202, json={"task_id": "va-1", "status": "processing"})
+    )
+    respx.get("https://api.test.local/v1/tasks/va-1").mock(
+        return_value=httpx.Response(200, json=ANALYSIS_BODY)
+    )
+
+    await api.analyze_video(video_url="https://example.com/clip.mp4")
+
+    sent = submit.calls.last.request.content.decode()
+    assert "mode" not in sent
+
+
+async def test_analyze_video_rejects_an_unknown_mode(output_dir):
+    """Checked before any I/O and case-sensitively: the backend would 422 a
+    'MUSIC' too, but only after the video had been uploaded."""
+    from sonilo_mcp import api
+    with pytest.raises(Exception, match="mode must be one of"):
+        await api.analyze_video(video_url="https://x/c.mp4", mode="MUSIC")
+    with pytest.raises(Exception, match="mode must be one of"):
+        await api.analyze_video(video_url="https://x/c.mp4", mode="sound")
+
+
+def test_analysis_brief_passes_the_sound_design_brief_through():
+    """_analysis_brief re-emits the wire shape instead of forwarding the
+    body, so the `both`-mode keys have to be listed explicitly or the caller
+    pays for a sound-design brief that is silently dropped. `sfx_prompt` is
+    one string, not one per variation."""
+    from sonilo_mcp import api
+    body = dict(
+        ANALYSIS_BODY,
+        mode="both",
+        sfx_segments=[
+            {"start": 0, "end": 12, "label": "none", "prompt": "wind, distant traffic"},
+            {"start": 12, "end": 30, "prompt": "tyre squeal, engine roar"},
+        ],
+        sfx_prompt="urban chase: engines, horns, glass",
+    )
+
+    brief = json.loads(api._analysis_brief(body)[0].text)
+
+    assert brief["mode"] == "both"
+    assert brief["sfx_prompt"] == "urban chase: engines, horns, glass"
+    assert brief["sfx_segments"] == [
+        {"start": 0, "end": 12, "label": "none", "prompt": "wind, distant traffic"},
+        {"start": 12, "end": 30, "label": "none", "prompt": "tyre squeal, engine roar"},
+    ]
+    # music / sfx mode bodies carry neither key, and the brief must not
+    # invent them.
+    music = json.loads(api._analysis_brief(dict(ANALYSIS_BODY, mode="music"))[0].text)
+    assert music["mode"] == "music"
+    assert "sfx_segments" not in music
+    assert "sfx_prompt" not in music
+
+
 async def test_analyze_video_requires_exactly_one_input(output_dir):
     from sonilo_mcp import api
     with pytest.raises(Exception, match="exactly one"):
@@ -7164,8 +7257,8 @@ async def test_analyze_video_rejects_variants_outside_1_to_5(output_dir):
 async def test_analyze_video_rejects_an_over_long_video(monkeypatch, output_dir):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     from sonilo_mcp import api
-    _patch_ffprobe(monkeypatch, duration=400.0)
-    with pytest.raises(Exception, match="360"):
+    _patch_ffprobe(monkeypatch, duration=500.0)
+    with pytest.raises(Exception, match="480"):
         await api.analyze_video(video_url="https://example.com/clip.mp4")
 
 
@@ -7174,13 +7267,13 @@ async def test_analyze_video_sends_a_video_at_the_cap_to_the_backend(
     monkeypatch, output_dir
 ):
     """The pre-check's only failure mode that costs the caller anything is
-    rejecting what the API would have taken. 360s is exactly the length
+    rejecting what the API would have taken. 480s is exactly the length
     /v1/video-analysis accepts; the submit 500s on purpose, because reaching
     the network at all is the proof."""
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     from sonilo_mcp import api
-    _patch_ffprobe(monkeypatch, duration=360.0)
+    _patch_ffprobe(monkeypatch, duration=480.0)
     submit = respx.post("https://api.test.local/v1/video-analysis").mock(
         return_value=httpx.Response(500, json={"message": "upstream is down"})
     )
@@ -7193,10 +7286,21 @@ def test_analysis_cap_matches_the_backend():
     """A literal, not a re-export: this pre-check is right exactly when it
     equals the number the backend enforces. Set it too low and we reject
     videos the API accepts -- the caller cannot appeal a rejection that never
-    left their machine. Note the backend cannot raise this above 360 without
-    first raising its own shared ffprobe ceiling, which sits at 360 too."""
+    left their machine. 480 is the backend's cap since video-analysis
+    gained mode=both; the shared ffprobe ceiling was raised with it."""
     from sonilo_mcp import api
-    assert api._ANALYSIS_MAX_VIDEO_DURATION_SECONDS == 360
+    assert api._ANALYSIS_MAX_VIDEO_DURATION_SECONDS == 480
+
+
+def _context7_cap_clause(context7: str, cap: int) -> str:
+    """The tools context7.json lists under one duration cap: the text between
+    `<cap>s for ` and the next `;` in the per-tool caps rule. Several tools
+    share a cap, so a test pins membership in the clause rather than a fixed
+    position in it."""
+    marker = f"{cap}s for "
+    assert marker in context7, marker
+    rest = context7.split(marker, 1)[1]
+    return rest.split(";", 1)[0]
 
 
 def test_documented_analysis_cap_matches_the_code():
@@ -7216,7 +7320,7 @@ def test_documented_analysis_cap_matches_the_code():
         if line.startswith("| `analyze_video(")
     )
     assert f"{cap}s" in analyze_line, analyze_line
-    assert f"{cap}s for analyze_video" in context7
+    assert "analyze_video" in _context7_cap_clause(context7, cap)
 
 
 @respx.mock
@@ -7271,7 +7375,9 @@ def test_documented_sfx_and_sound_caps_match_the_code():
             l for l in readme.splitlines() if l.startswith(f"| `{tool}")
         )
         assert f"{cap}s" in line, line
-    assert f"{cap}s for video_to_sfx" in context7
+    clause = _context7_cap_clause(context7, cap)
+    for tool in ("video_to_sfx", "video_to_video_sfx", "video_to_sound", "video_to_video_sound"):
+        assert tool in clause, clause
 
 
 async def test_tool_descriptions_state_each_cap_as_enforced():

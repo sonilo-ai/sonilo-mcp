@@ -3262,12 +3262,12 @@ async def video_to_video_sound(
         "    languages (list, optional): Target language codes, e.g. "
         '["es", "fr"]. Supported: en, zh_cn, ja, ko, pt, pt_br, es, '
         'es_419, de, fr, it, ru, th, ar, tr, vi, id, ta, ml, kn, gu, pa_in, '
-        'sd_in. pt_br is Brazilian '
+        'sd_in, hi. pt_br is Brazilian '
         'Portuguese and es_419 Latin American Spanish; plain pt and es give '
         'unqualified Portuguese and Spanish, so pick the regional code when '
         'the region matters. ar is likewise unqualified Arabic, not a '
         'country dialect. pa_in and sd_in are Punjabi and Sindhi as spoken '
-        'in India, the only variants available. Omit to get the default '
+        'in India, the only variants available; hi is Hindi. Omit to get the default '
         '["zh_cn", "es", "fr"].\n'
         "    ducking (bool, optional): Duck the background music/effects "
         "bed under the dubbed voice while it speaks. Off by default: the "

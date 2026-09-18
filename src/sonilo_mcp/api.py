@@ -329,7 +329,7 @@ _SFX_MAX_VIDEO_DURATION_SECONDS = 480  # 8 minutes — /v1/video-to-sfx
 _SOUND_MAX_VIDEO_DURATION_SECONDS = 480  # 8 minutes — /v1/video-to-sound*
 _DUCKING_MAX_DURATION_SECONDS = 360  # 6 minutes — /v1/audio-ducking, per input
 _DUBBING_MAX_VIDEO_DURATION_SECONDS = 300  # 5 minutes — /v1/dubbing
-_ANALYSIS_MAX_VIDEO_DURATION_SECONDS = 360  # 6 minutes — /v1/video-analysis
+_ANALYSIS_MAX_VIDEO_DURATION_SECONDS = 480  # 8 minutes — /v1/video-analysis
 # Floor for the dubbing poll, matched to the backend's own ceiling: it polls
 # its pipeline for up to 7200s, so giving up any earlier abandons a job the
 # caller has already been charged for. TIME_OUT_SECONDS defaults to 600.
@@ -1863,7 +1863,23 @@ def _analysis_brief(body: dict) -> list[TextContent]:
             if isinstance(var, dict)
         ],
     }
-    for key in ("variants_num", "duration_seconds", "cost"):
+    # `both` mode adds a sound-design brief next to the scoring one:
+    # `sfx_segments` mirrors `segments`, and `sfx_prompt` is one string
+    # rather than one per variation because the upstream authors the sound
+    # design once regardless of variants_num. Neither key exists in `music`
+    # or `sfx` mode, so they are emitted only when the body carries them.
+    if isinstance(body.get("sfx_segments"), list):
+        brief["sfx_segments"] = [
+            {
+                "start": seg.get("start"),
+                "end": seg.get("end"),
+                "label": seg.get("label", "none"),
+                "prompt": seg.get("prompt"),
+            }
+            for seg in body["sfx_segments"]
+            if isinstance(seg, dict)
+        ]
+    for key in ("mode", "sfx_prompt", "variants_num", "duration_seconds", "cost"):
         if body.get(key) is not None:
             brief[key] = body[key]
     return [TextContent(type="text", text=json.dumps(brief, indent=2))]
@@ -3517,13 +3533,18 @@ async def get_sfx_task(
 
 @mcp.tool(
     description=(
-        "Analyze a video and return a CREATIVE BRIEF for scoring it: a "
-        "time-aligned section plan plus one ready-to-use generation prompt "
-        "per variation, derived from the footage itself. Generates NOTHING — "
-        "no audio, no video, no file is written. Use it when the user does "
-        "not know what music or sound effects the video should get, then "
-        "feed a variation's prompt into video_to_music, video_to_sfx, "
-        "video_to_sound or their video-to-video counterparts.\n\n"
+        "Analyze a video and return a CREATIVE BRIEF derived from the footage "
+        "itself. Generates NOTHING — no audio, no video, no file is written. "
+        "`mode` picks which brief comes back: \"both\" (the default) returns "
+        "a music-direction brief in `segments`/`variations` AND a "
+        "sound-design brief in `sfx_segments`/`sfx_prompt` in one call; "
+        "\"music\" returns only the scoring brief (a time-aligned section "
+        "plan plus one ready-to-use generation prompt per variation); "
+        "\"sfx\" returns only the sound-design brief. All three modes cost "
+        "the same. Use it when the user does not know what music or sound "
+        "effects the video should get, then feed a variation's prompt into "
+        "video_to_music, video_to_sfx, video_to_sound or their "
+        "video-to-video counterparts.\n\n"
         "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
         "incur charges. Only use when explicitly requested by the user.\n\n"
         "Args:\n"
@@ -3534,16 +3555,21 @@ async def get_sfx_task(
         "on the chase'. At most 2000 characters.\n"
         "    variants_num (int, optional): 1-5, default 1. How many "
         "independent briefs to author for the same video. Billed per "
-        "brief.\n\n"
+        "brief.\n"
+        "    mode (str, optional): \"both\" (default), \"music\" or "
+        "\"sfx\".\n\n"
         "Exactly one of video_path and video_url must be provided. Maximum "
-        "video duration is 360 seconds (6 minutes); billing has a "
+        "video duration is 480 seconds (8 minutes); billing has a "
         "10-second floor, so a very short clip costs the same as a "
         "10-second one.\n\n"
         "Returns:\n"
-        "    TextContent holding the brief as JSON: `segments` (start, end, "
-        "label, prompt) and `variations` (one prompt each). No file path is "
-        "returned because no file is written. On timeout the error message "
-        "includes the task_id — recover the brief with get_sfx_task."
+        "    TextContent holding the brief as JSON: `mode` (echo of the "
+        "request), `segments` (start, end, label, prompt) and `variations` "
+        "(one prompt each); in both mode also `sfx_segments` (same shape as "
+        "`segments`) and `sfx_prompt` (a single string, not one per "
+        "variation). No file path is returned because no file is written. "
+        "On timeout the error message includes the task_id — recover the "
+        "brief with get_sfx_task."
     )
 )
 async def analyze_video(
@@ -3551,6 +3577,7 @@ async def analyze_video(
     video_url: str | None = None,
     prompt: str | None = None,
     variants_num: int = 1,
+    mode: str | None = None,
 ) -> list[TextContent]:
     if (video_path and video_url) or (not video_path and not video_url):
         raise Exception(
@@ -3560,6 +3587,8 @@ async def analyze_video(
         raise Exception(
             f"variants_num must be between 1 and {_ANALYSIS_VARIANTS_MAX}"
         )
+    if mode is not None and mode not in ("both", "music", "sfx"):
+        raise Exception("mode must be one of both, music, sfx")
     if prompt is not None and len(prompt) > 2000:
         raise Exception("prompt must be at most 2000 characters")
     if video_url:
@@ -3573,6 +3602,10 @@ async def analyze_video(
     # to what it sent before variants existed.
     if variants_num > 1:
         form["variants_num"] = str(variants_num)
+    # Sent only when set: omitting it lets the server default (both) apply
+    # and keeps an unset call byte-identical to what it sent before.
+    if mode is not None:
+        form["mode"] = mode
 
     # The analysis worker transcodes the source itself rather than copying
     # the picture stream, so the accepted container set is the broad

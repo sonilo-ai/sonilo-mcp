@@ -2100,6 +2100,25 @@ async def _save_dubbing_artifacts(
             ),
         ))
 
+    preview = body.get("trial_preview")
+    if isinstance(preview, dict):
+        # This run was the account's free 15-second preview: only the first
+        # 15 s of the source were translated, at no charge. Say so, and quote
+        # the full video, so the agent does not present a 15 s clip as the
+        # finished translation of a 3-minute video.
+        message = preview.get("message")
+        saved.append(TextContent(
+            type="text",
+            text=(
+                message if isinstance(message, str) and message else
+                "Free preview: only the first 15 seconds of the video were "
+                "translated, at no charge."
+            ) + (
+                " To translate the whole video, call dubbing again after "
+                "funds are added; that run is billed."
+            ),
+        ))
+
     return saved
 
 
@@ -3435,9 +3454,13 @@ async def video_to_video_sound(
         "track.\n\n"
         "⚠️ COST WARNING: This tool makes an API call to Sonilo which may "
         "incur charges, and you are billed PER LANGUAGE — asking for four "
-        "languages costs four times as much as one. This tool has ZERO "
-        "free-trial runs — even a trial account is billed from the first "
-        "call. Only use when explicitly requested by the user.\n\n"
+        "languages costs four times as much as one. Free preview: a "
+        "self-serve account's first call with ONE language and no subtitles "
+        "is free — the video is trimmed to its first 15 seconds and "
+        "translated at no charge, and the result carries trial_preview "
+        "with what the full video would cost. Every call after that, and "
+        "any call with several languages or subtitles, is billed. Only use "
+        "when explicitly requested by the user.\n\n"
         "This call polls until the backend finishes and waits AT LEAST TWO "
         "HOURS before giving up, regardless of any shorter configured "
         "timeout — two hours is the backend's own ceiling for the job. A "
@@ -4096,8 +4119,9 @@ async def audio_ducking(
         "account bills normally', not as an error. A trial object that IS "
         "present but has no entry for the service you're about to call means "
         "that service has no free-trial allowance at all — it bills from the "
-        "first call (this is dubbing's situation on any self-serve trial "
-        "account)."
+        "first call. dubbing's allowance of 1 is a 15-second PREVIEW, not a "
+        "full run: the first single-language call translates only the "
+        "first 15 seconds of the video, free."
     )
 )
 async def get_account_services() -> dict:

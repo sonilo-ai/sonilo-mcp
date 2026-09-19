@@ -5731,6 +5731,42 @@ async def test_save_dubbing_artifacts_writes_one_file_per_language(tmp_path):
 
 
 @respx.mock
+async def test_save_dubbing_artifacts_reports_the_free_preview(tmp_path):
+    """A preview run translated only the first 15 s: the agent must be told,
+    with the full-video quote, rather than presenting the clip as the whole
+    translation."""
+    from sonilo_mcp import api
+    respx.get("https://r2.test/es.mp4").mock(
+        return_value=httpx.Response(200, content=b"es-bytes")
+    )
+    body = {
+        "type": "dubbing", "status": "succeeded",
+        "outputs": {"es": "https://r2.test/es.mp4"},
+        "trial_preview": {
+            "preview_seconds": 15, "source_duration_seconds": 60.0, "trimmed": True,
+            "languages": 1, "full_video_cost_usd": 3.49,
+            "message": "Free preview: the first 15 seconds of your 60-second video, in 1 language. Translating the full video costs $3.49 — add funds at https://platform.sonilo.com/dashboard/billing",
+        },
+    }
+    result = await api._save_dubbing_artifacts(body, tmp_path, "dubbing-p", "p-1")
+    assert (tmp_path / "dubbing-p.es.mp4").read_bytes() == b"es-bytes"
+    assert "first 15 seconds of your 60-second video" in result[-1].text
+    assert "$3.49" in result[-1].text
+    assert "billed" in result[-1].text
+
+
+async def test_dubbing_description_explains_the_free_preview():
+    from sonilo_mcp import api
+    desc = {
+        t.name: (t.description or "") for t in await api.mcp.list_tools()
+    }["dubbing"]
+    assert "ZERO" not in desc
+    assert "first 15 seconds" in desc
+    assert "trial_preview" in desc
+    assert "PER LANGUAGE" in desc
+
+
+@respx.mock
 async def test_save_dubbing_artifacts_skips_blank_urls_in_a_mixed_map(tmp_path):
     from sonilo_mcp import api
     respx.get("https://r2.test/es.mp4").mock(

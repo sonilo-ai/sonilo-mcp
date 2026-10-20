@@ -24,7 +24,8 @@ def test_get_config_defaults(monkeypatch):
     assert cfg["api_key"] == "k1"
     assert cfg["api_url"] == "https://api.sonilo.com"
     assert cfg["base_path"] == str(Path.home() / "Desktop")
-    # Aligned with the backend fal read timeout (600s).
+    # The HTTP timeout for streaming, uploads and downloads (600s); task
+    # polling floors it separately (see _task_poll_timeout).
     assert cfg["timeout"] == 600.0
 
 
@@ -2336,13 +2337,14 @@ async def test_video_to_music_stems_path_mode_multipart(
 
 
 @respx.mock
-async def test_text_to_music_stems_polls_for_at_least_forty_minutes(
+async def test_text_to_music_stems_polls_for_at_least_seventy_five_minutes(
     monkeypatch, output_dir
 ):
     """TIME_OUT_SECONDS defaults to 600, but the backend gives the free
-    separation alone up to 1800s on top of the generation. Giving up at 10
-    minutes would routinely abandon a result the caller already paid for —
-    same rationale as dubbing's two-hour floor."""
+    separation alone up to 1800s on top of the generation, which itself gets
+    the ordinary 2700s task floor. Giving up any earlier would routinely
+    abandon a result the caller already paid for — same rationale as
+    dubbing's two-hour floor."""
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     monkeypatch.setenv("TIME_OUT_SECONDS", "600")
@@ -2369,11 +2371,11 @@ async def test_text_to_music_stems_polls_for_at_least_forty_minutes(
 
     monkeypatch.setattr(api, "_poll_task", fake_poll)
     await api.text_to_music(prompt="lofi", duration=10, stems=True)
-    assert seen["timeout"] == 2400.0
+    assert seen["timeout"] == 4500.0
 
 
 @respx.mock
-async def test_video_to_music_stems_polls_for_at_least_forty_minutes(
+async def test_video_to_music_stems_polls_for_at_least_seventy_five_minutes(
     monkeypatch, output_dir
 ):
     monkeypatch.setenv("SONILO_API_KEY", "k")
@@ -2404,7 +2406,7 @@ async def test_video_to_music_stems_polls_for_at_least_forty_minutes(
     await api.video_to_music(
         video_url="https://cdn.example.com/v.mp4", stems=True
     )
-    assert seen["timeout"] == 2400.0
+    assert seen["timeout"] == 4500.0
 
 
 @respx.mock
@@ -2413,7 +2415,7 @@ async def test_text_to_music_stems_honours_a_larger_operator_timeout(
 ):
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
-    monkeypatch.setenv("TIME_OUT_SECONDS", "3600")
+    monkeypatch.setenv("TIME_OUT_SECONDS", "6000")
     from sonilo_mcp import api
     respx.post("https://api.test.local/v1/text-to-music").mock(
         return_value=httpx.Response(
@@ -2437,15 +2439,15 @@ async def test_text_to_music_stems_honours_a_larger_operator_timeout(
 
     monkeypatch.setattr(api, "_poll_task", fake_poll)
     await api.text_to_music(prompt="lofi", duration=10, stems=True)
-    assert seen["timeout"] == 3600.0
+    assert seen["timeout"] == 6000.0
 
 
 @respx.mock
-async def test_video_to_music_stems_without_floor_when_unset(
+async def test_video_to_music_without_stems_uses_the_ordinary_task_floor(
     monkeypatch, output_dir
 ):
-    # A stems-less async call (here: ducking) must keep the plain operator
-    # timeout — the 40-minute floor is a stems-only concession.
+    # A stems-less async call (here: ducking) gets the ordinary 2700s task
+    # floor — the 75-minute floor is a stems-only concession.
     monkeypatch.setenv("SONILO_API_KEY", "k")
     monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
     monkeypatch.setenv("TIME_OUT_SECONDS", "600")
@@ -2474,7 +2476,7 @@ async def test_video_to_music_stems_without_floor_when_unset(
     await api.video_to_music(
         video_url="https://cdn.example.com/v.mp4", ducking=True
     )
-    assert seen["timeout"] == 600.0
+    assert seen["timeout"] == 2700.0
 
 
 @respx.mock
@@ -6586,6 +6588,89 @@ def test_documented_dubbing_cap_matches_the_code():
     assert f"{cap}s for dubbing" in context7
 
 
+def test_task_poll_timeout_floors_only_the_poll(monkeypatch):
+    """The backend lets a task wait up to 2400s in its upstream queue, so a
+    task poll waits at least 2700s — but TIME_OUT_SECONDS itself, the HTTP
+    timeout for streaming, uploads and downloads, keeps its 600s default."""
+    from sonilo_mcp import api
+    cfg = api._get_config()
+    assert cfg["timeout"] == 600.0
+    assert api._TASK_MIN_POLL_TIMEOUT_SECONDS == 2700.0
+    assert api._task_poll_timeout(cfg) == 2700.0
+    # Longer per-tool floors still apply, and every one of them is at least
+    # the ordinary task floor.
+    assert api._task_poll_timeout(cfg, api._DUBBING_MIN_POLL_TIMEOUT_SECONDS) == 7200.0
+    assert api._task_poll_timeout(cfg, api._STEMS_MIN_POLL_TIMEOUT_SECONDS) == 4500.0
+    assert api._STEMS_MIN_POLL_TIMEOUT_SECONDS >= api._TASK_MIN_POLL_TIMEOUT_SECONDS
+    assert api._DUBBING_MIN_POLL_TIMEOUT_SECONDS >= api._TASK_MIN_POLL_TIMEOUT_SECONDS
+    # A larger operator-set TIME_OUT_SECONDS still wins.
+    monkeypatch.setenv("TIME_OUT_SECONDS", "3600")
+    assert api._task_poll_timeout(api._get_config()) == 3600.0
+
+
+@respx.mock
+async def test_text_to_sfx_polls_for_at_least_forty_five_minutes(
+    monkeypatch, output_dir
+):
+    """With TIME_OUT_SECONDS unset (600s), an SFX task is still polled for
+    2700s: the backend lets it wait up to 2400s in the upstream queue, and a
+    task that succeeds after the client gave up is still billed."""
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    from sonilo_mcp import api
+    respx.post("https://api.test.local/v1/text-to-sfx").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "sfx-q1", "status": "processing"}
+        )
+    )
+    respx.get("https://r2.test/s.aac").mock(
+        return_value=httpx.Response(200, content=b"s")
+    )
+    seen: dict = {}
+
+    async def fake_poll(task_id, timeout):
+        seen["timeout"] = timeout
+        return {
+            "task_id": task_id, "status": "succeeded",
+            "audio": {"url": "https://r2.test/s.aac", "content_type": "audio/aac"},
+        }
+
+    monkeypatch.setattr(api, "_poll_task", fake_poll)
+    await api.text_to_sfx(prompt="door slam")
+    assert seen["timeout"] == 2700.0
+
+
+@respx.mock
+async def test_video_to_sfx_honours_a_larger_operator_timeout(
+    monkeypatch, output_dir
+):
+    monkeypatch.setenv("SONILO_API_KEY", "k")
+    monkeypatch.setenv("SONILO_API_URL", "https://api.test.local")
+    monkeypatch.setenv("TIME_OUT_SECONDS", "3600")
+    from sonilo_mcp import api
+    _patch_ffprobe(monkeypatch, duration=10.0)
+    respx.post("https://api.test.local/v1/video-to-sfx").mock(
+        return_value=httpx.Response(
+            202, json={"task_id": "sfx-q2", "status": "processing"}
+        )
+    )
+    respx.get("https://r2.test/s.aac").mock(
+        return_value=httpx.Response(200, content=b"s")
+    )
+    seen: dict = {}
+
+    async def fake_poll(task_id, timeout):
+        seen["timeout"] = timeout
+        return {
+            "task_id": task_id, "status": "succeeded",
+            "audio": {"url": "https://r2.test/s.aac", "content_type": "audio/aac"},
+        }
+
+    monkeypatch.setattr(api, "_poll_task", fake_poll)
+    await api.video_to_sfx(video_url="https://cdn.example.com/v.mp4")
+    assert seen["timeout"] == 3600.0
+
+
 @respx.mock
 async def test_dubbing_polls_for_at_least_two_hours(monkeypatch, output_dir):
     """TIME_OUT_SECONDS defaults to 600, but the dubbing backend polls its own
@@ -7798,10 +7883,10 @@ def test_proofread_cap_matches_the_backend():
 
 
 @respx.mock
-async def test_proofread_uses_the_ordinary_timeout(monkeypatch, output_dir):
+async def test_proofread_uses_the_ordinary_task_floor(monkeypatch, output_dir):
     """Not dubbing's two-hour floor: proofread only transcribes and
-    translates, finishing in well under 90 seconds, so it polls on
-    TIME_OUT_SECONDS like every other ordinary task."""
+    translates, finishing in well under 90 seconds, so it polls with the
+    ordinary 2700s task floor like every other ordinary task."""
     monkeypatch.setenv("TIME_OUT_SECONDS", "600")
     api, _ = _proofread_stub(monkeypatch)
     _mock_proofread_srt_downloads()
@@ -7813,7 +7898,7 @@ async def test_proofread_uses_the_ordinary_timeout(monkeypatch, output_dir):
 
     monkeypatch.setattr(api, "_poll_task", fake_poll)
     await api.proofread(video_url="https://example.com/clip.mp4")
-    assert seen["timeout"] == 600.0
+    assert seen["timeout"] == 2700.0
 
 
 @respx.mock

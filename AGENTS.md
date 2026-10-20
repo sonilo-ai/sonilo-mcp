@@ -82,7 +82,7 @@ Create keys at https://platform.sonilo.com/dashboard/api-keys.
 | `SONILO_API_URL` | `https://api.sonilo.com` | API base URL |
 | `SONILO_MCP_BASE_PATH` | `~/Desktop` | Output directory and file access boundary |
 | `SONILO_MCP_ALLOW_ANY_PATH` | `false` | Allow files outside the base path |
-| `TIME_OUT_SECONDS` | `600` | Wait limit for a generation |
+| `TIME_OUT_SECONDS` | `600` | Timeout for streaming music, uploads and downloads; task polls wait at least 2700 s (stems 4500 s, dubbing 7200 s) |
 
 ## Tools
 
@@ -104,7 +104,9 @@ Create keys at https://platform.sonilo.com/dashboard/api-keys.
 Every tool except the last three rows is billed when the request is accepted.
 A timeout on our side does not cancel or refund it. For task-based calls the
 error carries the task id, and `get_sfx_task("<id>")` fetches the result (the
-hosted server calls the same tool `get_generation_task`). Streaming music
+hosted server calls the same tool `get_generation_task`). If the MCP host's own
+tool-call timeout cuts the call off first, the id is in the server's stderr log
+as `[sonilo-mcp] task submitted: <id>`. Streaming music
 calls (`text_to_music`, and `video_to_music` without `preserve_speech`) have
 no task id; check `get_usage` to see whether one completed.
 

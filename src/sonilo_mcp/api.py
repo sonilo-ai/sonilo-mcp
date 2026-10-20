@@ -85,9 +85,11 @@ def _get_config() -> dict:
         "api_key": api_key,
         "api_url": api_url,
         "base_path": os.getenv("SONILO_MCP_BASE_PATH", base_default),
-        # Default aligns with the backend's generation read timeout (600s): a
-        # long generation can keep running—and charging—on the backend up to
-        # 600s, so timing out the client sooner would orphan a paid request.
+        # The HTTP timeout for streaming music, uploads and downloads (600s
+        # default, aligned with the backend's streaming read timeout). It is
+        # also the task-poll wait, but _task_poll_timeout floors that at
+        # _TASK_MIN_POLL_TIMEOUT_SECONDS — a task can sit in the backend's
+        # queue far longer than a stream may sit idle.
         "timeout": float(os.getenv("TIME_OUT_SECONDS", "600")),
         "allow_any_path": os.getenv(
             "SONILO_MCP_ALLOW_ANY_PATH", ""
@@ -331,6 +333,15 @@ _DUCKING_MAX_DURATION_SECONDS = 360  # 6 minutes — /v1/audio-ducking, per inpu
 _DUBBING_MAX_VIDEO_DURATION_SECONDS = 300  # 5 minutes — /v1/dubbing
 _PROOFREAD_MAX_VIDEO_DURATION_SECONDS = 300  # 5 minutes — /v1/proofread
 _ANALYSIS_MAX_VIDEO_DURATION_SECONDS = 480  # 8 minutes — /v1/video-analysis
+# Floor for polling any task-based generation (SFX, ducking, async music,
+# video-to-video, analysis, proofread). The backend lets a task wait up to
+# 2400s in its upstream provider's queue before giving up, and a backlogged
+# queue can hand out a runner only after 15-20 minutes; 2700s = that queue
+# ceiling plus a margin for the generation itself. The task is charged the
+# moment it is submitted, so giving up at the plain 600s TIME_OUT_SECONDS
+# default would abandon results the caller has already paid for. A larger
+# operator-set TIME_OUT_SECONDS still wins.
+_TASK_MIN_POLL_TIMEOUT_SECONDS = 2700.0
 # Floor for the dubbing poll, matched to the backend's own ceiling: it polls
 # its pipeline for up to 7200s, so giving up any earlier abandons a job the
 # caller has already been charged for. TIME_OUT_SECONDS defaults to 600.
@@ -338,11 +349,24 @@ _DUBBING_MIN_POLL_TIMEOUT_SECONDS = 7200.0
 # Floor for polling a music task created with stems=true — same pattern as
 # dubbing's floor above. Stem separation typically adds 2-6 minutes, but the
 # backend gives the separation alone up to 1800s before giving up, on top of
-# the generation itself; 2400s = that separation ceiling plus the default
-# 600s generation budget. The task is charged (for the music — separation is
-# free) the moment it is submitted, so giving up at the plain 600s default
+# the generation itself; 4500s = that separation ceiling plus the ordinary
+# task floor for the generation. The task is charged (for the music —
+# separation is free) the moment it is submitted, so giving up any earlier
 # would routinely abandon results the caller has already paid for.
-_STEMS_MIN_POLL_TIMEOUT_SECONDS = 2400.0
+_STEMS_MIN_POLL_TIMEOUT_SECONDS = 1800.0 + _TASK_MIN_POLL_TIMEOUT_SECONDS
+
+
+def _task_poll_timeout(
+    cfg: dict, floor: float = _TASK_MIN_POLL_TIMEOUT_SECONDS
+) -> float:
+    """How long to poll a submitted task: TIME_OUT_SECONDS, floored at
+    `floor` (the ordinary task floor unless a tool needs a longer one).
+
+    Only the poll is floored. TIME_OUT_SECONDS itself stays the HTTP timeout
+    for streaming, uploads and downloads, where waiting 45 minutes on a
+    stalled connection would help no one.
+    """
+    return max(cfg["timeout"], floor)
 
 
 async def _check_media_duration(
@@ -588,7 +612,7 @@ def _is_transient_error(e: BaseException) -> bool:
 
 
 # Short timeout for lightweight GETs (services, usage). Streaming
-# generation calls use cfg["timeout"] (default 300s) instead.
+# generation calls use cfg["timeout"] (default 600s) instead.
 _GET_TIMEOUT_SECONDS = 30
 
 
@@ -2331,7 +2355,7 @@ async def _save_proofread_artifacts(
         "    stems (bool, optional): Default false. Pass stems=true to "
         "also get the track split into four separate instrument tracks — "
         "drums, bass, vocals and other — at no extra charge; it adds a "
-        "few minutes to the wait (this tool then waits up to 40 minutes), "
+        "few minutes to the wait (this tool then waits up to 75 minutes), "
         "so set it only when the user asks for stems or separated tracks. "
         "Uses the backend's async generation mode (handled automatically, "
         "same as output_format='wav'). If a stems result comes back with "
@@ -2392,12 +2416,15 @@ async def text_to_music(
         if output_format:
             data["output_format"] = output_format
         task_id = await _post_task_submit("/v1/text-to-music", data=data)
-        timeout = _get_config()["timeout"]
         if stems:
             # Separation alone may take up to 30 minutes on the backend —
             # floor the poll the same way dubbing floors its own (while
             # still honouring a larger operator-set timeout).
-            timeout = max(timeout, _STEMS_MIN_POLL_TIMEOUT_SECONDS)
+            timeout = _task_poll_timeout(
+                _get_config(), _STEMS_MIN_POLL_TIMEOUT_SECONDS
+            )
+        else:
+            timeout = _task_poll_timeout(_get_config())
         body = await _poll_task(task_id, timeout)
         base = _slugify(prompt) if prompt else f"music-{task_id[:8]}"
         return await _save_music_task_artifacts(body, out_path, base, task_id)
@@ -2483,7 +2510,7 @@ async def _get_max_upload_size_mb() -> int:
         "    stems (bool, optional): Default false. Pass stems=true to "
         "also get the generated music split into four separate instrument "
         "tracks — drums, bass, vocals and other — at no extra charge; it "
-        "adds a few minutes to the wait (this tool then waits up to 40 "
+        "adds a few minutes to the wait (this tool then waits up to 75 "
         "minutes), so set it only when the user asks for stems or "
         "separated tracks. It splits the generated music, never the "
         "video's own audio. If a stems result comes back with stems_error "
@@ -2563,9 +2590,9 @@ async def video_to_music(
     # poll the same way dubbing floors its own (while still honouring a
     # larger operator-set timeout).
     poll_timeout = (
-        max(cfg["timeout"], _STEMS_MIN_POLL_TIMEOUT_SECONDS)
+        _task_poll_timeout(cfg, _STEMS_MIN_POLL_TIMEOUT_SECONDS)
         if stems
-        else cfg["timeout"]
+        else _task_poll_timeout(cfg)
     )
 
     if video_path:
@@ -2696,7 +2723,7 @@ async def text_to_sfx(
     if audio_format:
         data["audio_format"] = audio_format
     task_id = await _post_task_submit("/v1/text-to-sfx", data=data)
-    body = await _poll_task(task_id, _get_config()["timeout"])
+    body = await _poll_task(task_id, _task_poll_timeout(_get_config()))
     return await _save_task_artifacts(body, out_path, _slugify(prompt), task_id)
 
 
@@ -2800,7 +2827,7 @@ async def video_to_sfx(
         form["video_url"] = video_url
         task_id = await _post_task_submit("/v1/video-to-sfx", data=form)
 
-    body = await _poll_task(task_id, cfg["timeout"])
+    body = await _poll_task(task_id, _task_poll_timeout(cfg))
     base = _slugify(prompt) if prompt and prompt.strip() else f"sfx-{task_id[:8]}"
     return await _save_task_artifacts(body, out_path, base, task_id)
 
@@ -2955,7 +2982,7 @@ async def video_to_video_music(
         form["video_url"] = video_url
         task_id = await _post_task_submit("/v1/video-to-video-music", data=form)
 
-    body = await _poll_task(task_id, cfg["timeout"])
+    body = await _poll_task(task_id, _task_poll_timeout(cfg))
     base = _slugify(prompt) if prompt else f"v2v-music-{task_id[:8]}"
     return await _save_task_artifacts(body, out_path, base, task_id)
 
@@ -3052,7 +3079,7 @@ async def video_to_video_sfx(
         form["video_url"] = video_url
         task_id = await _post_task_submit("/v1/video-to-video-sfx", data=form)
 
-    body = await _poll_task(task_id, cfg["timeout"])
+    body = await _poll_task(task_id, _task_poll_timeout(cfg))
     base = _slugify(prompt) if prompt and prompt.strip() else f"v2v-sfx-{task_id[:8]}"
     return await _save_task_artifacts(body, out_path, base, task_id)
 
@@ -3258,7 +3285,7 @@ async def _submit_video_to_sound(
     form.update(extra_form)
     task_id = await _post_task_submit(path, data=form, files=files)
 
-    body = await _poll_task(task_id, cfg["timeout"])
+    body = await _poll_task(task_id, _task_poll_timeout(cfg))
     prompt = music_prompt or sfx_prompt
     base = (
         _slugify(prompt)
@@ -3606,13 +3633,13 @@ async def dubbing(
         files = {**(files or {}), **subtitle_files}
     task_id = await _post_task_submit("/v1/dubbing", data=form, files=files)
 
-    # TIME_OUT_SECONDS defaults to 600 (10 min), but the dubbing backend polls
+    # The ordinary task floor is 2700s (45 min), but the dubbing backend polls
     # its own pipeline for up to 7200s (2 hours). Abandoning the poll early
     # would leave the caller charged for videos they never receive, so floor
     # it at the backend's own ceiling — while still honouring a larger
     # operator-set timeout.
     body = await _poll_task(
-        task_id, max(cfg["timeout"], _DUBBING_MIN_POLL_TIMEOUT_SECONDS)
+        task_id, _task_poll_timeout(cfg, _DUBBING_MIN_POLL_TIMEOUT_SECONDS)
     )
     # No prompt to slugify — a dubbing call has no free text at all, so the
     # task id is the only stable name available.
@@ -3717,10 +3744,10 @@ async def proofread(
     form.update(extra_form)
     task_id = await _post_task_submit("/v1/proofread", data=form or None, files=files)
 
-    # The ordinary timeout, unlike dubbing's two-hour floor: proofread runs
+    # The ordinary task floor, unlike dubbing's two-hour one: proofread runs
     # transcription and translation only, and finishes in well under
     # 90 seconds, so there is no long-running pipeline to outwait.
-    body = await _poll_task(task_id, cfg["timeout"])
+    body = await _poll_task(task_id, _task_poll_timeout(cfg))
     # No prompt to slugify — a proofread call has no free text at all, so the
     # task id is the only stable name available.
     return await _save_proofread_artifacts(
@@ -3945,7 +3972,7 @@ async def analyze_video(
     task_id = await _post_task_submit(
         "/v1/video-analysis", data=form or None, files=files
     )
-    body = await _poll_task(task_id, cfg["timeout"])
+    body = await _poll_task(task_id, _task_poll_timeout(cfg))
     _raise_if_task_not_succeeded(body, task_id)
     return _analysis_brief(body)
 
@@ -4093,7 +4120,7 @@ async def audio_ducking(
     task_id = await _post_task_submit(
         "/v1/audio-ducking", data=data or None, files=files or None
     )
-    body = await _poll_task(task_id, cfg["timeout"])
+    body = await _poll_task(task_id, _task_poll_timeout(cfg))
     base = _ducking_base_name(voice_path, voice_url, task_id)
     return await _save_task_artifacts(body, out_path, base, task_id)
 

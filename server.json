@@ -40,7 +40,7 @@
         },
         {
           "name": "TIME_OUT_SECONDS",
-          "description": "Generation timeout in seconds",
+          "description": "Timeout in seconds for streaming music, uploads and downloads; task-based tools always wait at least 2700s for their task",
           "isRequired": false,
           "format": "number",
           "default": "600"

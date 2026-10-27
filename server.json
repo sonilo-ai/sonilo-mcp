@@ -8,6 +8,12 @@
     "source": "github"
   },
   "version": "0.9.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://api.sonilo.com/mcp"
+    }
+  ],
   "packages": [
     {
       "registryType": "pypi",

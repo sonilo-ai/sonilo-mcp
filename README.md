@@ -211,6 +211,8 @@ files. To opt out — e.g. to read a video from elsewhere on disk — set
 
 Tools marked ✅ make API calls that incur charges on your Sonilo account.
 
+Every tool also carries MCP tool annotations, so clients can tell the two kinds apart without reading descriptions: `get_account_services`, `get_usage` and `play_audio` are read-only; every other tool writes files or incurs charges, and none of them is destructive (outputs never overwrite an existing file). The server's `instructions` tell an agent to check `get_account_services` before the first paid call and to recover a timed-out call with `get_sfx_task`.
+
 > **Free trial:** self-serve accounts start with a few free runs per service — no card required. `get_account_services()` reports what is left as `trial[service] = {granted, used, remaining}`; check it before calling a ✅ tool so you can warn the user instead of failing on them. When a service's `remaining` hits `0`, calls to it fail with `trial_exhausted` until a payment method is added. Dubbing's single free run is a **15-second preview**: the first single-language call without subtitles translates only the first 15 seconds of the video, free, and the result carries `trial_preview` with what the full video would cost; `proofread` has 2 free runs, and like dubbing it bills per language. Accounts without a free-trial allowance simply have no `trial` key.
 
 > **Optional:** if [`ffprobe`](https://ffmpeg.org/) (part of FFmpeg) is installed, `video_to_music` checks a video's duration locally and rejects anything over 360s before uploading. `video_to_sfx` performs the same local check with its 480s cap. `audio_ducking` does the same for both of its inputs against its 360s cap. Without it, the same limits are still enforced by the backend.

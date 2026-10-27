@@ -20,11 +20,51 @@ from urllib.parse import urlparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
-from mcp.types import TextContent
+from mcp.types import TextContent, ToolAnnotations
 
 from .credentials import read_api_key
 
-mcp = FastMCP("Sonilo")
+mcp = FastMCP(
+    "Sonilo",
+    instructions=(
+        "Generate licensed music, sound effects, dubbing and audio ducking with "
+        "Sonilo; results are saved as local files. "
+        "Only call paid tools after the user explicitly asks. Before the first "
+        "paid call, call get_account_services to see the balance and the free "
+        "trial runs left for that service. "
+        "A paid call is charged when it is accepted and a timeout does not "
+        "cancel it: if a call times out, pass the task id from the error to "
+        "get_sfx_task instead of calling the tool again. "
+        "For music plus sound effects on one video, use video_to_sound (one "
+        "charge), not video_to_music and video_to_sfx. "
+        "Never describe or invent audio a tool did not return."
+    ),
+)
+
+# Tool annotations (MCP spec ToolAnnotations), matching the hosted server at
+# api.sonilo.com/mcp. Directories such as the Claude connector directory
+# require them, and clients use them to decide when to ask before a call.
+# No tool is destructive: outputs never overwrite an existing file.
+# openWorldHint marks tools that fetch a caller-supplied video or audio URL.
+_PAID = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+)
+_PAID_URL = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+)
+# Free account lookups.
+_LOOKUP = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+# Free, but writes the finished task's files to disk (a new -1, -2 name on
+# each call), so it is not read-only.
+_FREE_SAVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+)
+# Plays a local file; changes nothing.
+_LOCAL_PLAY = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
 
 try:
     _CLIENT_VERSION = _pkg_version("sonilo-mcp")
@@ -2328,6 +2368,8 @@ async def _save_proofread_artifacts(
 # ---------- Tools: generation ----------
 
 @mcp.tool(
+    title="Generate music",
+    annotations=_PAID,
     description=(
         "Generate music from a text prompt and save the resulting audio "
         "file(s) to a local directory. Generated tracks are fully licensed "
@@ -2469,6 +2511,8 @@ async def _get_max_upload_size_mb() -> int:
 
 
 @mcp.tool(
+    title="Generate music for a video",
+    annotations=_PAID_URL,
     description=(
         "Generate an original score for a video: Sonilo analyzes the video's "
         "pacing, motion, and emotion, aligns transitions and beat drops to "
@@ -2685,6 +2729,8 @@ async def video_to_music(
 # ---------- Tools: sound effects ----------
 
 @mcp.tool(
+    title="Generate sound effect",
+    annotations=_PAID,
     description=(
         "Generate a sound effect from a text prompt and save the audio file "
         "to a local directory. Generation is asynchronous on the backend; "
@@ -2728,6 +2774,8 @@ async def text_to_sfx(
 
 
 @mcp.tool(
+    title="Generate sound effects for a video",
+    annotations=_PAID_URL,
     description=(
         "Generate sound effects for a video: Sonilo analyzes the video and "
         "creates matching SFX. Returns the generated sound-effects audio "
@@ -2835,6 +2883,8 @@ async def video_to_sfx(
 # ---------- Tools: video-to-video ----------
 
 @mcp.tool(
+    title="Generate a music-scored video (video output)",
+    annotations=_PAID_URL,
     description=(
         "Generate an original score for a video and return a NEW VIDEO with "
         "the music muxed in (not just an audio file). Provide either a local "
@@ -2988,6 +3038,8 @@ async def video_to_video_music(
 
 
 @mcp.tool(
+    title="Generate a sound-effects video (video output)",
+    annotations=_PAID_URL,
     description=(
         "Generate sound effects for a video and return a NEW VIDEO with the "
         "SFX muxed in (not just an audio file). Provide either a local "
@@ -3296,6 +3348,8 @@ async def _submit_video_to_sound(
 
 
 @mcp.tool(
+    title="Generate a full soundtrack for a video (audio output)",
+    annotations=_PAID_URL,
     description=(
         "Generate music AND sound effects for a video in one call and return "
         "them mixed into a single audio track (no video). Use this instead of "
@@ -3382,6 +3436,8 @@ async def video_to_sound(
 
 
 @mcp.tool(
+    title="Generate a fully-scored video (video output)",
+    annotations=_PAID_URL,
     description=(
         "Generate music AND sound effects for a video in one call and return "
         "a NEW VIDEO with the mixed soundtrack muxed in (not just an audio "
@@ -3474,6 +3530,8 @@ async def video_to_video_sound(
 
 
 @mcp.tool(
+    title="Dub a video into other languages",
+    annotations=_PAID_URL,
     description=(
         "Dub a video into one or more other languages and save one dubbed "
         "video file per language. The speech is translated and re-voiced; "
@@ -3649,6 +3707,8 @@ async def dubbing(
 
 
 @mcp.tool(
+    title="Transcribe and translate a video into editable subtitles",
+    annotations=_PAID_URL,
     description=(
         "Transcribe a video and translate its script into the target dubbing "
         "languages, returning one editable .srt per language plus the "
@@ -3756,6 +3816,8 @@ async def proofread(
 
 
 @mcp.tool(
+    title="Get a Sonilo generation task and save its result",
+    annotations=_FREE_SAVE,
     description=(
         "Check a sound-effects, audio-ducking, video-to-video, dubbing, "
         "proofread, or "
@@ -3885,6 +3947,8 @@ async def get_sfx_task(
 # ---------- Tools: video analysis ----------
 
 @mcp.tool(
+    title="Analyze a video for music or sound-effect direction",
+    annotations=_PAID_URL,
     description=(
         "Analyze a video and return a CREATIVE BRIEF derived from the footage "
         "itself. Generates NOTHING — no audio, no video, no file is written. "
@@ -3996,6 +4060,8 @@ def _require_exactly_one(path: str | None, url: str | None, label: str) -> None:
 
 
 @mcp.tool(
+    title="Duck music under voice audio",
+    annotations=_PAID_URL,
     description=(
         "Duck a music bed under a voice track: Sonilo lowers the music "
         "wherever the voice is speaking and lifts it back in the gaps, then "
@@ -4128,6 +4194,8 @@ async def audio_ducking(
 # ---------- Tools: account ----------
 
 @mcp.tool(
+    title="Get Sonilo account services",
+    annotations=_LOOKUP,
     description=(
         "Get the authenticated account's available Sonilo services, rate limits, "
         "concurrency limit, discount factor, max video upload size, and — when "
@@ -4157,6 +4225,8 @@ async def get_account_services() -> dict:
 
 
 @mcp.tool(
+    title="Get Sonilo usage",
+    annotations=_LOOKUP,
     description=(
         "Get the authenticated account's usage summary and per-day breakdown. "
         "Useful for cost reconciliation and tracking generation history.\n\n"
@@ -4174,6 +4244,8 @@ async def get_usage(days: int = 30) -> dict:
 # ---------- Tools: local playback ----------
 
 @mcp.tool(
+    title="Play a local audio file",
+    annotations=_LOCAL_PLAY,
     description=(
         "Play a local audio file through the system's default output device. "
         "Supports WAV, MP3, M4A, AAC, OGG, FLAC.\n\n"

@@ -1,6 +1,6 @@
 [project]
 name = "sonilo-mcp"
-version = "0.27.1"
+version = "0.28.0"
 description = "MCP server for Sonilo AI music generation API"
 authors = [{ name = "Sonilo", email = "support@sonilo.com" }]
 readme = "README.md"
@@ -18,7 +18,9 @@ dependencies = [
     # Capped below 2.0: mcp 2.x removed mcp.server.fastmcp, which every tool
     # in this package imports. Without the cap a fresh install silently
     # resolves to 2.x and fails at import rather than at resolution.
-    "mcp[cli]>=1.6.0,<2",
+    # Floor 1.14: older 1.x fail at import on this module's postponed
+    # annotations (checked 1.12, 1.13 on 2026-10-27).
+    "mcp[cli]>=1.14.0,<2",
     "httpx>=0.27",
     "sounddevice>=0.5.1",
     "soundfile>=0.13.1",

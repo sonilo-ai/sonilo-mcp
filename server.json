@@ -7,6 +7,16 @@
     "url": "https://github.com/sonilo-ai/sonilo-mcp",
     "source": "github"
   },
+  "websiteUrl": "https://platform.sonilo.com/mcp?utm_source=mcp_registry&utm_medium=listing",
+  "icons": [
+    {
+      "src": "https://platform.sonilo.com/icon.png",
+      "mimeType": "image/png",
+      "sizes": [
+        "512x512"
+      ]
+    }
+  ],
   "version": "0.9.0",
   "remotes": [
     {
